@@ -6,9 +6,13 @@
 
 #include <dlfcn.h>
 
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <mutex>
 
 #include "elf_symbols.h"
+#include "mem.h"
 #include "log.h"
 
 namespace bg3le {
@@ -38,9 +42,42 @@ void ensure_symbols() {
     });
 }
 
-void report_symbol(const char* mangled) {
-    void* addr = g_symbols.find(mangled);
-    logf("  %-56s %s", mangled, addr != nullptr ? "resolved" : "MISSING");
+// MappingInfo's layout is unknown; dump candidate entries so it can be
+// derived from what the engine actually hands back.
+void probe_mappings(void* self, const char* getter, const char* what) {
+    auto fn = next<long (*)(void*, void**, unsigned*)>(getter);
+    if (fn == nullptr) {
+        logf("%s: getter unresolved", what);
+        return;
+    }
+
+    void* infos = nullptr;
+    unsigned count = 0;
+    fn(self, &infos, &count);
+    logf("%s: count=%u base=%p", what, count, infos);
+    if (infos == nullptr || count == 0) return;
+
+    // Print the first few machine words of the first entries, resolving any
+    // word that looks like a char* so the name field reveals itself.
+    for (unsigned e = 0; e < (count < 3u ? count : 3u); ++e) {
+        std::uintptr_t words[8] = {};
+        const char* entry = static_cast<const char*>(infos) + e * sizeof(words);
+        if (!safe_read(entry, words, sizeof(words))) {
+            logf("  [%u] unreadable", e);
+            continue;
+        }
+        for (unsigned w = 0; w < 8; ++w) {
+            char text[96];
+            if (safe_cstr(reinterpret_cast<const void*>(words[w]), text, sizeof(text)) &&
+                text[0] >= 0x20 && text[0] < 0x7f) {
+                logf("  [%u] +%02zu = 0x%016lx -> \"%s\"", e, w * sizeof(void*),
+                     (unsigned long)words[w], text);
+            } else {
+                logf("  [%u] +%02zu = 0x%016lx", e, w * sizeof(void*),
+                     (unsigned long)words[w]);
+            }
+        }
+    }
 }
 
 }  // namespace
@@ -53,7 +90,15 @@ using namespace bg3le;
 extern "C" long _ZN7COsiris8InitGameEv(void* self) {
     static auto real = next<long (*)(void*)>("_ZN7COsiris8InitGameEv");
     logf("COsiris::InitGame() self=%p", self);
-    return real != nullptr ? real(self) : 0;
+    long rc = real != nullptr ? real(self) : 0;
+
+    // The story is loaded by now, so the mapping tables are populated.
+    ensure_symbols();
+    probe_mappings(self, "_ZN7COsiris19GetFunctionMappingsEPP11MappingInfoPj",
+                   "function mappings");
+    probe_mappings(self, "_ZN7COsiris15GetTypeMappingsEPP11MappingInfoPj",
+                   "type mappings");
+    return rc;
 }
 
 extern "C" long _ZN7COsiris20RegisterDIVFunctionsEP19TOsirisInitFunction(
@@ -62,7 +107,13 @@ extern "C" long _ZN7COsiris20RegisterDIVFunctionsEP19TOsirisInitFunction(
         "_ZN7COsiris20RegisterDIVFunctionsEP19TOsirisInitFunction");
     logf("COsiris::RegisterDIVFunctions() self=%p init=%p", self, init_fn);
     ensure_symbols();  // game is initialised by now; its allocator is usable
-    return real != nullptr ? real(self, init_fn) : 0;
+    long rc = real != nullptr ? real(self, init_fn) : 0;
+
+    // Registration has just run, so the function table should be populated
+    // here -- and unlike InitGame this fires without a save loaded.
+    probe_mappings(self, "_ZN7COsiris19GetFunctionMappingsEPP11MappingInfoPj",
+                   "function mappings (post-register)");
+    return rc;
 }
 
 extern "C" long _ZN7COsiris5EventEjP16COsiArgumentDesc(

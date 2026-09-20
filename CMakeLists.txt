@@ -9,6 +9,7 @@ add_library(bg3le SHARED
     src/preload.cpp
     src/elf_symbols.cpp
     src/log.cpp
+    src/mem.cpp
 )
 target_link_libraries(bg3le PRIVATE dl)
 target_link_options(bg3le PRIVATE -static-libstdc++ -static-libgcc)

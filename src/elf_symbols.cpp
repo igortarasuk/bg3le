@@ -86,8 +86,10 @@ bool SymbolTable::load_file(const std::string& path, std::uintptr_t bias) {
     symbols_.clear();
 
     MappedFile f(path.c_str());
-    logf("elf: open %s ok=%d size=%zu errno=%d", path.c_str(), (int)f.ok(), f.size(), errno);
-    if (!f.ok() || f.size() < sizeof(Elf64_Ehdr)) return false;
+    if (!f.ok() || f.size() < sizeof(Elf64_Ehdr)) {
+        logf("elf: cannot map %s (errno %d)", path.c_str(), errno);
+        return false;
+    }
 
     const auto* ehdr = reinterpret_cast<const Elf64_Ehdr*>(f.data());
     if (std::memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) return false;
@@ -95,8 +97,6 @@ bool SymbolTable::load_file(const std::string& path, std::uintptr_t bias) {
     if (ehdr->e_shoff == 0 || ehdr->e_shentsize != sizeof(Elf64_Shdr)) return false;
     if (ehdr->e_shoff + std::size_t(ehdr->e_shnum) * sizeof(Elf64_Shdr) > f.size()) return false;
 
-    logf("elf: shoff=%lu shnum=%u shentsize=%u", (unsigned long)ehdr->e_shoff,
-         ehdr->e_shnum, ehdr->e_shentsize);
     const auto* shdrs = reinterpret_cast<const Elf64_Shdr*>(f.data() + ehdr->e_shoff);
 
     for (unsigned i = 0; i < ehdr->e_shnum; ++i) {
