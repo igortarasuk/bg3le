@@ -1,5 +1,6 @@
 #include "lua_host.h"
 
+#include <ctime>
 #include <string>
 
 #include "debug_server.h"
@@ -102,6 +103,27 @@ int l_log(lua_State* L) {
     return 0;
 }
 
+int l_monotonic_ms(lua_State* L) {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    lua_pushinteger(L, (lua_Integer)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    return 1;
+}
+
+int l_microsec(lua_State* L) {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    lua_pushinteger(L, (lua_Integer)ts.tv_sec * 1000000 + ts.tv_nsec / 1000);
+    return 1;
+}
+
+int l_clock_time(lua_State* L) {
+    timespec ts{};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    lua_pushnumber(L, (double)ts.tv_sec + (double)ts.tv_nsec / 1e9);
+    return 1;
+}
+
 void register_log(lua_State* L, const char* name, int severity) {
     lua_pushinteger(L, severity);
     lua_pushcclosure(L, l_log, 1);
@@ -128,6 +150,16 @@ void lua_init() {
     register_log(g_lua, "PrintWarning", 1);
     register_log(g_lua, "PrintError", 2);
     lua_setfield(g_lua, -2, "Log");
+
+    lua_newtable(g_lua);                       // Ext.Timer
+    lua_pushcfunction(g_lua, l_monotonic_ms);
+    lua_setfield(g_lua, -2, "MonotonicTime");
+    lua_pushcfunction(g_lua, l_microsec);
+    lua_setfield(g_lua, -2, "MicrosecTime");
+    lua_pushcfunction(g_lua, l_clock_time);
+    lua_setfield(g_lua, -2, "ClockTime");
+    lua_setfield(g_lua, -2, "Timer");
+
     lua_setglobal(g_lua, "Ext");
 
     static const char kPrelude[] = R"LUA(
@@ -199,6 +231,74 @@ function Ext.Dump(v) Ext.Log.Print(Ext.DumpExport(v)) end
 function Ext.DumpShallow(v)
   Ext.Log.Print(Ext.Json.Stringify(v, {Beautify = true, LimitDepth = 1}))
 end
+
+-- Modules needing engine reflection are stubbed so a mod gets a specific
+-- error instead of "attempt to index a nil value".
+local function stub_index(name)
+  return function(_, key)
+    return function()
+      error(string.format("bg3le: Ext.%s.%s is not implemented yet", name, key), 2)
+    end
+  end
+end
+
+local function stub(name)
+  return setmetatable({}, {__index = stub_index(name)})
+end
+
+Ext.Table = {
+  Find = function(tbl, value)
+    for k, v in pairs(tbl) do
+      if v == value then return v, k end
+    end
+    return nil
+  end
+}
+table.find = Ext.Table.Find
+
+-- The scalar half of Ext.Math; the vector and matrix entries need their
+-- userdata types, so they stub out rather than silently misbehave.
+Ext.Math = setmetatable({
+  Round = function(x) return math.floor(x + 0.5) end,
+  Trunc = function(x) return x >= 0 and math.floor(x) or math.ceil(x) end,
+  Fract = function(x) return x - math.floor(x) end,
+  Sign = function(x) return (x > 0 and 1) or (x < 0 and -1) or 0 end,
+  Clamp = function(x, lo, hi) return math.max(lo, math.min(hi, x)) end,
+  Lerp = function(a, b, t) return a + (b - a) * t end,
+  Smoothstep = function(a, b, x)
+    local t = math.max(0, math.min(1, (x - a) / (b - a)))
+    return t * t * (3 - 2 * t)
+  end,
+  IsNaN = function(x) return x ~= x end,
+  IsInf = function(x) return x == math.huge or x == -math.huge end,
+  Acos = math.acos, Asin = math.asin, Atan = math.atan,
+  Random = function(a, b)
+    if a == nil then return math.random() end
+    if b == nil then return math.random(a) end
+    return math.random(a, b)
+  end
+}, {__index = stub_index("Math")})
+
+Ext.Utils = {
+  Print = Ext.Log.Print,
+  PrintWarning = Ext.Log.PrintWarning,
+  PrintError = Ext.Log.PrintError,
+  Round = Ext.Math.Round,
+  Random = Ext.Math.Random,
+  MonotonicTime = Ext.Timer.MonotonicTime,
+  MicrosecTime = Ext.Timer.MicrosecTime,
+}
+
+function Ext.IsServer() return true end
+function Ext.IsClient() return false end
+
+for _, name in ipairs({"Entity", "Stats", "Level", "StaticData", "Mod", "Net",
+                       "Vars", "IO", "Types", "Localization", "Debug",
+                       "Events", "Resource", "Template"}) do
+  Ext[name] = stub(name)
+end
+Ext.Definition = Ext.StaticData
+Mods = {}
 
 _D = Ext.Dump
 _DS = Ext.DumpShallow
