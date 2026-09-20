@@ -273,11 +273,12 @@ void debug_server_tick() {
     debug_server_pump();
 }
 
-void debug_server_output(const char* text) {
+void debug_server_output(const char* text, int severity) {
     const int fd = g_client.load();
     if (fd < 0 || text == nullptr) return;
     std::string body;
     pb::bytes_field(&body, 1, text);
+    pb::uint_field(&body, 2, static_cast<std::uint64_t>(severity));
     std::string msg;
     pb::bytes_field(&msg, kBkDebugOutput, body);
     send_packet(fd, msg);

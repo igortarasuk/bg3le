@@ -85,9 +85,11 @@ int osi_dispatch(lua_State* L) {
     return static_cast<int>(outputs.size());
 }
 
-// print() goes to the attached debugger client as well as the log, which is
-// what makes the remote prompt useful.
-int l_print(lua_State* L) {
+// Output goes to the attached debugger client as well as the log, which is
+// what makes the remote prompt useful. Severity rides in an upvalue so
+// Ext.Log.Print/PrintWarning/PrintError share one implementation.
+int l_log(lua_State* L) {
+    const int severity = static_cast<int>(lua_tointeger(L, lua_upvalueindex(1)));
     std::string out;
     const int n = lua_gettop(L);
     for (int i = 1; i <= n; ++i) {
@@ -95,9 +97,15 @@ int l_print(lua_State* L) {
         out += luaL_tolstring(L, i, nullptr);
         lua_pop(L, 1);
     }
-    debug_server_output(out.c_str());
-    logf("lua print: %s", out.c_str());
+    debug_server_output(out.c_str(), severity);
+    logf("lua: %s", out.c_str());
     return 0;
+}
+
+void register_log(lua_State* L, const char* name, int severity) {
+    lua_pushinteger(L, severity);
+    lua_pushcclosure(L, l_log, 1);
+    lua_setfield(L, -2, name);
 }
 
 }  // namespace
@@ -111,31 +119,94 @@ void lua_init() {
         return;
     }
     luaL_openlibs(g_lua);
-    lua_pushcfunction(g_lua, l_print);
-    lua_setglobal(g_lua, "print");
-    // _D is muscle memory from BG3SE; provide it in plain Lua.
-    static const char kPrelude[] = R"LUA(
--- _P prints values as-is; _D pretty-prints tables. Both are BG3SE habits.
-_P = print
+    // Ext.Log and Ext.Json are pure Lua/C and need no engine reflection, so
+    // the helpers mods actually use every day can be compatible now. Shapes
+    // and aliases follow BG3SE's BuiltinLibrary.lua.
+    lua_newtable(g_lua);                       // Ext
+    lua_newtable(g_lua);                       // Ext.Log
+    register_log(g_lua, "Print", 0);
+    register_log(g_lua, "PrintWarning", 1);
+    register_log(g_lua, "PrintError", 2);
+    lua_setfield(g_lua, -2, "Log");
+    lua_setglobal(g_lua, "Ext");
 
-function _D(v, indent)
-  indent = indent or ""
-  if type(v) ~= "table" then print(indent .. tostring(v)) return end
-  local keys = {}
-  for k in pairs(v) do keys[#keys+1] = k end
-  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-  print(indent .. "{")
-  for _, k in ipairs(keys) do
-    local val = v[k]
-    if type(val) == "table" then
-      print(indent .. "  " .. tostring(k) .. " =")
-      _D(val, indent .. "    ")
-    else
-      print(indent .. "  " .. tostring(k) .. " = " .. tostring(val))
+    static const char kPrelude[] = R"LUA(
+-- _D is Ext.Json.Stringify, which is why strings come back quoted:
+-- _D(GetHostCharacter()) yields "<uuid>" while _P yields <uuid>.
+Ext.Json = Ext.Json or {}
+
+local function encode(v, indent, depth, opts, seen, out)
+  local t = type(v)
+  if v == nil then out[#out+1] = "null"
+  elseif t == "boolean" then out[#out+1] = tostring(v)
+  elseif t == "number" then
+    out[#out+1] = (math.type(v) == "integer") and tostring(v)
+                  or string.format("%.14g", v)
+  elseif t == "string" then
+    out[#out+1] = string.format("%q", v):gsub("\\\n", "\\n")
+  elseif t ~= "table" then
+    out[#out+1] = string.format("%q", tostring(v))
+  else
+    if seen[v] then out[#out+1] = "\"<recursion>\"" return end
+    if opts.LimitDepth and depth > opts.LimitDepth then
+      out[#out+1] = "\"<...>\"" return
     end
+    seen[v] = true
+
+    local n = 0
+    local array = true
+    for k in pairs(v) do
+      n = n + 1
+      if type(k) ~= "number" then array = false end
+    end
+    array = array and n == #v
+
+    local pad = indent .. "    "
+    if n == 0 then
+      out[#out+1] = array and "[]" or "{}"
+    elseif array then
+      out[#out+1] = "[\n"
+      for i = 1, #v do
+        out[#out+1] = pad
+        encode(v[i], pad, depth + 1, opts, seen, out)
+        out[#out+1] = (i < #v) and ",\n" or "\n"
+      end
+      out[#out+1] = indent .. "]"
+    else
+      local keys = {}
+      for k in pairs(v) do keys[#keys+1] = k end
+      table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+      out[#out+1] = "{\n"
+      for i, k in ipairs(keys) do
+        out[#out+1] = pad .. string.format("%q", tostring(k)) .. ": "
+        encode(v[k], pad, depth + 1, opts, seen, out)
+        out[#out+1] = (i < #keys) and ",\n" or "\n"
+      end
+      out[#out+1] = indent .. "}"
+    end
+    seen[v] = nil
   end
-  print(indent .. "}")
 end
+
+function Ext.Json.Stringify(v, opts)
+  local out = {}
+  encode(v, "", 1, opts or {}, {}, out)
+  return table.concat(out)
+end
+
+function Ext.DumpExport(v) return Ext.Json.Stringify(v, {Beautify = true}) end
+function Ext.Dump(v) Ext.Log.Print(Ext.DumpExport(v)) end
+function Ext.DumpShallow(v)
+  Ext.Log.Print(Ext.Json.Stringify(v, {Beautify = true, LimitDepth = 1}))
+end
+
+_D = Ext.Dump
+_DS = Ext.DumpShallow
+_P = Ext.Log.Print
+_PW = Ext.Log.PrintWarning
+_PE = Ext.Log.PrintError
+Print = Ext.Log.Print
+print = Ext.Log.Print
 )LUA";
     if (luaL_dostring(g_lua, kPrelude) != LUA_OK) {
         logf("lua: prelude failed: %s", lua_tostring(g_lua, -1));
@@ -175,6 +246,26 @@ void lua_bind_osi(const std::vector<osi::Function>& functions) {
         lua_setglobal(g_lua, fn.name.c_str());
     }
     lua_pop(g_lua, 1);
+
+    // Match bg3se's name resolver: a wrong-case lookup on Osi resolves with a
+    // compatibility warning rather than failing, since mods rely on that
+    // leniency. Globals stay exact-case, as they are there too.
+    lua_run(R"LUA(
+local lower = {}
+for name in pairs(Osi) do lower[string.lower(name)] = name end
+setmetatable(Osi, {
+  __index = function(t, key)
+    local real = lower[string.lower(key)]
+    if real == nil then return nil end
+    Ext.Log.PrintWarning(string.format(
+      "COMPATIBILITY WARNING: Osiris symbol '%s' referenced using incorrect " ..
+      "case; the correct name is '%s'", key, real))
+    local fn = rawget(t, real)
+    rawset(t, key, fn)  -- cache, so the warning fires once per name
+    return fn
+  end
+})
+)LUA");
 
     logf("lua: bound %d Osi functions as Osi.* and globals (%d events skipped)",
          bound, events);

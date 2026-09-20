@@ -11,7 +11,7 @@ void debug_server_start();
 void debug_server_pump();
 
 // Forwards Lua print() output to the attached client.
-void debug_server_output(const char* text);
+void debug_server_output(const char* text, int severity = 0);
 
 // Records the calling thread as the one safe for Lua and engine calls.
 // Called from Osiris entry points, which run on the story thread.
