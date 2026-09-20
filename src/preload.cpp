@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "elf_symbols.h"
+#include "debug_server.h"
 #include "lua_host.h"
 #include "osi.h"
 #include "mem.h"
@@ -49,6 +50,7 @@ void ensure_symbols() {
             "_ZN2ls11TypeContextIN3esv4tags8_private23TagComponentTypeContextEE7m_StateE");
         logf("  sentinel esv TagComponentTypeContext::m_State -> %p", p);
         lua_init();
+        debug_server_start();
     });
 }
 
@@ -403,6 +405,7 @@ extern "C" long _ZN7COsiris5EventEjP16COsiArgumentDesc(
         "_ZN7COsiris5EventEjP16COsiArgumentDesc");
 
     dump_once(self);  // first event means the story is up
+    debug_server_pump();  // the story thread is the only safe place for Lua
 
     static unsigned long seen = 0;
     if (++seen <= 5) logf("COsiris::Event(%u) args=%p", event_id, args);

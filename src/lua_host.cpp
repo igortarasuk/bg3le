@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include "debug_server.h"
 #include "log.h"
 
 extern "C" {
@@ -84,6 +85,21 @@ int osi_dispatch(lua_State* L) {
     return static_cast<int>(outputs.size());
 }
 
+// print() goes to the attached debugger client as well as the log, which is
+// what makes the remote prompt useful.
+int l_print(lua_State* L) {
+    std::string out;
+    const int n = lua_gettop(L);
+    for (int i = 1; i <= n; ++i) {
+        if (i > 1) out += "\t";
+        out += luaL_tolstring(L, i, nullptr);
+        lua_pop(L, 1);
+    }
+    debug_server_output(out.c_str());
+    logf("lua print: %s", out.c_str());
+    return 0;
+}
+
 }  // namespace
 
 void lua_init() {
@@ -95,6 +111,8 @@ void lua_init() {
         return;
     }
     luaL_openlibs(g_lua);
+    lua_pushcfunction(g_lua, l_print);
+    lua_setglobal(g_lua, "print");
     logf("lua: %s up", LUA_RELEASE);
 }
 
@@ -118,6 +136,40 @@ void lua_bind_osi(const std::vector<osi::Function>& functions) {
     }
     lua_setglobal(g_lua, "Osi");
     logf("lua: bound %d Osi functions (%d events skipped)", bound, events);
+}
+
+void lua_eval(const char* code, std::string* result, std::string* error) {
+    if (g_lua == nullptr) {
+        *error = "Lua is not initialised";
+        return;
+    }
+
+    // Prefer expression form so a bare expression yields its value, falling
+    // back to statement form when that will not compile.
+    const std::string as_expr = std::string("return ") + code;
+    if (luaL_loadstring(g_lua, as_expr.c_str()) != LUA_OK) {
+        lua_pop(g_lua, 1);
+        if (luaL_loadstring(g_lua, code) != LUA_OK) {
+            *error = lua_tostring(g_lua, -1);
+            lua_pop(g_lua, 1);
+            return;
+        }
+    }
+
+    const int before = lua_gettop(g_lua) - 1;
+    if (lua_pcall(g_lua, 0, LUA_MULTRET, 0) != LUA_OK) {
+        *error = lua_tostring(g_lua, -1);
+        lua_pop(g_lua, 1);
+        return;
+    }
+
+    const int count = lua_gettop(g_lua) - before;
+    for (int i = 0; i < count; ++i) {
+        if (i > 0) *result += "\t";
+        *result += luaL_tolstring(g_lua, before + 1 + i, nullptr);
+        lua_pop(g_lua, 1);
+    }
+    lua_pop(g_lua, count);
 }
 
 void lua_run(const char* code) {

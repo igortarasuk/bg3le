@@ -1,0 +1,261 @@
+#include "debug_server.h"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+
+#include "log.h"
+#include "lua_host.h"
+#include "pb.h"
+
+namespace bg3le {
+namespace {
+
+// LuaDebug.proto field numbers.
+constexpr unsigned kMsgConnect = 3;
+constexpr unsigned kMsgEvaluate = 7;
+constexpr unsigned kBkConnectResponse = 3;
+constexpr unsigned kBkEvaluateResponse = 5;
+constexpr unsigned kBkDebugOutput = 8;
+
+constexpr unsigned kProtocolVersion = 4;
+constexpr unsigned kValueTypeString = 4;
+
+std::atomic<bool> g_running{false};
+std::atomic<int> g_client{-1};
+std::mutex g_send_mutex;
+
+struct Job {
+    std::string code;
+    std::string result;
+    std::string error;
+    bool done = false;
+};
+
+std::mutex g_queue_mutex;
+std::condition_variable g_queue_cv;
+std::deque<std::shared_ptr<Job>> g_queue;
+
+// Framing is a native little-endian uint32 holding the TOTAL packet size,
+// the 4-byte length field included.
+bool send_packet(int fd, const std::string& payload) {
+    std::lock_guard<std::mutex> lock(g_send_mutex);
+    const std::uint32_t total = static_cast<std::uint32_t>(payload.size() + 4);
+    std::string frame(reinterpret_cast<const char*>(&total), 4);
+    frame.append(payload);
+
+    std::size_t sent = 0;
+    while (sent < frame.size()) {
+        const ssize_t n = ::send(fd, frame.data() + sent, frame.size() - sent, MSG_NOSIGNAL);
+        if (n <= 0) return false;
+        sent += static_cast<std::size_t>(n);
+    }
+    return true;
+}
+
+bool recv_exact(int fd, char* buf, std::size_t n) {
+    std::size_t got = 0;
+    while (got < n) {
+        const ssize_t r = ::recv(fd, buf + got, n - got, 0);
+        if (r <= 0) return false;
+        got += static_cast<std::size_t>(r);
+    }
+    return true;
+}
+
+std::string make_connect_response(std::uint64_t reply_seq) {
+    std::string body;
+    pb::uint_field(&body, 1, kProtocolVersion);
+    std::string msg;
+    pb::uint_field(&msg, 2, reply_seq);
+    pb::bytes_field(&msg, kBkConnectResponse, body);
+    return msg;
+}
+
+std::string make_evaluate_response(std::uint64_t reply_seq, const std::string& result,
+                                   const std::string& error) {
+    std::string body;
+    if (!error.empty()) {
+        pb::bytes_field(&body, 2, error);
+    } else {
+        std::string value;
+        pb::uint_field(&value, 1, kValueTypeString);
+        pb::bytes_field(&value, 5, result);
+        pb::bytes_field(&body, 1, value);
+    }
+    std::string msg;
+    pb::uint_field(&msg, 2, reply_seq);
+    pb::bytes_field(&msg, kBkEvaluateResponse, body);
+    return msg;
+}
+
+void handle_client(int fd) {
+    logf("debug: client attached");
+    for (;;) {
+        char header[4];
+        if (!recv_exact(fd, header, 4)) break;
+        std::uint32_t total = 0;
+        std::memcpy(&total, header, 4);
+        if (total < 4 || total > (16u << 20)) {
+            logf("debug: bad packet size %u", total);
+            break;
+        }
+
+        std::string payload(total - 4, '\0');
+        if (total > 4 && !recv_exact(fd, payload.data(), payload.size())) break;
+
+        std::uint64_t seq = 0;
+        std::string connect_body;
+        std::string evaluate_body;
+
+        pb::Reader r(payload.data(), payload.size());
+        unsigned field = 0;
+        unsigned wire = 0;
+        while (r.next(&field, &wire)) {
+            if (field == 1 && wire == 0) {
+                r.read_varint(&seq);
+            } else if (field == kMsgConnect && wire == 2) {
+                r.read_bytes(&connect_body);
+            } else if (field == kMsgEvaluate && wire == 2) {
+                r.read_bytes(&evaluate_body);
+            } else if (!r.skip(wire)) {
+                break;
+            }
+        }
+
+        if (!connect_body.empty()) {
+            if (!send_packet(fd, make_connect_response(seq))) break;
+            continue;
+        }
+
+        if (evaluate_body.empty()) continue;
+
+        std::string expression;
+        pb::Reader er(evaluate_body.data(), evaluate_body.size());
+        while (er.next(&field, &wire)) {
+            if (field == 2 && wire == 2) {
+                er.read_bytes(&expression);
+            } else if (!er.skip(wire)) {
+                break;
+            }
+        }
+
+        // Hand the chunk to the story thread; never touch Lua from here.
+        auto job = std::make_shared<Job>();
+        job->code = expression;
+        {
+            std::lock_guard<std::mutex> lock(g_queue_mutex);
+            g_queue.push_back(job);
+        }
+
+        std::unique_lock<std::mutex> lock(g_queue_mutex);
+        const bool finished = g_queue_cv.wait_for(
+            lock, std::chrono::seconds(10), [&job] { return job->done; });
+        std::string result = job->result;
+        std::string error = job->error;
+        lock.unlock();
+
+        if (!finished) {
+            error = "timed out waiting for the story thread; is the game paused "
+                    "or still loading?";
+        }
+        if (!send_packet(fd, make_evaluate_response(seq, result, error))) break;
+    }
+
+    logf("debug: client detached");
+    g_client.store(-1);
+    ::close(fd);
+}
+
+void listener() {
+    const char* env = std::getenv("BG3LE_DEBUG_PORT");
+    const int port = env != nullptr ? std::atoi(env) : 9998;
+
+    const int srv = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        logf("debug: socket() failed");
+        return;
+    }
+    int one = 1;
+    ::setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+    addr.sin_port = ::htons(static_cast<std::uint16_t>(port));
+
+    if (::bind(srv, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        ::listen(srv, 1) != 0) {
+        logf("debug: cannot listen on 127.0.0.1:%d", port);
+        ::close(srv);
+        return;
+    }
+    logf("debug: listening on 127.0.0.1:%d", port);
+
+    for (;;) {
+        const int fd = ::accept(srv, nullptr, nullptr);
+        if (fd < 0) break;
+        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        g_client.store(fd);
+        handle_client(fd);  // one client at a time, as the protocol assumes
+    }
+    ::close(srv);
+}
+
+}  // namespace
+
+void debug_server_start() {
+    const char* opt = std::getenv("BG3LE_DEBUG");
+    if (opt != nullptr && opt[0] == '0') return;
+    bool expected = false;
+    if (!g_running.compare_exchange_strong(expected, true)) return;
+    std::thread(listener).detach();
+}
+
+void debug_server_pump() {
+    for (;;) {
+        std::shared_ptr<Job> job;
+        {
+            std::lock_guard<std::mutex> lock(g_queue_mutex);
+            if (g_queue.empty()) return;
+            job = g_queue.front();
+            g_queue.pop_front();
+        }
+
+        std::string result;
+        std::string error;
+        lua_eval(job->code.c_str(), &result, &error);
+
+        {
+            std::lock_guard<std::mutex> lock(g_queue_mutex);
+            job->result = std::move(result);
+            job->error = std::move(error);
+            job->done = true;
+        }
+        g_queue_cv.notify_all();
+    }
+}
+
+void debug_server_output(const char* text) {
+    const int fd = g_client.load();
+    if (fd < 0 || text == nullptr) return;
+    std::string body;
+    pb::bytes_field(&body, 1, text);
+    std::string msg;
+    pb::bytes_field(&msg, kBkDebugOutput, body);
+    send_packet(fd, msg);
+}
+
+}  // namespace bg3le
