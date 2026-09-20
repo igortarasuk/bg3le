@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "elf_symbols.h"
+#include "lua_host.h"
 #include "mem.h"
 #include "log.h"
 
@@ -45,6 +46,7 @@ void ensure_symbols() {
         void* p = g_symbols.find(
             "_ZN2ls11TypeContextIN3esv4tags8_private23TagComponentTypeContextEE7m_StateE");
         logf("  sentinel esv TagComponentTypeContext::m_State -> %p", p);
+        lua_init();
     });
 }
 
@@ -134,15 +136,51 @@ using Thunk6 = long (*)(long, long, long, long, long, long);
 Thunk6 g_real_call = nullptr;
 Thunk6 g_real_query = nullptr;
 
+// Cross-check the raw bytes of a live COsiArgumentDesc against Osiris' own
+// exported accessors, so the layout is read off the engine rather than guessed.
+void dump_arg_desc(const void* desc, unsigned id, const char* kind) {
+    logf("%s id=0x%08x arg desc @ %p", kind, id, desc);
+
+    std::uintptr_t w[8] = {};
+    if (safe_read(desc, w, sizeof(w))) {
+        for (unsigned i = 0; i < 8; ++i)
+            logf("   +%02zu = 0x%016lx", i * sizeof(void*), (unsigned long)w[i]);
+    }
+
+    auto is_str = next<bool (*)(const void*)>("_ZNK16COsiArgumentDesc12IsStringTypeEv");
+    auto get_int = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc10GetIntegerEv");
+    auto get_str = next<const char* (*)(const void*)>(
+        "_ZNK16COsiArgumentDesc12GetAnyStringEv");
+    auto get_type = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc13GetOpaqueTypeEv");
+
+    if (get_type != nullptr) logf("   GetOpaqueType() = %d", get_type(desc));
+    if (is_str != nullptr) {
+        bool str = is_str(desc);
+        logf("   IsStringType()  = %d", (int)str);
+        if (str && get_str != nullptr) {
+            const char* v = get_str(desc);
+            char buf[128];
+            logf("   GetAnyString()  = \"%s\"",
+                 safe_cstr(v, buf, sizeof(buf)) ? buf : "<unreadable>");
+        } else if (!str && get_int != nullptr) {
+            logf("   GetInteger()    = %d", get_int(desc));
+        }
+    }
+}
+
 long call_wrapper(long a, long b, long c, long d, long e, long f) {
     static unsigned long seen = 0;
     if (++seen <= 10) logf("DIV Call  arg0=0x%lx arg1=0x%lx", a, b);
+    if (seen == 1) dump_arg_desc(reinterpret_cast<const void*>(b),
+                                 (unsigned)a, "DIV Call ");
     return g_real_call != nullptr ? g_real_call(a, b, c, d, e, f) : 0;
 }
 
 long query_wrapper(long a, long b, long c, long d, long e, long f) {
     static unsigned long seen = 0;
     if (++seen <= 10) logf("DIV Query arg0=0x%lx arg1=0x%lx", a, b);
+    if (seen == 1) dump_arg_desc(reinterpret_cast<const void*>(b),
+                                 (unsigned)a, "DIV Query");
     return g_real_query != nullptr ? g_real_query(a, b, c, d, e, f) : 0;
 }
 
