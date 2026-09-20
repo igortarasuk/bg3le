@@ -1,3 +1,4 @@
 [submodule "client"]
 	path = client
 	url = https://github.com/lenonk/bg3lua.git
+	pushurl = git@github.com:lenonk/bg3lua.git
