@@ -40,7 +40,34 @@ Fn next(const char* mangled) {
     return reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, mangled));
 }
 
-void install_tick_hook();
+// ---- tick ----
+//
+// esv::GameServer::UpdateMessagesToSend flushes outbound network messages
+// once per server tick, on the story thread, whether or not the story is
+// busy. It has no direct call sites -- it is dispatched through a pointer
+// table -- so hooking it is one aligned store.
+//
+// Offsets from tools/recover_symbols.py | tools/find_slots.py against
+// 4.8.400.7143220; hook_slot verifies the slot before touching it.
+constexpr std::uintptr_t kUpdateMessagesSlot = 0x7a88228;
+constexpr std::uintptr_t kUpdateMessagesFunc = 0x7077120;
+
+using UpdateMessagesProc = void (*)(void*);
+UpdateMessagesProc g_orig_update_messages = nullptr;
+
+void update_messages_hook(void* self) {
+    debug_server_note_story_thread();
+    debug_server_pump();
+    if (g_orig_update_messages != nullptr) g_orig_update_messages(self);
+}
+
+void install_tick_hook() {
+    void* original = nullptr;
+    if (hook_slot(kUpdateMessagesSlot, kUpdateMessagesFunc,
+                  reinterpret_cast<void*>(&update_messages_hook), &original)) {
+        g_orig_update_messages = reinterpret_cast<UpdateMessagesProc>(original);
+    }
+}
 
 void ensure_symbols() {
     std::call_once(g_symbols_once, [] {
@@ -416,35 +443,6 @@ extern "C" long _ZN7COsiris5EventEjP16COsiArgumentDesc(
     static unsigned long seen = 0;
     if (++seen <= 5) logf("COsiris::Event(%u) args=%p", event_id, args);
     return real != nullptr ? real(self, event_id, args) : 0;
-}
-
-// ---- tick ----
-//
-// esv::GameServer::UpdateMessagesToSend flushes outbound network messages
-// once per server tick, on the story thread, whether or not the story is
-// busy. It has no direct call sites -- it is dispatched through a pointer
-// table -- so hooking it is one aligned store.
-//
-// Offsets from tools/recover_symbols.py | tools/find_slots.py against
-// 4.8.400.7143220; hook_slot verifies the slot before touching it.
-constexpr std::uintptr_t kUpdateMessagesSlot = 0x7a88228;
-constexpr std::uintptr_t kUpdateMessagesFunc = 0x7077120;
-
-using UpdateMessagesProc = void (*)(void*);
-UpdateMessagesProc g_orig_update_messages = nullptr;
-
-void update_messages_hook(void* self) {
-    debug_server_note_story_thread();
-    debug_server_pump();
-    if (g_orig_update_messages != nullptr) g_orig_update_messages(self);
-}
-
-void install_tick_hook() {
-    void* original = nullptr;
-    if (hook_slot(kUpdateMessagesSlot, kUpdateMessagesFunc,
-                  reinterpret_cast<void*>(&update_messages_hook), &original)) {
-        g_orig_update_messages = reinterpret_cast<UpdateMessagesProc>(original);
-    }
 }
 
 // ---- pump ----
