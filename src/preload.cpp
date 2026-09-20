@@ -11,12 +11,14 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <mutex>
 #include <ctime>
 #include <unistd.h>
 
 #include "elf_symbols.h"
 #include "lua_host.h"
+#include "osi.h"
 #include "mem.h"
 #include "log.h"
 
@@ -220,6 +222,8 @@ void* maybe_wrap_div_table(void* init_fn) {
     // Always record the handlers; interposing them is a separate opt-in.
     g_real_call = reinterpret_cast<Thunk6>(copy[1]);
     g_real_query = reinterpret_cast<Thunk6>(copy[2]);
+    osi::set_handlers(reinterpret_cast<void*>(copy[1]),
+                      reinterpret_cast<void*>(copy[2]));
 
     const char* opt = std::getenv("BG3LE_WRAP_DIV");
     if (opt == nullptr || opt[0] != '1') return init_fn;
@@ -244,42 +248,13 @@ double now_s() {
 // integer parameter while type is different", which routes to the game's
 // assert thunk and aborts. SetType must come first; it is a two-instruction
 // store of the type at +16 and a zero of the value at +08.
-enum : unsigned short { OSI_INTEGER = 1 };
-
 void test_integer_sum() {
     const char* opt = std::getenv("BG3LE_TEST_CALL");
     if (opt == nullptr || opt[0] != '1') return;
-    if (g_real_query == nullptr) {
-        logf("test: no Query handler recorded");
-        return;
-    }
-
-    auto set_type = next<void (*)(void*, unsigned short)>(
-        "_ZN16COsiArgumentDesc7SetTypeE13TOsiValueType");
-    auto set_int = next<void (*)(void*, int)>("_ZN16COsiArgumentDesc10SetIntegerEi");
-    auto get_int = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc10GetIntegerEv");
-    if (set_type == nullptr || set_int == nullptr || get_int == nullptr) {
-        logf("test: accessors unresolved");
-        return;
-    }
-
-    alignas(16) static unsigned char nodes[3][128];
-    std::memset(nodes, 0, sizeof(nodes));
-
-    const int values[3] = {2, 3, 0};
-    for (int i = 0; i < 3; ++i) {
-        set_type(nodes[i], OSI_INTEGER);
-        set_int(nodes[i], values[i]);
-    }
-    *reinterpret_cast<void**>(nodes[0]) = nodes[1];
-    *reinterpret_cast<void**>(nodes[1]) = nodes[2];
-    *reinterpret_cast<void**>(nodes[2]) = nullptr;
-    logf("test: built args (%d, %d, out=%d)", get_int(nodes[0]), get_int(nodes[1]),
-         get_int(nodes[2]));
-
-    long rc = g_real_query(0x80000002L, reinterpret_cast<long>(nodes[0]), 0, 0, 0, 0);
-    logf("test: IntegerSum -> rc=%d out=%d (expecting 5)", (int)(rc & 0xff),
-         get_int(nodes[2]));
+    logf("lua test: Osi.IntegerSum(2, 3) ->");
+    lua_run("local s = Osi.IntegerSum(2, 3); return tostring(s)");
+    logf("lua test: Osi.GetModuleVersion('GustavX') ->");
+    lua_run("return table.concat({Osi.GetModuleVersion('GustavX')}, '.')");
 }
 
 // Building a descriptor from zeroed memory crashes inside SetInteger, so
@@ -372,6 +347,23 @@ void dump_osiris_api(void* self) {
         std::fclose(f);
         logf("osiris: wrote %s", path);
     }
+
+    std::vector<osi::Function> bindable;
+    bindable.reserve(func_count);
+    for (unsigned i = 0; i < func_count; ++i) {
+        const MappingInfo& m = funcs[i];
+        osi::Function fn;
+        fn.name = name_of(m);
+        fn.id = m.id;
+        fn.params.reserve(m.num_params);
+        for (unsigned p = 0; p < m.num_params; ++p) {
+            std::uint8_t t = 0;
+            safe_read(m.param_types + p, &t, 1);
+            fn.params.push_back(t);
+        }
+        bindable.push_back(std::move(fn));
+    }
+    lua_bind_osi(bindable);
 
     auto free_types = next<FreeMappings>("_ZN7COsiris16FreeTypeMappingsEP11MappingInfoj");
     auto free_funcs = next<FreeMappings>("_ZN7COsiris20FreeFunctionMappingsEP11MappingInfoj");

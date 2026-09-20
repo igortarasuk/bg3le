@@ -19,6 +19,7 @@ add_library(bg3le SHARED
     src/log.cpp
     src/mem.cpp
     src/lua_host.cpp
+    src/osi.cpp
 )
 target_link_libraries(bg3le PRIVATE dl lua_static)
 target_link_options(bg3le PRIVATE -static-libstdc++ -static-libgcc)
