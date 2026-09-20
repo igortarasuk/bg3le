@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "elf_symbols.h"
+#include "hook.h"
 #include "debug_server.h"
 #include "lua_host.h"
 #include "osi.h"
@@ -39,6 +40,8 @@ Fn next(const char* mangled) {
     return reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, mangled));
 }
 
+void install_tick_hook();
+
 void ensure_symbols() {
     std::call_once(g_symbols_once, [] {
         if (!g_symbols.load()) {
@@ -52,6 +55,7 @@ void ensure_symbols() {
         logf("  sentinel esv TagComponentTypeContext::m_State -> %p", p);
         lua_init();
         debug_server_start();
+        install_tick_hook();
     });
 }
 
@@ -416,25 +420,31 @@ extern "C" long _ZN7COsiris5EventEjP16COsiArgumentDesc(
 
 // ---- tick ----
 //
-// The engine has no named per-tick function we can interpose (Update has no
-// assert string, so symbol recovery does not see it), and hooking an internal
-// address would need a detour library plus an instruction length decoder.
-// clock_gettime is imported, called every tick by the game loop, and cheap to
-// filter: pump only when work is pending and we are on the story thread.
+// esv::GameServer::UpdateMessagesToSend flushes outbound network messages
+// once per server tick, on the story thread, whether or not the story is
+// busy. It has no direct call sites -- it is dispatched through a pointer
+// table -- so hooking it is one aligned store.
+//
+// Offsets from tools/recover_symbols.py | tools/find_slots.py against
+// 4.8.400.7143220; hook_slot verifies the slot before touching it.
+constexpr std::uintptr_t kUpdateMessagesSlot = 0x7a88228;
+constexpr std::uintptr_t kUpdateMessagesFunc = 0x7077120;
 
-extern "C" int clock_gettime(clockid_t clk, struct timespec* ts) {
-    static auto real = next<int (*)(clockid_t, struct timespec*)>("clock_gettime");
-    if (real == nullptr) return -1;
-    const int rc = real(clk, ts);
+using UpdateMessagesProc = void (*)(void*);
+UpdateMessagesProc g_orig_update_messages = nullptr;
 
-    // Lua and our own logging call clock_gettime, so do not re-enter.
-    static thread_local bool inside = false;
-    if (!inside) {
-        inside = true;
-        debug_server_tick();
-        inside = false;
+void update_messages_hook(void* self) {
+    debug_server_note_story_thread();
+    debug_server_pump();
+    if (g_orig_update_messages != nullptr) g_orig_update_messages(self);
+}
+
+void install_tick_hook() {
+    void* original = nullptr;
+    if (hook_slot(kUpdateMessagesSlot, kUpdateMessagesFunc,
+                  reinterpret_cast<void*>(&update_messages_hook), &original)) {
+        g_orig_update_messages = reinterpret_cast<UpdateMessagesProc>(original);
     }
-    return rc;
 }
 
 // ---- pump ----
