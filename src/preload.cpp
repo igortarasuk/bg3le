@@ -405,12 +405,36 @@ extern "C" long _ZN7COsiris5EventEjP16COsiArgumentDesc(
     static auto real = next<long (*)(void*, unsigned, void*)>(
         "_ZN7COsiris5EventEjP16COsiArgumentDesc");
 
+    debug_server_note_story_thread();  // Osiris runs on the story thread
     dump_once(self);  // first event means the story is up
-    debug_server_pump();  // the story thread is the only safe place for Lua
+    debug_server_pump();
 
     static unsigned long seen = 0;
     if (++seen <= 5) logf("COsiris::Event(%u) args=%p", event_id, args);
     return real != nullptr ? real(self, event_id, args) : 0;
+}
+
+// ---- tick ----
+//
+// The engine has no named per-tick function we can interpose (Update has no
+// assert string, so symbol recovery does not see it), and hooking an internal
+// address would need a detour library plus an instruction length decoder.
+// clock_gettime is imported, called every tick by the game loop, and cheap to
+// filter: pump only when work is pending and we are on the story thread.
+
+extern "C" int clock_gettime(clockid_t clk, struct timespec* ts) {
+    static auto real = next<int (*)(clockid_t, struct timespec*)>("clock_gettime");
+    if (real == nullptr) return -1;
+    const int rc = real(clk, ts);
+
+    // Lua and our own logging call clock_gettime, so do not re-enter.
+    static thread_local bool inside = false;
+    if (!inside) {
+        inside = true;
+        debug_server_tick();
+        inside = false;
+    }
+    return rc;
 }
 
 // ---- pump ----
@@ -445,6 +469,7 @@ extern "C" long _ZNK7COsiris13NoStoryLoadedEv(void* self) {
 
 extern "C" long _ZN7COsiris4LoadER12COsiSmartBuf(void* self, void* buf) {
     static auto real = next<long (*)(void*, void*)>("_ZN7COsiris4LoadER12COsiSmartBuf");
+    debug_server_note_story_thread();
     double t0 = now_s();
     long rc = real != nullptr ? real(self, buf) : 0;
     logf("COsiris::Load took %.2fs", now_s() - t0);

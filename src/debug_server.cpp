@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -47,6 +48,15 @@ struct Job {
 std::mutex g_queue_mutex;
 std::condition_variable g_queue_cv;
 std::deque<std::shared_ptr<Job>> g_queue;
+
+// Pending count is read on every clock_gettime, so keep it lock-free.
+std::atomic<int> g_pending{0};
+std::atomic<long> g_story_tid{0};
+
+long this_tid() {
+    static thread_local long tid = ::syscall(SYS_gettid);
+    return tid;
+}
 
 // Framing is a native little-endian uint32 holding the TOTAL packet size,
 // the 4-byte length field included.
@@ -159,6 +169,7 @@ void handle_client(int fd) {
             std::lock_guard<std::mutex> lock(g_queue_mutex);
             g_queue.push_back(job);
         }
+        g_pending.fetch_add(1, std::memory_order_release);
 
         std::unique_lock<std::mutex> lock(g_queue_mutex);
         const bool finished = g_queue_cv.wait_for(
@@ -234,6 +245,8 @@ void debug_server_pump() {
             g_queue.pop_front();
         }
 
+        g_pending.fetch_sub(1, std::memory_order_acq_rel);
+
         std::string result;
         std::string error;
         lua_eval(job->code.c_str(), &result, &error);
@@ -246,6 +259,18 @@ void debug_server_pump() {
         }
         g_queue_cv.notify_all();
     }
+}
+
+void debug_server_note_story_thread() {
+    long expected = 0;
+    g_story_tid.compare_exchange_strong(expected, this_tid());
+}
+
+void debug_server_tick() {
+    if (g_pending.load(std::memory_order_acquire) == 0) return;
+    const long owner = g_story_tid.load(std::memory_order_relaxed);
+    if (owner == 0 || this_tid() != owner) return;
+    debug_server_pump();
 }
 
 void debug_server_output(const char* text) {
