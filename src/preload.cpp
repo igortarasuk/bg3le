@@ -25,6 +25,7 @@ namespace {
 SymbolTable g_symbols;
 std::once_flag g_symbols_once;
 std::once_flag g_story_once;
+std::once_flag g_init_struct_once;
 
 void ensure_symbols();
 
@@ -78,6 +79,90 @@ const char* base_type_name(std::uint8_t t) {
 std::string name_of(const MappingInfo& m) {
     char buf[256];
     return safe_cstr(m.name, buf, sizeof(buf)) ? std::string(buf) : std::string("?");
+}
+
+// TOsirisInitFunction is the callback table the game hands to Osiris. It
+// should carry the dispatch entry used to invoke DIV functions, which is the
+// call path Osi.* needs. Classify each word to find out what's in it.
+void dump_init_struct(const void* init_fn) {
+    std::uintptr_t words[16] = {};
+    if (!safe_read(init_fn, words, sizeof(words))) {
+        logf("init struct: unreadable at %p", init_fn);
+        return;
+    }
+
+    logf("TOsirisInitFunction @ %p", init_fn);
+    for (unsigned i = 0; i < 16; ++i) {
+        const std::uintptr_t w = words[i];
+        const std::size_t off = i * sizeof(void*);
+
+        if (w == 0) {
+            logf("  +%02zu = 0", off);
+            continue;
+        }
+
+        Dl_info info{};
+        if (::dladdr(reinterpret_cast<void*>(w), &info) != 0 && info.dli_fname != nullptr) {
+            const char* base = std::strrchr(info.dli_fname, '/');
+            logf("  +%02zu = 0x%016lx  %s+0x%lx  %s", off, (unsigned long)w,
+                 base != nullptr ? base + 1 : info.dli_fname,
+                 (unsigned long)(w - reinterpret_cast<std::uintptr_t>(info.dli_fbase)),
+                 info.dli_sname != nullptr ? info.dli_sname : "");
+            continue;
+        }
+
+        char text[64];
+        if (safe_cstr(reinterpret_cast<const void*>(w), text, sizeof(text)) &&
+            text[0] >= 0x20 && text[0] < 0x7f) {
+            logf("  +%02zu = 0x%016lx  \"%s\"", off, (unsigned long)w, text);
+        } else {
+            logf("  +%02zu = 0x%016lx", off, (unsigned long)w);
+        }
+    }
+}
+
+// The table's two large entries (+08, +16) are the likely Call/Query
+// handlers Osiris invokes for DIV functions; the rest are small thunks.
+// Rather than guess, hand Osiris a copy with those two wrapped and learn the
+// signature from real traffic.
+//
+// Wrappers take six longs so they forward correctly whatever the true arity
+// is: SysV passes the first six integer args in registers, and the callee
+// reads only what it needs. Opt in with BG3LE_WRAP_DIV=1.
+using Thunk6 = long (*)(long, long, long, long, long, long);
+
+Thunk6 g_real_call = nullptr;
+Thunk6 g_real_query = nullptr;
+
+long call_wrapper(long a, long b, long c, long d, long e, long f) {
+    static unsigned long seen = 0;
+    if (++seen <= 10) logf("DIV Call  arg0=0x%lx arg1=0x%lx", a, b);
+    return g_real_call != nullptr ? g_real_call(a, b, c, d, e, f) : 0;
+}
+
+long query_wrapper(long a, long b, long c, long d, long e, long f) {
+    static unsigned long seen = 0;
+    if (++seen <= 10) logf("DIV Query arg0=0x%lx arg1=0x%lx", a, b);
+    return g_real_query != nullptr ? g_real_query(a, b, c, d, e, f) : 0;
+}
+
+// Returns the table to pass on: either our patched copy or the original.
+void* maybe_wrap_div_table(void* init_fn) {
+    const char* opt = std::getenv("BG3LE_WRAP_DIV");
+    if (opt == nullptr || opt[0] != '1') return init_fn;
+
+    static std::uintptr_t copy[32];
+    if (!safe_read(init_fn, copy, sizeof(copy))) {
+        logf("DIV wrap: table unreadable, passing through");
+        return init_fn;
+    }
+
+    g_real_call = reinterpret_cast<Thunk6>(copy[1]);
+    g_real_query = reinterpret_cast<Thunk6>(copy[2]);
+    copy[1] = reinterpret_cast<std::uintptr_t>(&call_wrapper);
+    copy[2] = reinterpret_cast<std::uintptr_t>(&query_wrapper);
+    logf("DIV wrap: active (call=%p query=%p)", (void*)g_real_call, (void*)g_real_query);
+    return copy;
 }
 
 double now_s() {
@@ -178,7 +263,9 @@ extern "C" long _ZN7COsiris20RegisterDIVFunctionsEP19TOsirisInitFunction(
         "_ZN7COsiris20RegisterDIVFunctionsEP19TOsirisInitFunction");
     logf("COsiris::RegisterDIVFunctions() self=%p init=%p", self, init_fn);
     ensure_symbols();  // game is initialised by now; its allocator is usable
-    return real != nullptr ? real(self, init_fn) : 0;
+    std::call_once(g_init_struct_once, [init_fn] { dump_init_struct(init_fn); });
+    void* table = maybe_wrap_div_table(init_fn);
+    return real != nullptr ? real(self, table) : 0;
 }
 
 extern "C" long _ZN7COsiris5EventEjP16COsiArgumentDesc(
