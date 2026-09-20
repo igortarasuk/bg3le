@@ -139,52 +139,53 @@ Thunk6 g_real_query = nullptr;
 // Cross-check the raw bytes of a live COsiArgumentDesc against Osiris' own
 // exported accessors, so the layout is read off the engine rather than guessed.
 void dump_arg_desc(const void* desc, unsigned id, const char* kind) {
-    logf("%s id=0x%08x arg desc @ %p", kind, id, desc);
-
-    std::uintptr_t w[8] = {};
-    if (safe_read(desc, w, sizeof(w))) {
-        for (unsigned i = 0; i < 8; ++i)
-            logf("   +%02zu = 0x%016lx", i * sizeof(void*), (unsigned long)w[i]);
-    }
-
-    // If +00 is NextParam, walking it must reproduce the enumerated signature.
     auto type_of = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc13GetOpaqueTypeEv");
-    if (type_of != nullptr) {
-        const void* node = desc;
-        for (unsigned i = 0; i < 12 && node != nullptr; ++i) {
-            std::uintptr_t nxt = 0;
-            if (!safe_read(node, &nxt, sizeof(nxt))) break;
-            logf("   chain[%u] @ %p type=%d next=0x%lx", i, node, type_of(node),
-                 (unsigned long)nxt);
-            node = reinterpret_cast<const void*>(nxt);
-        }
-    }
-
     auto is_str = next<bool (*)(const void*)>("_ZNK16COsiArgumentDesc12IsStringTypeEv");
     auto get_int = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc10GetIntegerEv");
     auto get_str = next<const char* (*)(const void*)>(
         "_ZNK16COsiArgumentDesc12GetAnyStringEv");
-    auto get_type = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc13GetOpaqueTypeEv");
+    auto src_ptr = next<const void* (*)(const void*, bool)>(
+        "_ZNK16COsiArgumentDesc13GetDataSrcPtrEb");
+    auto data_size = next<unsigned long (*)(const void*, bool)>(
+        "_ZNK16COsiArgumentDesc11GetDataSizeEb");
 
-    if (get_type != nullptr) logf("   GetOpaqueType() = %d", get_type(desc));
-    if (is_str != nullptr) {
-        bool str = is_str(desc);
-        logf("   IsStringType()  = %d", (int)str);
+    logf("%s id=0x%08x chain from %p", kind, id, desc);
+
+    const void* node = desc;
+    for (unsigned n = 0; n < 8 && node != nullptr; ++n) {
+        std::uintptr_t w[12] = {};
+        if (!safe_read(node, w, sizeof(w))) {
+            logf("  node[%u] @ %p unreadable", n, node);
+            break;
+        }
+
+        const int type = type_of != nullptr ? type_of(node) : -1;
+        const bool str = is_str != nullptr && is_str(node);
+        logf("  node[%u] @ %p type=%d isString=%d", n, node, type, (int)str);
+        for (unsigned i = 0; i < 12; ++i)
+            logf("      +%02zu = 0x%016lx", i * sizeof(void*), (unsigned long)w[i]);
+
+        // Where does the value actually live? This is what constructing one needs.
+        if (src_ptr != nullptr) logf("      GetDataSrcPtr(false) = %p", src_ptr(node, false));
+        if (data_size != nullptr) logf("      GetDataSize(false)   = %lu", data_size(node, false));
+
         if (str && get_str != nullptr) {
-            const char* v = get_str(desc);
             char buf[128];
-            logf("   GetAnyString()  = \"%s\"",
+            const char* v = get_str(node);
+            logf("      GetAnyString() = \"%s\"",
                  safe_cstr(v, buf, sizeof(buf)) ? buf : "<unreadable>");
         } else if (!str && get_int != nullptr) {
-            logf("   GetInteger()    = %d", get_int(desc));
+            logf("      GetInteger()   = %d", get_int(node));
         }
+
+        node = reinterpret_cast<const void*>(w[0]);  // suspected NextParam
     }
 }
 
 long call_wrapper(long a, long b, long c, long d, long e, long f) {
     static unsigned long seen = 0;
     if (++seen <= 10) logf("DIV Call  arg0=0x%lx arg1=0x%lx", a, b);
-    if (seen == 1) dump_arg_desc(reinterpret_cast<const void*>(b),
+    if (seen <= 3) dump_arg_desc(reinterpret_cast<const void*>(b),
                                  (unsigned)a, "DIV Call ");
     return g_real_call != nullptr ? g_real_call(a, b, c, d, e, f) : 0;
 }
@@ -192,7 +193,7 @@ long call_wrapper(long a, long b, long c, long d, long e, long f) {
 long query_wrapper(long a, long b, long c, long d, long e, long f) {
     static unsigned long seen = 0;
     if (++seen <= 10) logf("DIV Query arg0=0x%lx arg1=0x%lx", a, b);
-    if (seen == 1) dump_arg_desc(reinterpret_cast<const void*>(b),
+    if (seen <= 3) dump_arg_desc(reinterpret_cast<const void*>(b),
                                  (unsigned)a, "DIV Query");
     return g_real_query != nullptr ? g_real_query(a, b, c, d, e, f) : 0;
 }
@@ -246,10 +247,13 @@ void test_integer_sum() {
     // The real size is unknown; over-allocate and zero it.
     alignas(16) static unsigned char nodes[3][256];
     std::memset(nodes, 0, sizeof(nodes));
+    logf("test: running ctor on 3 nodes ...");
     for (int i = 0; i < 3; ++i) ctor(nodes[i]);
+    logf("test: ctor ok; calling SetInteger ...");
     set_int(nodes[0], 2);
     set_int(nodes[1], 3);
     set_int(nodes[2], 0);
+    logf("test: SetInteger ok; linking ...");
 
     // Link through the suspected NextParam slot at +00.
     *reinterpret_cast<void**>(nodes[0]) = nodes[1];
