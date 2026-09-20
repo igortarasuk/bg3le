@@ -147,6 +147,19 @@ void dump_arg_desc(const void* desc, unsigned id, const char* kind) {
             logf("   +%02zu = 0x%016lx", i * sizeof(void*), (unsigned long)w[i]);
     }
 
+    // If +00 is NextParam, walking it must reproduce the enumerated signature.
+    auto type_of = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc13GetOpaqueTypeEv");
+    if (type_of != nullptr) {
+        const void* node = desc;
+        for (unsigned i = 0; i < 12 && node != nullptr; ++i) {
+            std::uintptr_t nxt = 0;
+            if (!safe_read(node, &nxt, sizeof(nxt))) break;
+            logf("   chain[%u] @ %p type=%d next=0x%lx", i, node, type_of(node),
+                 (unsigned long)nxt);
+            node = reinterpret_cast<const void*>(nxt);
+        }
+    }
+
     auto is_str = next<bool (*)(const void*)>("_ZNK16COsiArgumentDesc12IsStringTypeEv");
     auto get_int = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc10GetIntegerEv");
     auto get_str = next<const char* (*)(const void*)>(
@@ -186,17 +199,19 @@ long query_wrapper(long a, long b, long c, long d, long e, long f) {
 
 // Returns the table to pass on: either our patched copy or the original.
 void* maybe_wrap_div_table(void* init_fn) {
-    const char* opt = std::getenv("BG3LE_WRAP_DIV");
-    if (opt == nullptr || opt[0] != '1') return init_fn;
-
     static std::uintptr_t copy[32];
     if (!safe_read(init_fn, copy, sizeof(copy))) {
-        logf("DIV wrap: table unreadable, passing through");
+        logf("DIV table unreadable, passing through");
         return init_fn;
     }
 
+    // Always record the handlers; interposing them is a separate opt-in.
     g_real_call = reinterpret_cast<Thunk6>(copy[1]);
     g_real_query = reinterpret_cast<Thunk6>(copy[2]);
+
+    const char* opt = std::getenv("BG3LE_WRAP_DIV");
+    if (opt == nullptr || opt[0] != '1') return init_fn;
+
     copy[1] = reinterpret_cast<std::uintptr_t>(&call_wrapper);
     copy[2] = reinterpret_cast<std::uintptr_t>(&query_wrapper);
     logf("DIV wrap: active (call=%p query=%p)", (void*)g_real_call, (void*)g_real_query);
@@ -209,6 +224,43 @@ double now_s() {
     return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
 }
 
+// First attempt at invoking Osiris ourselves. IntegerSum is pure arithmetic
+// with a checkable answer, so a wrong layout shows up as a bad result rather
+// than as damage to a save. Opt in with BG3LE_TEST_CALL=1.
+void test_integer_sum() {
+    const char* opt = std::getenv("BG3LE_TEST_CALL");
+    if (opt == nullptr || opt[0] != '1') return;
+    if (g_real_query == nullptr) {
+        logf("test: no Query handler recorded");
+        return;
+    }
+
+    auto ctor = next<void (*)(void*)>("_ZN16COsiArgumentDescC1Ev");
+    auto set_int = next<void (*)(void*, int)>("_ZN16COsiArgumentDesc10SetIntegerEi");
+    auto get_int = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc10GetIntegerEv");
+    if (ctor == nullptr || set_int == nullptr || get_int == nullptr) {
+        logf("test: COsiArgumentDesc accessors unresolved");
+        return;
+    }
+
+    // The real size is unknown; over-allocate and zero it.
+    alignas(16) static unsigned char nodes[3][256];
+    std::memset(nodes, 0, sizeof(nodes));
+    for (int i = 0; i < 3; ++i) ctor(nodes[i]);
+    set_int(nodes[0], 2);
+    set_int(nodes[1], 3);
+    set_int(nodes[2], 0);
+
+    // Link through the suspected NextParam slot at +00.
+    *reinterpret_cast<void**>(nodes[0]) = nodes[1];
+    *reinterpret_cast<void**>(nodes[1]) = nodes[2];
+    *reinterpret_cast<void**>(nodes[2]) = nullptr;
+
+    logf("test: invoking IntegerSum(2, 3, out) via Query 0x80000002 ...");
+    long rc = g_real_query(0x80000002L, reinterpret_cast<long>(nodes[0]), 0, 0, 0, 0);
+    logf("test: returned rc=%ld, out=%d (expecting 5)", rc, get_int(nodes[2]));
+}
+
 // Whichever of InitGame / the first Event happens first does the work.
 void dump_osiris_api(void* self);
 
@@ -216,6 +268,7 @@ void dump_once(void* self) {
     std::call_once(g_story_once, [self] {
         ensure_symbols();
         dump_osiris_api(self);
+        test_integer_sum();
     });
 }
 
