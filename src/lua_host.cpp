@@ -327,7 +327,7 @@ print = Ext.Log.Print
         logf("lua: prelude failed: %s", lua_tostring(g_lua, -1));
         lua_pop(g_lua, 1);
     }
-    logf("lua: %s up", LUA_RELEASE);
+    statusf("LUA VM initialised (%s)", LUA_RELEASE);
 }
 
 void lua_bind_osi(const std::vector<osi::Function>& functions) {
@@ -384,8 +384,8 @@ setmetatable(Osi, {
 })
 )LUA");
 
-    logf("lua: bound %d Osi functions as Osi.* and globals (%d events skipped)",
-         bound, events);
+    statusf("Bound %d Osiris functions as Osi.* and globals (%d events skipped)",
+            bound, events);
 }
 
 void lua_eval(const char* code, std::string* result, std::string* error) {

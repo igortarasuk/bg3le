@@ -13,6 +13,11 @@ void debug_server_pump();
 // Forwards Lua print() output to the attached client.
 void debug_server_output(const char* text, int severity = 0);
 
+// Lifecycle status: written to the log, forwarded to an attached client, and
+// retained so a client that connects later still sees what happened. This is
+// the stream bg3se surfaces in the debugger.
+void statusf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+
 // Records the calling thread as the one safe for Lua and engine calls.
 // Called from Osiris entry points, which run on the story thread.
 void debug_server_note_story_thread();

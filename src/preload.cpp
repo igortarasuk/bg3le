@@ -66,6 +66,11 @@ void install_tick_hook() {
     if (hook_slot(kUpdateMessagesSlot, kUpdateMessagesFunc,
                   reinterpret_cast<void*>(&update_messages_hook), &original)) {
         g_orig_update_messages = reinterpret_cast<UpdateMessagesProc>(original);
+        statusf("Hooked server tick via slot 0x%lx",
+                (unsigned long)kUpdateMessagesSlot);
+    } else {
+        statusf("WARNING: server tick hook refused; the prompt will stall "
+                "unless a story is active");
     }
 }
 
@@ -75,8 +80,10 @@ void ensure_symbols() {
             logf("symbol table unavailable");
             return;
         }
-        logf("symbols: %zu from %s (bias 0x%lx)", g_symbols.count(),
-             g_symbols.path().c_str(), g_symbols.bias());
+        statusf("bg3le attached to %s", g_symbols.path().c_str());
+        statusf("Extender runtime log written to '%s'", log_path());
+        statusf("Resolved %zu symbols (load bias 0x%lx)", g_symbols.count(),
+                g_symbols.bias());
         void* p = g_symbols.find(
             "_ZN2ls11TypeContextIN3esv4tags8_private23TagComponentTypeContextEE7m_StateE");
         logf("  sentinel esv TagComponentTypeContext::m_State -> %p", p);
@@ -348,7 +355,7 @@ void dump_osiris_api(void* self) {
     MappingInfo* funcs = nullptr;
     unsigned func_count = 0;
     get_funcs(self, &funcs, &func_count);
-    logf("osiris: %u functions, %u types", func_count, type_count);
+    statusf("StoryLoaded(): %u Osiris functions, %u types", func_count, type_count);
 
     char path[4096];
     const char* out = std::getenv("BG3LE_OSI_DUMP");
@@ -480,7 +487,7 @@ extern "C" long _ZN7COsiris4LoadER12COsiSmartBuf(void* self, void* buf) {
     debug_server_note_story_thread();
     double t0 = now_s();
     long rc = real != nullptr ? real(self, buf) : 0;
-    logf("COsiris::Load took %.2fs", now_s() - t0);
+    statusf("OnAfterOsirisLoad: story loaded in %.2fs", now_s() - t0);
     return rc;
 }
 
@@ -496,8 +503,9 @@ extern "C" long _ZN7COsiris7CompileEPKwS1_(void* self, const wchar_t* a, const w
 extern "C" long _ZN7COsiris5MergeEPKw(void* self, const wchar_t* a) {
     static auto real = next<long (*)(void*, const wchar_t*)>("_ZN7COsiris5MergeEPKw");
     double t0 = now_s();
+    statusf("MergeWrapper() - started merge");
     long rc = real != nullptr ? real(self, a) : 0;
-    logf("COsiris::Merge took %.2fs", now_s() - t0);
+    statusf("MergeWrapper() - finished merge in %.2fs", now_s() - t0);
     return rc;
 }
 

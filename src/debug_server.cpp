@@ -10,6 +10,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <memory>
@@ -52,6 +54,11 @@ std::deque<std::shared_ptr<Job>> g_queue;
 // Pending count is read on every clock_gettime, so keep it lock-free.
 std::atomic<int> g_pending{0};
 std::atomic<long> g_story_tid{0};
+
+// Clients attach long after load, so retain recent status for replay.
+constexpr std::size_t kStatusHistory = 128;
+std::mutex g_status_mutex;
+std::deque<std::string> g_status;
 
 long this_tid() {
     static thread_local long tid = ::syscall(SYS_gettid);
@@ -113,6 +120,18 @@ std::string make_evaluate_response(std::uint64_t reply_seq, const std::string& r
 
 void handle_client(int fd) {
     logf("debug: client attached");
+
+    // Replay what the client missed, so attaching mid-session is informative.
+    {
+        std::lock_guard<std::mutex> lock(g_status_mutex);
+        for (const std::string& line : g_status) {
+            std::string body;
+            pb::bytes_field(&body, 1, line);
+            std::string msg;
+            pb::bytes_field(&msg, kBkDebugOutput, body);
+            if (!send_packet(fd, msg)) return;
+        }
+    }
     for (;;) {
         char header[4];
         if (!recv_exact(fd, header, 4)) break;
@@ -213,7 +232,7 @@ void listener() {
         ::close(srv);
         return;
     }
-    logf("debug: listening on 127.0.0.1:%d", port);
+    statusf("Debug server listening on 127.0.0.1:%d", port);
 
     for (;;) {
         const int fd = ::accept(srv, nullptr, nullptr);
@@ -259,6 +278,22 @@ void debug_server_pump() {
         }
         g_queue_cv.notify_all();
     }
+}
+
+void statusf(const char* fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    logf("%s", buf);
+    {
+        std::lock_guard<std::mutex> lock(g_status_mutex);
+        g_status.emplace_back(buf);
+        if (g_status.size() > kStatusHistory) g_status.pop_front();
+    }
+    debug_server_output(buf, 0);
 }
 
 void debug_server_note_story_thread() {

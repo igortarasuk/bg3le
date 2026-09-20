@@ -11,16 +11,18 @@ namespace bg3le {
 namespace {
 std::FILE* g_log = nullptr;
 std::mutex g_mutex;
+char g_path[4096] = {0};
 }
+
+const char* log_path() { return g_path; }
 
 void log_init() {
     // Every process in the Steam runtime launch chain preloads us, so each
     // needs its own file or they truncate each other.
     const char* base = std::getenv("BG3LE_LOG");
-    char path[4096];
-    std::snprintf(path, sizeof(path), "%s.%d",
+    std::snprintf(g_path, sizeof(g_path), "%s.%d",
                   base != nullptr ? base : "/tmp/bg3le.log", (int)::getpid());
-    g_log = std::fopen(path, "w");
+    g_log = std::fopen(g_path, "w");
 }
 
 void logf(const char* fmt, ...) {
