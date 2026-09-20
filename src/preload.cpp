@@ -236,33 +236,34 @@ void test_integer_sum() {
         return;
     }
 
-    auto ctor = next<void (*)(void*)>("_ZN16COsiArgumentDescC1Ev");
     auto set_int = next<void (*)(void*, int)>("_ZN16COsiArgumentDesc10SetIntegerEi");
     auto get_int = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc10GetIntegerEv");
-    if (ctor == nullptr || set_int == nullptr || get_int == nullptr) {
-        logf("test: COsiArgumentDesc accessors unresolved");
+    if (set_int == nullptr || get_int == nullptr) {
+        logf("test: accessors unresolved");
         return;
     }
 
-    // The real size is unknown; over-allocate and zero it.
-    alignas(16) static unsigned char nodes[3][256];
+    // Live descriptors are 0x40 apart in their pool, so 64 bytes is the size;
+    // 128 is slack. The exported ctor is the prime crash suspect and is no
+    // longer needed: NextParam is at +00 and SetInteger sets value and type.
+    alignas(16) static unsigned char nodes[3][128];
     std::memset(nodes, 0, sizeof(nodes));
-    logf("test: running ctor on 3 nodes ...");
-    for (int i = 0; i < 3; ++i) ctor(nodes[i]);
-    logf("test: ctor ok; calling SetInteger ...");
+
+    logf("test: SetInteger on zeroed node 0 ...");
     set_int(nodes[0], 2);
+    logf("test: node 0 ok (value=%d); doing nodes 1 and 2 ...", get_int(nodes[0]));
     set_int(nodes[1], 3);
     set_int(nodes[2], 0);
-    logf("test: SetInteger ok; linking ...");
+    logf("test: all three set (%d, %d, %d); linking ...",
+         get_int(nodes[0]), get_int(nodes[1]), get_int(nodes[2]));
 
-    // Link through the suspected NextParam slot at +00.
     *reinterpret_cast<void**>(nodes[0]) = nodes[1];
     *reinterpret_cast<void**>(nodes[1]) = nodes[2];
     *reinterpret_cast<void**>(nodes[2]) = nullptr;
 
     logf("test: invoking IntegerSum(2, 3, out) via Query 0x80000002 ...");
     long rc = g_real_query(0x80000002L, reinterpret_cast<long>(nodes[0]), 0, 0, 0, 0);
-    logf("test: returned rc=%ld, out=%d (expecting 5)", rc, get_int(nodes[2]));
+    logf("test: rc=%ld out=%d (expecting 5)", rc, get_int(nodes[2]));
 }
 
 // Whichever of InitGame / the first Event happens first does the work.
