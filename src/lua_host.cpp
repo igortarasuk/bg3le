@@ -113,6 +113,31 @@ void lua_init() {
     luaL_openlibs(g_lua);
     lua_pushcfunction(g_lua, l_print);
     lua_setglobal(g_lua, "print");
+    // _D is muscle memory from BG3SE; provide it in plain Lua.
+    static const char kPrelude[] = R"LUA(
+function _D(v, indent)
+  indent = indent or ""
+  if type(v) ~= "table" then print(indent .. tostring(v)) return end
+  local keys = {}
+  for k in pairs(v) do keys[#keys+1] = k end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  print(indent .. "{")
+  for _, k in ipairs(keys) do
+    local val = v[k]
+    if type(val) == "table" then
+      print(indent .. "  " .. tostring(k) .. " =")
+      _D(val, indent .. "    ")
+    else
+      print(indent .. "  " .. tostring(k) .. " = " .. tostring(val))
+    end
+  end
+  print(indent .. "}")
+end
+)LUA";
+    if (luaL_dostring(g_lua, kPrelude) != LUA_OK) {
+        logf("lua: prelude failed: %s", lua_tostring(g_lua, -1));
+        lua_pop(g_lua, 1);
+    }
     logf("lua: %s up", LUA_RELEASE);
 }
 

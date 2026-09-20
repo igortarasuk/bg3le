@@ -12,6 +12,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <atomic>
 #include <mutex>
 #include <ctime>
 #include <unistd.h>
@@ -410,6 +411,30 @@ extern "C" long _ZN7COsiris5EventEjP16COsiArgumentDesc(
     static unsigned long seen = 0;
     if (++seen <= 5) logf("COsiris::Event(%u) args=%p", event_id, args);
     return real != nullptr ? real(self, event_id, args) : 0;
+}
+
+// ---- pump ----
+//
+// COsiris::Event only fires when the story is active, so an idle game
+// starves the request queue. NoStoryLoaded is a trivial const query the game
+// imports; instrument its rate to see whether it ticks regularly.
+
+extern "C" long _ZNK7COsiris13NoStoryLoadedEv(void* self) {
+    static auto real = next<long (*)(void*)>("_ZNK7COsiris13NoStoryLoadedEv");
+    static std::atomic<unsigned long> calls{0};
+    static double last = 0.0;
+
+    const unsigned long n = ++calls;
+    const double t = now_s();
+    if (last == 0.0) last = t;
+    if (t - last >= 5.0) {
+        logf("pump: NoStoryLoaded %.1f calls/s", n / (t - last));
+        calls.store(0);
+        last = t;
+    }
+
+    debug_server_pump();
+    return real != nullptr ? real(self) : 0;
 }
 
 // ---- story load timing ----
