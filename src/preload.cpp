@@ -138,6 +138,8 @@ Thunk6 g_real_query = nullptr;
 
 // Cross-check the raw bytes of a live COsiArgumentDesc against Osiris' own
 // exported accessors, so the layout is read off the engine rather than guessed.
+void test_requery(unsigned id, void* args);
+
 void dump_arg_desc(const void* desc, unsigned id, const char* kind) {
     auto type_of = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc13GetOpaqueTypeEv");
     auto is_str = next<bool (*)(const void*)>("_ZNK16COsiArgumentDesc12IsStringTypeEv");
@@ -167,6 +169,9 @@ void dump_arg_desc(const void* desc, unsigned id, const char* kind) {
 
         // Where does the value actually live? This is what constructing one needs.
         if (src_ptr != nullptr) logf("      GetDataSrcPtr(false) = %p", src_ptr(node, false));
+        auto dst_ptr = next<void* (*)(void*)>("_ZN16COsiArgumentDesc13GetDataDstPtrEv");
+        if (dst_ptr != nullptr)
+            logf("      GetDataDstPtr()      = %p", dst_ptr(const_cast<void*>(node)));
         if (data_size != nullptr) logf("      GetDataSize(false)   = %lu", data_size(node, false));
 
         if (str && get_str != nullptr) {
@@ -195,6 +200,11 @@ long query_wrapper(long a, long b, long c, long d, long e, long f) {
     if (++seen <= 10) logf("DIV Query arg0=0x%lx arg1=0x%lx", a, b);
     if (seen <= 3) dump_arg_desc(reinterpret_cast<const void*>(b),
                                  (unsigned)a, "DIV Query");
+    static std::once_flag once;
+    if ((unsigned)a == 0x8000113au || (unsigned)a == 0x800019f2u)
+        std::call_once(once, [a, b] {
+            test_requery((unsigned)a, reinterpret_cast<void*>(b));
+        });
     return g_real_query != nullptr ? g_real_query(a, b, c, d, e, f) : 0;
 }
 
@@ -228,42 +238,29 @@ double now_s() {
 // First attempt at invoking Osiris ourselves. IntegerSum is pure arithmetic
 // with a checkable answer, so a wrong layout shows up as a bad result rather
 // than as damage to a save. Opt in with BG3LE_TEST_CALL=1.
-void test_integer_sum() {
+// Building a descriptor from zeroed memory crashes inside SetInteger, so
+// prove invocation a different way: re-issue a query the engine just made,
+// reusing its own descriptor list. Exists/IsSummon are pure predicates, so
+// calling one twice is harmless, and nothing has to be constructed.
+void test_requery(unsigned id, void* args) {
     const char* opt = std::getenv("BG3LE_TEST_CALL");
     if (opt == nullptr || opt[0] != '1') return;
-    if (g_real_query == nullptr) {
-        logf("test: no Query handler recorded");
-        return;
-    }
+    if (g_real_query == nullptr) return;
 
-    auto set_int = next<void (*)(void*, int)>("_ZN16COsiArgumentDesc10SetIntegerEi");
+    // Exists(GUIDSTRING, INTEGER) and IsSummon(GUIDSTRING, INTEGER).
+    if (id != 0x8000113au && id != 0x800019f2u) return;
+
     auto get_int = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc10GetIntegerEv");
-    if (set_int == nullptr || get_int == nullptr) {
-        logf("test: accessors unresolved");
-        return;
-    }
+    std::uintptr_t next_node = 0;
+    if (!safe_read(args, &next_node, sizeof(next_node)) || next_node == 0) return;
+    const void* out = reinterpret_cast<const void*>(next_node);
 
-    // Live descriptors are 0x40 apart in their pool, so 64 bytes is the size;
-    // 128 is slack. The exported ctor is the prime crash suspect and is no
-    // longer needed: NextParam is at +00 and SetInteger sets value and type.
-    alignas(16) static unsigned char nodes[3][128];
-    std::memset(nodes, 0, sizeof(nodes));
-
-    logf("test: SetInteger on zeroed node 0 ...");
-    set_int(nodes[0], 2);
-    logf("test: node 0 ok (value=%d); doing nodes 1 and 2 ...", get_int(nodes[0]));
-    set_int(nodes[1], 3);
-    set_int(nodes[2], 0);
-    logf("test: all three set (%d, %d, %d); linking ...",
-         get_int(nodes[0]), get_int(nodes[1]), get_int(nodes[2]));
-
-    *reinterpret_cast<void**>(nodes[0]) = nodes[1];
-    *reinterpret_cast<void**>(nodes[1]) = nodes[2];
-    *reinterpret_cast<void**>(nodes[2]) = nullptr;
-
-    logf("test: invoking IntegerSum(2, 3, out) via Query 0x80000002 ...");
-    long rc = g_real_query(0x80000002L, reinterpret_cast<long>(nodes[0]), 0, 0, 0, 0);
-    logf("test: rc=%ld out=%d (expecting 5)", rc, get_int(nodes[2]));
+    const int before = get_int != nullptr ? get_int(out) : -1;
+    logf("requery: id=0x%08x out before = %d; re-invoking with engine's own args ...",
+         id, before);
+    long rc = g_real_query(static_cast<long>(id), reinterpret_cast<long>(args),
+                           0, 0, 0, 0);
+    logf("requery: rc=%ld out after = %d", rc, get_int != nullptr ? get_int(out) : -1);
 }
 
 // Whichever of InitGame / the first Event happens first does the work.
@@ -273,7 +270,6 @@ void dump_once(void* self) {
     std::call_once(g_story_once, [self] {
         ensure_symbols();
         dump_osiris_api(self);
-        test_integer_sum();
     });
 }
 
