@@ -139,6 +139,7 @@ Thunk6 g_real_query = nullptr;
 // Cross-check the raw bytes of a live COsiArgumentDesc against Osiris' own
 // exported accessors, so the layout is read off the engine rather than guessed.
 void test_requery(unsigned id, void* args);
+void test_integer_sum();
 
 void dump_arg_desc(const void* desc, unsigned id, const char* kind) {
     auto type_of = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc13GetOpaqueTypeEv");
@@ -238,6 +239,49 @@ double now_s() {
 // First attempt at invoking Osiris ourselves. IntegerSum is pure arithmetic
 // with a checkable answer, so a wrong layout shows up as a bad result rather
 // than as damage to a save. Opt in with BG3LE_TEST_CALL=1.
+// SetInteger asserts the descriptor is already typed -- its disassembly
+// compares the uint16 at +16 against 1 and otherwise raises "Trying to set
+// integer parameter while type is different", which routes to the game's
+// assert thunk and aborts. SetType must come first; it is a two-instruction
+// store of the type at +16 and a zero of the value at +08.
+enum : unsigned short { OSI_INTEGER = 1 };
+
+void test_integer_sum() {
+    const char* opt = std::getenv("BG3LE_TEST_CALL");
+    if (opt == nullptr || opt[0] != '1') return;
+    if (g_real_query == nullptr) {
+        logf("test: no Query handler recorded");
+        return;
+    }
+
+    auto set_type = next<void (*)(void*, unsigned short)>(
+        "_ZN16COsiArgumentDesc7SetTypeE13TOsiValueType");
+    auto set_int = next<void (*)(void*, int)>("_ZN16COsiArgumentDesc10SetIntegerEi");
+    auto get_int = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc10GetIntegerEv");
+    if (set_type == nullptr || set_int == nullptr || get_int == nullptr) {
+        logf("test: accessors unresolved");
+        return;
+    }
+
+    alignas(16) static unsigned char nodes[3][128];
+    std::memset(nodes, 0, sizeof(nodes));
+
+    const int values[3] = {2, 3, 0};
+    for (int i = 0; i < 3; ++i) {
+        set_type(nodes[i], OSI_INTEGER);
+        set_int(nodes[i], values[i]);
+    }
+    *reinterpret_cast<void**>(nodes[0]) = nodes[1];
+    *reinterpret_cast<void**>(nodes[1]) = nodes[2];
+    *reinterpret_cast<void**>(nodes[2]) = nullptr;
+    logf("test: built args (%d, %d, out=%d)", get_int(nodes[0]), get_int(nodes[1]),
+         get_int(nodes[2]));
+
+    long rc = g_real_query(0x80000002L, reinterpret_cast<long>(nodes[0]), 0, 0, 0, 0);
+    logf("test: IntegerSum -> rc=%d out=%d (expecting 5)", (int)(rc & 0xff),
+         get_int(nodes[2]));
+}
+
 // Building a descriptor from zeroed memory crashes inside SetInteger, so
 // prove invocation a different way: re-issue a query the engine just made,
 // reusing its own descriptor list. Exists/IsSummon are pure predicates, so
@@ -270,6 +314,7 @@ void dump_once(void* self) {
     std::call_once(g_story_once, [self] {
         ensure_symbols();
         dump_osiris_api(self);
+        test_integer_sum();
     });
 }
 
