@@ -163,7 +163,21 @@ void lua_bind_osi(const std::vector<osi::Function>& functions) {
         ++bound;
     }
     lua_setglobal(g_lua, "Osi");
-    logf("lua: bound %d Osi functions (%d events skipped)", bound, events);
+
+    // The Windows extender generates "Name = Osi.Name" for every symbol, so
+    // mods call Osiris functions bare: _D(GetHostCharacter()) is idiomatic.
+    // Matching that is the point of sharing the API surface. Verified against
+    // the enumerated names that none collide with a Lua global.
+    lua_getglobal(g_lua, "Osi");
+    for (osi::Function& fn : g_functions) {
+        if (fn.kind() == osi::kEvent) continue;
+        lua_getfield(g_lua, -1, fn.name.c_str());
+        lua_setglobal(g_lua, fn.name.c_str());
+    }
+    lua_pop(g_lua, 1);
+
+    logf("lua: bound %d Osi functions as Osi.* and globals (%d events skipped)",
+         bound, events);
 }
 
 void lua_eval(const char* code, std::string* result, std::string* error) {
