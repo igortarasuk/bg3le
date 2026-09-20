@@ -115,6 +115,9 @@ void lua_init() {
     lua_setglobal(g_lua, "print");
     // _D is muscle memory from BG3SE; provide it in plain Lua.
     static const char kPrelude[] = R"LUA(
+-- _P prints values as-is; _D pretty-prints tables. Both are BG3SE habits.
+_P = print
+
 function _D(v, indent)
   indent = indent or ""
   if type(v) ~= "table" then print(indent .. tostring(v)) return end
