@@ -237,7 +237,7 @@ end
 local function stub_index(name)
   return function(_, key)
     return function()
-      error(string.format("bg3le: Ext.%s.%s is not implemented yet", name, key), 2)
+      error(string.format("bg3le: Ext.%s.%s is not implemented yet", name, key), 0)
     end
   end
 end
@@ -300,6 +300,21 @@ end
 Ext.Definition = Ext.StaticData
 Mods = {}
 
+-- Osi cannot be bound until a story is loaded (the engine generates its
+-- function table on demand), so until then explain the situation rather
+-- than letting every Osiris name look like a typo.
+Osi = setmetatable({}, {__index = function(_, key)
+  error(string.format(
+    "bg3le: Osiris is not bound yet (no story loaded), so Osi.%s is "
+    .. "unavailable -- load a save first", key), 0)
+end})
+
+setmetatable(_G, {__index = function(_, key)
+  error(string.format(
+    "bg3le: '%s' is not defined. Osiris functions become available as "
+    .. "globals once a save is loaded.", key), 0)
+end})
+
 _D = Ext.Dump
 _DS = Ext.DumpShallow
 _P = Ext.Log.Print
@@ -351,6 +366,8 @@ void lua_bind_osi(const std::vector<osi::Function>& functions) {
     // compatibility warning rather than failing, since mods rely on that
     // leniency. Globals stay exact-case, as they are there too.
     lua_run(R"LUA(
+setmetatable(_G, nil)  -- Osiris is bound; typos are plain nils again
+
 local lower = {}
 for name in pairs(Osi) do lower[string.lower(name)] = name end
 setmetatable(Osi, {
