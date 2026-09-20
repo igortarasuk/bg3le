@@ -22,6 +22,7 @@ add_library(bg3le SHARED
     src/osi.cpp
     src/debug_server.cpp
     src/hook.cpp
+    src/console.cpp
 )
 target_link_libraries(bg3le PRIVATE dl lua_static)
 target_link_options(bg3le PRIVATE -static-libstdc++ -static-libgcc

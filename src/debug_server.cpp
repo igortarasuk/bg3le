@@ -19,6 +19,7 @@
 #include <string>
 #include <thread>
 
+#include "console.h"
 #include "log.h"
 #include "lua_host.h"
 #include "pb.h"
@@ -233,6 +234,9 @@ void listener() {
         return;
     }
     statusf("Debug server listening on 127.0.0.1:%d", port);
+
+    // Only now can a client succeed in connecting.
+    maybe_open_console();
 
     for (;;) {
         const int fd = ::accept(srv, nullptr, nullptr);
