@@ -20,6 +20,7 @@ namespace {
 
 SymbolTable g_symbols;
 std::once_flag g_symbols_once;
+std::once_flag g_story_once;
 
 void ensure_symbols();
 
@@ -107,21 +108,37 @@ extern "C" long _ZN7COsiris20RegisterDIVFunctionsEP19TOsirisInitFunction(
         "_ZN7COsiris20RegisterDIVFunctionsEP19TOsirisInitFunction");
     logf("COsiris::RegisterDIVFunctions() self=%p init=%p", self, init_fn);
     ensure_symbols();  // game is initialised by now; its allocator is usable
-    long rc = real != nullptr ? real(self, init_fn) : 0;
-
-    // Registration has just run, so the function table should be populated
-    // here -- and unlike InitGame this fires without a save loaded.
-    probe_mappings(self, "_ZN7COsiris19GetFunctionMappingsEPP11MappingInfoPj",
-                   "function mappings (post-register)");
-    return rc;
+    return real != nullptr ? real(self, init_fn) : 0;
 }
 
 extern "C" long _ZN7COsiris5EventEjP16COsiArgumentDesc(
     void* self, unsigned event_id, void* args) {
     static auto real = next<long (*)(void*, unsigned, void*)>(
         "_ZN7COsiris5EventEjP16COsiArgumentDesc");
+
+    // First event means the story is running, so the tables exist by now.
+    std::call_once(g_story_once, [self] {
+        ensure_symbols();
+
+        auto gen = next<long (*)(void*)>("_ZN7COsiris20GenerateFunctionListEv");
+        if (gen != nullptr) {
+            logf("GenerateFunctionList() ...");
+            gen(self);
+            logf("GenerateFunctionList() returned");
+        } else {
+            logf("GenerateFunctionList unresolved");
+        }
+
+        probe_mappings(self, "_ZN7COsiris19GetFunctionMappingsEPP11MappingInfoPj",
+                       "function mappings");
+        probe_mappings(self, "_ZN7COsiris15GetTypeMappingsEPP11MappingInfoPj",
+                       "type mappings");
+        probe_mappings(self, "_ZN7COsiris17GetObjectMappingsEPP11MappingInfoPj",
+                       "object mappings");
+    });
+
     static unsigned long seen = 0;
-    if (++seen <= 20) logf("COsiris::Event(%u) args=%p", event_id, args);
+    if (++seen <= 5) logf("COsiris::Event(%u) args=%p", event_id, args);
     return real != nullptr ? real(self, event_id, args) : 0;
 }
 
