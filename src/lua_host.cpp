@@ -758,12 +758,18 @@ void lua_run(const char* code) {
 
 }  // namespace bg3le
 
+
 // Norbyte's Lua fork calls this from luaG_errormsg whenever an error is raised
 // while an error handler is installed, so a debugger can see errors that pcall
 // would otherwise swallow. The host has to supply it or the fork does not link.
 //
+// Weak, because bg3se's Lua/LuaBinding.cpp defines it too: once
+// vendor/bg3se is linked in, its strong definition takes precedence and this
+// one falls away.
+//
 // It fires for every handled error, including the deliberate ones in our timer
 // and mod-loading paths, so this goes to the log rather than the console.
+__attribute__((weak))
 void nse_lua_report_handled_error(lua_State* L) {
     const char* err = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1)
                                                      : "(not a string)";

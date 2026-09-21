@@ -33,8 +33,8 @@ CHECKS = [
      lambda: '__FUNCTION__ "(): "' not in text("BG3Extender/Extender/Shared/Utils.h")),
     ("std::thread included rather than forward-declared",
      lambda: "#include <thread>" in text("BG3Extender/Extender/Shared/Utils.h")),
-    ("SDL_HOOK specialisations marked template<>",
-     lambda: "template<> SDL##name##HookType"
+    ("SDL_HOOK specialisations marked template<> inline",
+     lambda: "template<> inline SDL##name##HookType"
              in text("BG3Extender/Extender/Client/SDLManager.h")),
     ("LuaStats.h include uses the real directory case",
      lambda: "<Lua/LuaBinding.h>" in text("BG3Extender/Lua/Shared/LuaStats.h")),
@@ -46,8 +46,8 @@ CHECKS = [
      lambda: "__VA_OPT__" in text("CoreLib/Utils.h")),
     ("FixedStringUnhashed has a stream operator",
      lambda: "bg3se::FixedStringUnhashed const& str" in text("CoreLib/Base/BaseString.h")),
-    ("FOR_NOESIS_TYPE specialisations marked template<>",
-     lambda: "template<> Symbol SymbolInfo<T>::Name"
+    ("FOR_NOESIS_TYPE specialisations marked template<> inline",
+     lambda: "template<> inline Symbol SymbolInfo<T>::Name"
              in text("BG3Extender/Lua/Libs/ClientUI/Symbols.inl")),
     ("BaseObject::operator new takes size_t",
      lambda: "unsigned __int64" not in text("BG3Extender/Lua/Libs/ClientUI/Builtins.inl")),
@@ -102,6 +102,15 @@ CHECKS = [
     ("ImGui D3D11 backend gated",
      lambda: "BG3LE_NO_DX11"
              in text("BG3Extender/Extender/Client/IMGUI/IMGUI.cpp")),
+    ("variable template specialisations are inline",
+     lambda: all("template <> constexpr" not in text(f) and
+                 "template<> constexpr" not in text(f) for f in (
+         "BG3Extender/GameDefinitions/Base/TypeMetadata.h",
+         "BG3Extender/GameDefinitions/Base/LuaAnnotations.h",
+         "BG3Extender/GameDefinitions/Enumerations.h",
+         "BG3Extender/Lua/Shared/Proxies/LuaStructIDs.h"))),
+    ("VMCallEntry constructor is not declared inline",
+     lambda: "inline VMCallEntry(State* state" not in text("BG3Extender/Lua/LuaBinding.h")),
     ("NsCustomDataContext has a usual operator delete",
      lambda: "static void operator delete(void* ptr) noexcept"
              in text("BG3Extender/Lua/Libs/ClientUI/CustomProperties.inl")),

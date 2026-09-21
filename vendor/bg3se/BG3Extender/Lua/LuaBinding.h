@@ -108,7 +108,11 @@ namespace bg3se::lua
     class VMCallEntry
     {
     public:
-        inline VMCallEntry(State* state, int stackDelta = 0);
+        // Declared inline but defined out-of-line in LuaBinding.cpp, so no
+        // symbol is emitted and every other TU that calls it is left with
+        // an undefined reference. An inline function has to be defined in
+        // every TU that uses it; MSVC emits it regardless.
+        VMCallEntry(State* state, int stackDelta = 0);
         ~VMCallEntry();
 
     private:

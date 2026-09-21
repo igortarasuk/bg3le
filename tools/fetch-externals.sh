@@ -44,6 +44,63 @@ clone tinycrypt https://github.com/intel/tinycrypt
 clone Vulkan    https://github.com/KhronosGroup/Vulkan-Headers vulkan-sdk-1.4.357
 clone optick    https://github.com/Norbyte/optick
 
+echo "== abseil (built from source against libc++) =="
+# protobuf needs abseil, and 45 of the symbols it calls take or return
+# std::string. The distribution abseil is libstdc++, so it has to be rebuilt
+# too or the mismatch just moves one layer down. The version has to match
+# whatever protobuf expects.
+ABSL_PREFIX="$EXT/abseil/install"
+if [ ! -f "$ABSL_PREFIX/lib/libabsl_strings.a" ]; then
+    if [ ! -d abseil ]; then
+        git clone --depth 1 --branch 20260817.0 \
+            https://github.com/abseil/abseil-cpp abseil
+    fi
+    cmake -S abseil -B abseil/build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CXX_COMPILER=clang++ \
+        -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DCMAKE_CXX_STANDARD=17 \
+        -DABSL_PROPAGATE_CXX_STD=ON \
+        -DABSL_ENABLE_INSTALL=ON \
+        -DBUILD_TESTING=OFF \
+        -DCMAKE_INSTALL_PREFIX="$ABSL_PREFIX"
+    cmake --build abseil/build
+    cmake --install abseil/build
+else
+    echo "  abseil: present"
+fi
+
+echo "== protobuf (built from source against libc++) =="
+# The distribution package is built against libstdc++ and exports
+# std::__cxx11 symbols. bg3se's generated message code is part of the extender
+# core, not just its networking, so it has to link a protobuf whose
+# std::string matches ours -- mixing the two ABIs in one process is not
+# something that fails loudly at runtime. Upstream builds protobuf from source
+# on Windows for the same reason.
+if [ -d protobuf/build/libprotobuf-lite.a ] || [ -f protobuf/build/libprotobuf-lite.a ]; then
+    echo "  protobuf: present"
+else
+    if [ ! -d protobuf ]; then
+        git clone --depth 1 --branch v36.1 --recurse-submodules --shallow-submodules \
+            https://github.com/protocolbuffers/protobuf protobuf
+    fi
+    cmake -S protobuf -B protobuf/build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CXX_COMPILER=clang++ \
+        -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DCMAKE_CXX_STANDARD=17 \
+        -Dprotobuf_BUILD_TESTS=OFF \
+        -Dprotobuf_BUILD_PROTOC_BINARIES=OFF \
+        -Dprotobuf_BUILD_SHARED_LIBS=OFF \
+        -Dprotobuf_ABSL_PROVIDER=package \
+        -DCMAKE_PREFIX_PATH="$ABSL_PREFIX"
+    cmake --build protobuf/build --target libprotobuf-lite
+fi
+
 echo "== patch Noesis for clang =="
 # NsCore/TypePropertyImpl.h marks void Get(const void*, void*) const as
 # override, but TypeProperty declares GetCopy and no such overload, so it never

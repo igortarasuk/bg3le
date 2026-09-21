@@ -97,7 +97,10 @@ static_assert(IsVariant<std::variant<int, STDString>>);
 template <class T>
 constexpr bool IsIntegralAlias = false;
 
-#define MARK_INTEGRAL_ALIAS(ty) template <> constexpr bool IsIntegralAlias<ty> = true;
+// An explicit specialisation of a variable template has external linkage and
+// is not implicitly inline, so without the keyword every including translation
+// unit emits a definition. MSVC folds them as COMDAT; ELF reports duplicates.
+#define MARK_INTEGRAL_ALIAS(ty) template <> inline constexpr bool IsIntegralAlias<ty> = true;
 
 
 
@@ -120,7 +123,7 @@ concept IsByVal = ByValType<T>;
 
 #define MARK_BY_VALUE_TYPE(cls) \
     static_assert(std::is_default_constructible_v<cls>, "By-value types must be default constructible"); \
-    template<> constexpr bool ByValType<cls> = true;
+    template<> inline constexpr bool ByValType<cls> = true;
 
 
 MARK_BY_VALUE_TYPE(bool)

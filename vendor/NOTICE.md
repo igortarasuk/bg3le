@@ -243,6 +243,35 @@ selection is fixed accordingly, under `BG3LE_NO_DX11`:
 
 - `BG3Extender/Extender/Client/IMGUI/IMGUI.cpp`
 
+**An explicit specialisation of a variable template has external linkage and
+is not implicitly inline**, so every including translation unit emits a
+definition. MSVC folds them as COMDAT; ELF reported 134,567 duplicates across
+the generated `StructID`/`EnumID` tables:
+
+- `BG3Extender/GameDefinitions/Base/TypeMetadata.h` (`MARK_BY_VALUE_TYPE`,
+  `MARK_INTEGRAL_ALIAS`)
+- `BG3Extender/GameDefinitions/Base/LuaAnnotations.h`
+- `BG3Extender/GameDefinitions/Enumerations.h` (the `BEGIN_ENUM` family)
+- `BG3Extender/Lua/Shared/Proxies/LuaStructIDs.h` (the `DECLARE_CLS` family)
+
+The same applies to the static data members in headers, which additionally
+have to be `inline` rather than merely initialised:
+
+- `BG3Extender/Extender/Client/SDLManager.h`,
+  `BG3Extender/Lua/Libs/ClientUI/Symbols.inl`
+
+**An inline function has to be defined in every translation unit that uses
+it.** `VMCallEntry`'s constructor was declared `inline` in the header and
+defined out-of-line in one `.cpp`, so no symbol was emitted and every other
+caller was left with an undefined reference. MSVC emits it anyway:
+
+- `BG3Extender/Lua/LuaBinding.h:108`
+
+**A pure virtual destructor still needs a definition** — derived destructors
+call it and the vtables reference it. `aspk::Component` only ever describes
+engine memory, so MSVC never demanded the symbol; it is defined in
+`src/vendor/platform_linux.cpp`.
+
 **An include used the wrong directory case**, which resolves on Windows and
 not on Linux:
 
@@ -298,6 +327,18 @@ or sit ahead of the vendored tree on the include path.
 - `detours.h` — declarations only. The sole upstream user is
   `CoreLib/Wrappers.h`, whose callers bg3le replaces with PLT interposition, so
   these refuse rather than hook; `Wrap()` already handles a non-zero return
+
+## What the link still needs
+
+`bg3le` does not link `vendor/bg3se` yet. It is short of eleven symbols: C++
+RTTI for Noesis types (`typeinfo for Noesis::Panel` and siblings), reached
+through `typeid`/`dynamic_cast` in the generated property-map metadata.
+
+Nothing on Linux can satisfy them. The Noesis SDK we fetch is headers plus
+Windows `.lib` files, and the native game carries no Noesis typeinfo either --
+28,992 Noesis symbols in `.symtab` and not one typeinfo, because Noesis uses
+its own reflection system rather than C++ RTTI. The fix is to keep the Noesis
+types out of the generated property maps, not to shim a symbol.
 
 ## Not vendored
 

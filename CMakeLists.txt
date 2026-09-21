@@ -75,6 +75,7 @@ add_library(imgui STATIC
     ${EXTERNAL}/imgui/imgui_draw.cpp
     ${EXTERNAL}/imgui/imgui_tables.cpp
     ${EXTERNAL}/imgui/imgui_widgets.cpp
+    ${EXTERNAL}/imgui/imgui_demo.cpp
     ${EXTERNAL}/imgui/backends/imgui_impl_vulkan.cpp
     ${EXTERNAL}/imgui/backends/imgui_impl_sdl2.cpp
 )
@@ -82,6 +83,22 @@ target_include_directories(imgui PUBLIC ${EXTERNAL}/imgui
     ${EXTERNAL}/Vulkan/include /usr/include/SDL2)
 target_compile_options(imgui PRIVATE -w)
 set_target_properties(imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# ---------------------------------------------------------------------------
+# Optick. USE_OPTICK is 0, so its macros compile away, but bg3se still refers
+# to the Optick types directly in its profiler plumbing.
+# ---------------------------------------------------------------------------
+add_library(optick STATIC
+    ${EXTERNAL}/optick/src/optick_capi.cpp
+    ${EXTERNAL}/optick/src/optick_core.cpp
+    ${EXTERNAL}/optick/src/optick_message.cpp
+    ${EXTERNAL}/optick/src/optick_miniz.cpp
+    ${EXTERNAL}/optick/src/optick_serialization.cpp
+    ${EXTERNAL}/optick/src/optick_server.cpp
+)
+target_include_directories(optick PUBLIC ${EXTERNAL}/optick/src)
+target_compile_options(optick PRIVATE -w)
+set_target_properties(optick PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
 # Vendored bg3se
@@ -104,6 +121,13 @@ file(GLOB_RECURSE VENDOR_SOURCES ${VENDOR_ROOT}/*.cpp ${VENDOR_ROOT}/*.cc)
 # for an .inl, so src/vendor/ wraps it.
 list(APPEND VENDOR_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/stats_object_tu.cpp)
+
+# Linux stand-ins for the components whose upstream implementations are
+# Windows-only. These are bg3le's own code, so they are not silenced by the
+# -w below; they are listed here because they have to see the vendored headers.
+list(APPEND VENDOR_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/console_linux.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/platform_linux.cpp)
 
 # Kept in step with tools/vendor-exclude.txt.
 set(VENDOR_EXCLUDE
@@ -141,7 +165,7 @@ target_include_directories(bg3se_vendor PUBLIC
     /usr/include/SDL2
 )
 
-target_compile_definitions(bg3se_vendor PUBLIC
+target_compile_definitions(bg3se_vendor PRIVATE
     OSI_EOCAPP
     OSI_EXTENSION_BUILD
     NS_STATIC_LIBRARY
@@ -156,7 +180,10 @@ target_compile_definitions(bg3se_vendor PUBLIC
 # Not -fms-compatibility: it de-keywords char16_t/char32_t and breaks libc++.
 # MSVC enables SSE4.2 and POPCNT by default when targeting x64, so upstream
 # uses _mm_popcnt_u64 and rapidjson's SSE4.2 scanner without asking for them.
-target_compile_options(bg3se_vendor PUBLIC
+# PRIVATE: these belong to the vendored sources and the Linux stand-ins in
+# src/vendor/ that are part of this target. bg3le's own sources should not be
+# getting Win32 typedefs or MSVC language extensions force-included.
+target_compile_options(bg3se_vendor PRIVATE
     -msse4.2 -mpopcnt
     -fdeclspec -fms-extensions -fdelayed-template-parsing
     -Wno-delayed-template-parsing-in-cxx20
@@ -165,7 +192,30 @@ target_compile_options(bg3se_vendor PUBLIC
 # Upstream warnings are not ours to fix, and there are some 1800 of them.
 target_compile_options(bg3se_vendor PRIVATE -w)
 
-target_link_libraries(bg3se_vendor PUBLIC lua_static imgui protobuf-lite tbb)
+# protobuf and abseil are built from source against libc++ by
+# tools/fetch-externals.sh. The distribution packages are libstdc++ and export
+# std::__cxx11 symbols; bg3se's generated message code is part of the extender
+# core, so mixing the two std::string ABIs in one process is not an option.
+# TBB is fine from the distribution -- it exports no std::string in its ABI.
+set(PROTOBUF_LITE ${EXTERNAL}/protobuf/build/libprotobuf-lite.a)
+set(ABSL_PREFIX ${EXTERNAL}/abseil/install)
+if(NOT EXISTS ${PROTOBUF_LITE})
+    message(FATAL_ERROR "protobuf not built; run tools/fetch-externals.sh")
+endif()
+
+file(GLOB ABSL_LIBS ${ABSL_PREFIX}/lib/libabsl_*.a)
+list(APPEND ABSL_LIBS ${EXTERNAL}/protobuf/build/third_party/utf8_range/libutf8_validity.a)
+
+target_include_directories(bg3se_vendor PRIVATE
+    ${EXTERNAL}/protobuf/src
+    ${ABSL_PREFIX}/include)
+
+# The abseil archives are mutually dependent, so a single left-to-right pass
+# cannot resolve them; --start-group makes the linker iterate.
+target_link_libraries(bg3se_vendor PUBLIC
+    lua_static imgui ${PROTOBUF_LITE}
+    -Wl,--start-group ${ABSL_LIBS} -Wl,--end-group
+    optick tbb)
 
 # ---------------------------------------------------------------------------
 # bg3le
@@ -184,6 +234,20 @@ add_library(bg3le SHARED
     src/fast_alloc.cpp
     src/win_compat.cpp
 )
+# bg3se_vendor is deliberately not linked yet. Everything in it compiles and
+# archives, but the final link is short of eleven symbols: C++ RTTI for
+# Noesis types (typeinfo for Noesis::Panel and friends), which bg3se uses
+# through typeid and dynamic_cast.
+#
+# Those cannot be satisfied on Linux by anything. The Noesis SDK we fetch is
+# headers plus Windows .lib files, and the native game carries no Noesis
+# typeinfo either -- it has 28,992 Noesis symbols in .symtab and not one
+# typeinfo, because Noesis uses its own reflection system rather than C++
+# RTTI. Resolving this means keeping the Noesis types out of the generated
+# property maps, not shimming a symbol.
+#
+# Add bg3se_vendor, vulkan and SDL2 here once that is done; vulkan and SDL2
+# resolve from the host process, which has both loaded before bg3le is.
 target_link_libraries(bg3le PRIVATE dl lua_static)
 target_link_options(bg3le PRIVATE -Wl,--no-undefined)
 target_compile_options(bg3le PRIVATE -Wall -Wextra -fvisibility=default)

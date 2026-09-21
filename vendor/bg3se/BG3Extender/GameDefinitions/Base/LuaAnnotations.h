@@ -131,7 +131,7 @@ template <class T>
 constexpr bool IsLuaPolymorphic = false;
 
 #define LUA_POLYMORPHIC(cls) \
-    template <> constexpr bool IsLuaPolymorphic<cls> = true; \
+    template <> inline constexpr bool IsLuaPolymorphic<cls> = true; \
     void MakePolymorphicRef(lua_State* L, cls* value, LifetimeHandle lifetime);
 
 
@@ -141,7 +141,7 @@ template <class T>
 constexpr bool LuaHasInfiniteLifetime = false;
 
 #define LUA_INFINITE_LIFETIME(cls) \
-    template <> constexpr bool LuaHasInfiniteLifetime<cls> = true;
+    template <> inline constexpr bool LuaHasInfiniteLifetime<cls> = true;
 
 
 END_NS()
