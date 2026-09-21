@@ -11,6 +11,7 @@
 // through tools/find_slots.py.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace bg3le {
@@ -22,5 +23,16 @@ namespace bg3le {
 // the load bias is applied internally.
 bool hook_slot(std::uintptr_t slot_offset, std::uintptr_t expected_offset,
                void* replacement, void** original);
+
+// Redirects every direct `call rel32` that targets func_offset to
+// replacement, for functions that are called directly rather than through a
+// pointer table. Each site is verified to be an E8 whose displacement
+// actually resolves to the target before being touched.
+//
+// rel32 cannot reach our library from the executable's text, so the calls
+// are pointed at a trampoline allocated within +/-2GB of the code. Returns
+// the number of sites patched; original receives the real function address.
+std::size_t hook_call_sites(std::uintptr_t func_offset, void* replacement,
+                            void** original);
 
 }  // namespace bg3le
