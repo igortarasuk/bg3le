@@ -3,12 +3,17 @@
 #include <string>
 #include <vector>
 
+#include "elf_symbols.h"
 #include "osi.h"
 
 namespace bg3le {
 
 // Brings up the embedded Lua state. Safe to call more than once.
 void lua_init();
+
+// Lets Ext._Internal.SymbolAddr resolve engine symbols from the prompt, so
+// structures can be explored live instead of rebuilding for every guess.
+void lua_set_symbols(const SymbolTable* symbols);
 
 // Publishes the enumerated Osiris functions as the global Osi table.
 void lua_bind_osi(const std::vector<osi::Function>& functions);

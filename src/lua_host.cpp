@@ -25,6 +25,7 @@ namespace bg3le {
 namespace {
 
 lua_State* g_lua = nullptr;
+const SymbolTable* g_symbols = nullptr;
 
 // Bound functions must outlive the closures that reference them, and the
 // storage must not move once pointers are handed to Lua.
@@ -284,6 +285,23 @@ CMetatable* cpp_get_light_metatable(lua_State*, unsigned long long,
 void cache_string(lua_State*, TString*) {}
 void release_string(lua_State*, TString*) {}
 
+// Address of an engine symbol by mangled name. The counterpart to Peek: with
+// both, a structure can be walked from the prompt without a rebuild.
+int l_symbol_addr(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    if (g_symbols == nullptr) {
+        lua_pushnil(L);
+        return 1;
+    }
+    void* addr = g_symbols->find(name);
+    if (addr == nullptr) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushinteger(L, static_cast<lua_Integer>(reinterpret_cast<std::uintptr_t>(addr)));
+    return 1;
+}
+
 // The engine's ECS type index for a component, read live from the static the
 // engine assigns at startup. This is the foundation Ext.Entity needs.
 int l_component_index(lua_State* L) {
@@ -376,6 +394,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "ComponentIndex");
     lua_pushcfunction(g_lua, l_ecs_counts);
     lua_setfield(g_lua, -2, "EcsCounts");
+    lua_pushcfunction(g_lua, l_symbol_addr);
+    lua_setfield(g_lua, -2, "SymbolAddr");
     lua_setfield(g_lua, -2, "_Internal");
 
     lua_setglobal(g_lua, "Ext");
@@ -690,6 +710,8 @@ void call_internal(const char* name) {
         lua_pop(g_lua, 1);
     }
 }
+
+void lua_set_symbols(const SymbolTable* symbols) { g_symbols = symbols; }
 
 void lua_tick() { call_internal("RunTimers"); }
 

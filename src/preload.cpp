@@ -211,6 +211,7 @@ void ensure_symbols() {
 
         // The engine names every ECS type index, so the whole registry comes
         // straight out of the symbol table.
+        lua_set_symbols(&g_symbols);
         const std::size_t types = ecs::load(g_symbols);
         statusf("ECS registry: %zu type indices (%zu components)", types,
                 ecs::count(ecs::Context::Component));
