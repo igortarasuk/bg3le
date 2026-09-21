@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 #include <atomic>
+#include <sched.h>
 #include <mutex>
 #include <ctime>
 #include <unistd.h>
@@ -66,9 +67,44 @@ const char* clock_name(int id) {
     }
 }
 
+// Workaround for the busy-wait. A thread calling the clock again within a
+// microsecond is polling, not timing; once that repeats enough times, yield
+// so the threads doing real work get the core. sched_yield is used rather
+// than a sleep because it costs nothing when no one else is runnable -- this
+// donates spare capacity instead of inserting delay.
+std::atomic<bool> g_spin_backoff{false};
+std::atomic<unsigned long> g_yields{0};
+
+constexpr std::uint64_t kSpinGapNs = 1000;   // calls closer than this are polling
+constexpr unsigned kSpinBeforeYield = 200;   // consecutive polls before yielding
+
+void maybe_back_off(const struct timespec* ts) {
+    thread_local std::uint64_t last_ns = 0;
+    thread_local unsigned spins = 0;
+
+    const std::uint64_t now =
+        static_cast<std::uint64_t>(ts->tv_sec) * 1000000000ULL + ts->tv_nsec;
+    if (now - last_ns < kSpinGapNs) {
+        if (++spins >= kSpinBeforeYield) {
+            spins = 0;
+            g_yields.fetch_add(1, std::memory_order_relaxed);
+            ::sched_yield();
+        }
+    } else {
+        spins = 0;
+    }
+    last_ns = now;
+}
+
 extern "C" int clock_gettime(clockid_t clk, struct timespec* ts) {
     static auto real = next<int (*)(clockid_t, struct timespec*)>("clock_gettime");
     if (real == nullptr) return -1;
+
+    if (clk == CLOCK_MONOTONIC && g_spin_backoff.load(std::memory_order_relaxed)) {
+        const int rc = real(clk, ts);
+        maybe_back_off(ts);
+        return rc;
+    }
 
     if (g_clock_stats.load(std::memory_order_relaxed)) {
         const unsigned idx = static_cast<unsigned>(clk) < 16u
@@ -138,6 +174,11 @@ void ensure_symbols() {
         debug_server_start();
         if (const char* e = std::getenv("BG3LE_CLOCK_STATS")) {
             g_clock_stats.store(e[0] == '1');
+        }
+        if (const char* e = std::getenv("BG3LE_SPIN_BACKOFF")) {
+            g_spin_backoff.store(e[0] == '1');
+            if (e[0] == '1') statusf("Spin backoff enabled (yield after %u polls)",
+                                     kSpinBeforeYield);
         }
         install_tick_hook();
     });
@@ -325,6 +366,8 @@ void* maybe_wrap_div_table(void* init_fn) {
     return copy;
 }
 
+double g_story_ready_at = 0.0;
+
 double now_s() {
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -379,6 +422,11 @@ void dump_osiris_api(void* self);
 void dump_once(void* self) {
     std::call_once(g_story_once, [self] {
         ensure_symbols();
+        if (g_story_ready_at > 0.0) {
+            statusf("Level load took %.1fs after Osiris finished (%lu spin yields)",
+                    now_s() - g_story_ready_at,
+                    g_yields.load(std::memory_order_relaxed));
+        }
         dump_osiris_api(self);
         test_integer_sum();
     });
@@ -544,6 +592,7 @@ extern "C" long _ZN7COsiris4LoadER12COsiSmartBuf(void* self, void* buf) {
     double t0 = now_s();
     long rc = real != nullptr ? real(self, buf) : 0;
     statusf("OnAfterOsirisLoad: story loaded in %.2fs", now_s() - t0);
+    g_story_ready_at = now_s();
     return rc;
 }
 
