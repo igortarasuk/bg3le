@@ -38,8 +38,12 @@ constexpr std::uintptr_t kTempFree = 0x5666c90;
 using CheckProc = long (*)(const char*);
 using ConvertProc = long (*)(void*, void*, void*, void*, void*, void*);
 using ConvertClassProc = long (*)(void*, const char*, const void*, int);
-using TempAllocProc = void* (*)(unsigned long, const char*, int);
-using TempFreeProc = void (*)(void*);
+// Non-static members: `this` is the implicit first argument. Omitting it
+// happens to pass the first three arguments through correctly by register
+// position, but leaves the fourth garbage -- and for deallocate it means
+// the pointer to free is never passed at all.
+using TempAllocProc = void* (*)(void*, unsigned long, const char*, int);
+using TempFreeProc = void (*)(void*, void*);
 using PlatformNameProc = const char* (*)(unsigned);
 
 CheckProc g_real_check = nullptr;
@@ -123,18 +127,19 @@ long convert_class_hook(void* self, const char* name, const void* meta, int dept
 
 // If most of the conversion time is in here, the fix is the allocator, not
 // the asset format.
-void* temp_alloc_hook(unsigned long size, const char* file, int line) {
+void* temp_alloc_hook(void* self, unsigned long size, const char* file, int line) {
     const double t0 = now_ns();
-    void* p = g_real_temp_alloc != nullptr ? g_real_temp_alloc(size, file, line)
-                                           : nullptr;
+    void* p = g_real_temp_alloc != nullptr
+                  ? g_real_temp_alloc(self, size, file, line)
+                  : nullptr;
     g_alloc_ns.fetch_add((unsigned long)(now_ns() - t0), std::memory_order_relaxed);
     g_allocs.fetch_add(1, std::memory_order_relaxed);
     return p;
 }
 
-void temp_free_hook(void* p) {
+void temp_free_hook(void* self, void* p) {
     const double t0 = now_ns();
-    if (g_real_temp_free != nullptr) g_real_temp_free(p);
+    if (g_real_temp_free != nullptr) g_real_temp_free(self, p);
     g_free_ns.fetch_add((unsigned long)(now_ns() - t0), std::memory_order_relaxed);
     g_frees.fetch_add(1, std::memory_order_relaxed);
 }
