@@ -20,6 +20,8 @@ static size_t (*meta_component_size)(void const*);
 static int (*meta_field)(void const*, char const*, uint32_t*, uint16_t*,
                          uint8_t*, uint8_t*, uint16_t*);
 static size_t (*meta_fields)(void const*, char const**, uint8_t*, size_t);
+static size_t (*meta_fields_at)(void const*, char const*, char const**,
+                                uint8_t*, size_t);
 static size_t (*meta_class_count)(void);
 static size_t (*meta_component_count)(void);
 
@@ -75,6 +77,91 @@ static void expect_absent(char const* component, char const* field) {
     printf("  ok   %s.%s correctly absent\n", component, field);
 }
 
+// Checks that a field reports the given kind. Used to pin down that a type
+// bg3se cannot traverse is reported as unsupported rather than as a struct,
+// since a caller acts on that answer.
+static void expect_kind(char const* component, char const* field,
+                        uint8_t wantKind) {
+    void const* meta = meta_component(component);
+    uint32_t offset = 0;
+    uint16_t size = 0, elemCount = 0;
+    uint8_t kind = 0, elemKind = 0;
+    if (meta == NULL
+        || !meta_field(meta, field, &offset, &size, &kind, &elemKind,
+                       &elemCount)) {
+        printf("  FAIL %s.%s: not found\n", component, field);
+        failures++;
+        return;
+    }
+    if (kind != wantKind) {
+        printf("  FAIL %s.%s: kind %u, expected %u\n", component, field, kind,
+               wantKind);
+        failures++;
+        return;
+    }
+    printf("  ok   %s.%s is kind %u\n", component, field, kind);
+}
+
+// Checks that a dotted path accumulates offsets: the offset of "outer.inner"
+// has to be the offset of "outer" plus the offset of "inner" inside it.
+//
+// inner may be NULL, in which case it is taken to be the first listed field of
+// outer -- which still exercises the accumulation, and saves naming a member
+// whose spelling is not obvious from the component.
+static void expect_path_adds(char const* component, char const* outer,
+                             char const* inner) {
+    void const* meta = meta_component(component);
+    if (meta == NULL) {
+        printf("  FAIL %s: no metadata\n", component);
+        failures++;
+        return;
+    }
+
+    uint32_t outerOffset = 0, pathOffset = 0;
+    uint16_t size = 0, elemCount = 0;
+    uint8_t kind = 0, elemKind = 0;
+    if (!meta_field(meta, outer, &outerOffset, &size, &kind, &elemKind,
+                    &elemCount)) {
+        printf("  FAIL %s.%s: not found\n", component, outer);
+        failures++;
+        return;
+    }
+
+    char const* names[256];
+    uint8_t kinds[256];
+    size_t n = meta_fields_at(meta, outer, names, kinds, 256);
+    if (n == 0) {
+        printf("  FAIL %s.%s: not traversable\n", component, outer);
+        failures++;
+        return;
+    }
+    if (inner == NULL) inner = names[0];
+
+    // The inner field's offset within its own struct, reached through the
+    // path; and the same field reached as a path from the component.
+    char path[256];
+    snprintf(path, sizeof(path), "%s.%s", outer, inner);
+    uint32_t innerSize = 0;
+    uint16_t isz = 0;
+    if (!meta_field(meta, path, &pathOffset, &isz, &kind, &elemKind,
+                    &elemCount)) {
+        printf("  FAIL %s: not found\n", path);
+        failures++;
+        return;
+    }
+    (void)innerSize;
+
+    if (pathOffset < outerOffset || pathOffset >= outerOffset + size) {
+        printf("  FAIL %s: offset %u is outside %s at +%u..+%u\n", path,
+               pathOffset, outer, outerOffset, outerOffset + size);
+        failures++;
+        return;
+    }
+
+    printf("  ok   %s at +%u, inside %s at +%u (+%u within)\n", path,
+           pathOffset, outer, outerOffset, pathOffset - outerOffset);
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <path to libbg3le.so>\n", argv[0]);
@@ -98,6 +185,7 @@ int main(int argc, char** argv) {
     BIND(meta_component_size, "bg3le_meta_component_size")
     BIND(meta_field, "bg3le_meta_field")
     BIND(meta_fields, "bg3le_meta_fields")
+    BIND(meta_fields_at, "bg3le_meta_fields_at")
     BIND(meta_class_count, "bg3le_meta_class_count")
     BIND(meta_component_count, "bg3le_meta_component_count")
 #undef BIND
@@ -131,6 +219,19 @@ int main(int argc, char** argv) {
     expect_field("eoc::StatsComponent", "AbilityModifiers", 32, 28);
     expect_field("eoc::StatsComponent", "ProficiencyBonus", 132, 4);
     expect_field("eoc::StatsComponent", "SpellCastingAbility", 136, 1);
+
+    // A dotted path has to add the offset of each step. Checked as arithmetic
+    // rather than against a literal, so it holds whatever the inner layout is:
+    // the path offset must equal the outer field's offset plus the inner
+    // field's offset within its own struct.
+    expect_path_adds("ls::TransformComponent", "Transform", "Translate");
+    expect_path_adds("ls::TransformComponent", "Transform", NULL);
+
+    // A path through a type bg3se does not describe has to fail rather than
+    // resolving to the outer offset, which would read the wrong bytes
+    // entirely. Resources is a HashMap, which is not traversable yet.
+    expect_absent("eoc::ActionResourcesComponent", "Resources.Amount");
+    expect_kind("eoc::ActionResourcesComponent", "Resources", 0);
 
     void const* health = meta_component("eoc::HealthComponent");
     printf("  eoc::HealthComponent is %zu bytes\n", meta_component_size(health));

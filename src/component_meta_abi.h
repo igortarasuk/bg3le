@@ -32,6 +32,11 @@ enum class FieldKind : std::uint8_t {
     // engine stores the per-ability and per-skill tables. ElemKind and
     // ElemCount describe the elements.
     ScalarArray,
+    // A nested struct. TypeName names its type; whether it is traversable
+    // depends on bg3se describing that type too, which is resolved by name at
+    // load rather than at compile time -- a field's type does not have to have
+    // a field table of its own for the field itself to be recorded.
+    Struct,
     // Not a field: records that the class also has the fields of the class
     // named in Name. Classes are declared in dependency-free order, so bases
     // are resolved by name at load rather than by pointer.
@@ -45,6 +50,10 @@ struct FieldDesc {
     FieldKind Kind;
     FieldKind ElemKind;       // ScalarArray only
     std::uint16_t ElemCount;  // ScalarArray only
+    // The field's C++ type, for Struct. Not NUL-terminated: it is a slice of a
+    // compiler-generated function-name string, so it carries its own length.
+    char const* TypeName;
+    std::uint16_t TypeNameLength;
 };
 
 }  // namespace bg3le

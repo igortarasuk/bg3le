@@ -46,6 +46,23 @@ namespace bg3le {
 
 using namespace bg3se;
 
+// The name of a type, taken from the compiler's own function-name string.
+//
+// This is how a field's type gets recorded without its field table having to
+// be complete at that point. Requiring completeness would mean a field could
+// only be described if its type happened to be declared earlier in the
+// generated file, which is not how that file is ordered. Instead both a
+// class's own name and a field's type name come from here, so they are written
+// by the same scheme and compare exactly, and a field type that turns out to
+// have no table of its own simply fails to resolve at load.
+template <class T>
+constexpr std::string_view type_name() {
+    std::string_view p = __PRETTY_FUNCTION__;
+    const auto start = p.find("T = ") + 4;
+    const auto end = p.rfind(']');
+    return p.substr(start, end - start);
+}
+
 // std::array is how the engine stores the per-ability and per-skill tables,
 // so it is worth recognising rather than reporting as unsupported.
 template <class T>
@@ -86,8 +103,11 @@ constexpr FieldKind scalar_kind_of() {
     else return FieldKind::Unsupported;
 }
 
-// An array of scalars is reported as one; an array of anything else stays
-// unsupported, because there is nothing useful to hand a script.
+// An array of scalars is reported as one. A class type that is not a scalar in
+// disguise is reported as a struct, and whether it can actually be traversed
+// is decided at load by whether its type name resolves to a field table --
+// so HashMap and DynamicArray land here too and simply fail to resolve, which
+// is the honest answer until they are handled.
 template <class T>
 constexpr FieldKind kind_of() {
     if constexpr (ArrayTraits<T>::kIsArray) {
@@ -97,8 +117,12 @@ constexpr FieldKind kind_of() {
         } else {
             return FieldKind::Unsupported;
         }
-    } else {
+    } else if constexpr (scalar_kind_of<T>() != FieldKind::Unsupported) {
         return scalar_kind_of<T>();
+    } else if constexpr (std::is_class_v<T>) {
+        return FieldKind::Struct;
+    } else {
+        return FieldKind::Unsupported;
     }
 }
 
@@ -138,6 +162,10 @@ struct ClassFields {
     char const* Name;           // the C++ class name, what INHERIT refers to
     char const* ComponentName;  // bg3se's short name, or null
     char const* EngineClass;    // the engine's name, or null
+    // The fully qualified type name, written by the same type_name<T>() that
+    // writes a field's type name, so a nested field type resolves by an exact
+    // compare rather than by guessing at qualification.
+    std::string_view TypeName;
     FieldDesc const* Fields;
     // The stride bg3se walks a component page with, so it has to be the
     // engine's real component size.
@@ -176,6 +204,7 @@ struct FieldTable;
         static constexpr char const* kComponentName =                         \
             component_name_of<cls>();                                         \
         static constexpr char const* kEngineClass = engine_class_of<cls>();   \
+        static constexpr std::string_view kTypeName = type_name<cls>();       \
         static constexpr FieldDesc kFields[] = {
 
 #define BEGIN_CLS(cls, id) BEGIN_CLS_TN(cls, cls, id)
@@ -184,7 +213,7 @@ struct FieldTable;
 // array, which is not valid C++, so every table is null-terminated.
 #define END_CLS()                                                             \
             { nullptr, 0, 0, FieldKind::Unsupported,                          \
-              FieldKind::Unsupported, 0 },                                    \
+              FieldKind::Unsupported, 0, nullptr, 0 },                        \
         };                                                                    \
     };                                                                        \
     }
@@ -193,14 +222,17 @@ struct FieldTable;
 // initialiser list and so multiple bases work. Resolved by name at load,
 // because a class's table may be declared before its base's.
 #define INHERIT(base)                                                         \
-        { #base, 0, 0, FieldKind::Inherit, FieldKind::Unsupported, 0 },
+        { #base, 0, 0, FieldKind::Inherit, FieldKind::Unsupported, 0,         \
+          nullptr, 0 },
 
 #define PN(name, prop)                                                        \
         { #name, (std::uint32_t)offsetof(ObjectType, prop),                   \
           (std::uint16_t)sizeof(decltype(ObjectType::prop)),                  \
           kind_of<decltype(ObjectType::prop)>(),                              \
           elem_kind_of<decltype(ObjectType::prop)>(),                         \
-          elem_count_of<decltype(ObjectType::prop)>() },
+          elem_count_of<decltype(ObjectType::prop)>(),                        \
+          type_name<decltype(ObjectType::prop)>().data(),                     \
+          (std::uint16_t)type_name<decltype(ObjectType::prop)>().size() },
 
 #define P(prop) PN(prop, prop)
 #define P_RO(prop) PN(prop, prop)
@@ -249,6 +281,7 @@ inline constexpr ClassFields kClassFields{
     FieldTable<T>::kName,
     FieldTable<T>::kComponentName,
     FieldTable<T>::kEngineClass,
+    FieldTable<T>::kTypeName,
     FieldTable<T>::kFields,
     sizeof(T),
 };
@@ -319,6 +352,69 @@ FieldDesc const* find_field(ClassFields const* cls, char const* name,
     return nullptr;
 }
 
+// Types by their type_name<T>() spelling, so a Struct field can be resolved to
+// the table describing it. Only the types bg3se describes are in here; a field
+// whose type it does not describe -- a HashMap, say -- simply misses.
+std::unordered_map<std::string_view, ClassFields const*>& by_type_name() {
+    static std::unordered_map<std::string_view, ClassFields const*> map = [] {
+        std::unordered_map<std::string_view, ClassFields const*> m;
+        m.reserve(std::size(kAllClasses));
+        for (auto const* cls : kAllClasses) m.emplace(cls->TypeName, cls);
+        return m;
+    }();
+    return map;
+}
+
+// The table describing a Struct field's type, or null if bg3se does not
+// describe it.
+ClassFields const* struct_type_of(FieldDesc const* field) {
+    if (field == nullptr || field->Kind != FieldKind::Struct
+        || field->TypeName == nullptr) {
+        return nullptr;
+    }
+    auto it = by_type_name().find(
+        std::string_view(field->TypeName, field->TypeNameLength));
+    return it != by_type_name().end() ? it->second : nullptr;
+}
+
+// Resolves a dotted path -- "DiceValues.Amount" -- accumulating the offset of
+// each step.
+//
+// Nesting is expressed as a path rather than by handing out a table for the
+// inner struct, so reading a nested field stays a single call and needs no
+// object to be kept alive on either side.
+FieldDesc const* find_field_path(ClassFields const* cls, char const* path,
+                                 std::uint32_t* offset) {
+    *offset = 0;
+    if (cls == nullptr || path == nullptr) return nullptr;
+
+    std::string_view rest(path);
+    FieldDesc const* field = nullptr;
+
+    // Bounded so a pathological path cannot spin; nothing in the metadata
+    // nests anywhere near this deep.
+    for (unsigned step = 0; step < 16; ++step) {
+        const auto dot = rest.find('.');
+        const std::string_view segment =
+            dot == std::string_view::npos ? rest : rest.substr(0, dot);
+        if (segment.empty()) return nullptr;
+
+        // find_field takes a NUL-terminated name, and a path segment is not
+        // one.
+        const std::string name(segment);
+        field = find_field(cls, name.c_str());
+        if (field == nullptr) return nullptr;
+        *offset += field->Offset;
+
+        if (dot == std::string_view::npos) return field;
+
+        cls = struct_type_of(field);
+        if (cls == nullptr) return nullptr;  // cannot descend through this
+        rest = rest.substr(dot + 1);
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -341,19 +437,25 @@ extern "C" std::size_t bg3le_meta_component_size(void const* handle) {
     return static_cast<ClassFields const*>(handle)->Size;
 }
 
-// Resolves one field of a component, following base classes. Returns false if
-// the component has no such field.
+// Resolves a field of a component by name or by dotted path, following base
+// classes. Returns false if the path does not resolve, including when it tries
+// to descend through a type bg3se does not describe.
 extern "C" bool bg3le_meta_field(void const* handle, char const* name,
                                  std::uint32_t* offset, std::uint16_t* size,
                                  std::uint8_t* kind, std::uint8_t* elemKind,
                                  std::uint16_t* elemCount) {
     if (handle == nullptr || name == nullptr) return false;
-    auto const* field =
-        find_field(static_cast<ClassFields const*>(handle), name);
+    std::uint32_t pathOffset = 0;
+    auto const* field = find_field_path(
+        static_cast<ClassFields const*>(handle), name, &pathOffset);
     if (field == nullptr) return false;
-    *offset = field->Offset;
+    *offset = pathOffset;
     *size = field->Size;
-    *kind = (std::uint8_t)field->Kind;
+    // As in bg3le_meta_fields_at: a struct with no table behind it is reported
+    // as unsupported, because nothing can be done with it.
+    *kind = (field->Kind == FieldKind::Struct && struct_type_of(field) == nullptr)
+                ? (std::uint8_t)FieldKind::Unsupported
+                : (std::uint8_t)field->Kind;
     *elemKind = (std::uint8_t)field->ElemKind;
     *elemCount = field->ElemCount;
     return true;
@@ -361,15 +463,26 @@ extern "C" bool bg3le_meta_field(void const* handle, char const* name,
 
 // Enumerates a component's own fields, base classes included, for listing a
 // component from Lua. Returns the number written.
-extern "C" std::size_t bg3le_meta_fields(void const* handle,
-                                         char const** names,
-                                         std::uint8_t* kinds,
-                                         std::size_t capacity) {
+// path may be null or empty for the component itself, or a dotted path to a
+// nested struct, so a script can list what an inner struct offers the same way
+// it lists a component.
+extern "C" std::size_t bg3le_meta_fields_at(void const* handle,
+                                            char const* path,
+                                            char const** names,
+                                            std::uint8_t* kinds,
+                                            std::size_t capacity) {
     if (handle == nullptr) return 0;
 
+    auto const* cls = static_cast<ClassFields const*>(handle);
+    if (path != nullptr && path[0] != '\0') {
+        std::uint32_t offset = 0;
+        auto const* field = find_field_path(cls, path, &offset);
+        cls = struct_type_of(field);
+        if (cls == nullptr) return 0;
+    }
+
     std::size_t n = 0;
-    std::vector<ClassFields const*> pending{
-        static_cast<ClassFields const*>(handle)};
+    std::vector<ClassFields const*> pending{cls};
 
     while (!pending.empty() && n < capacity) {
         auto const* cls = pending.back();
@@ -382,11 +495,24 @@ extern "C" std::size_t bg3le_meta_fields(void const* handle,
             }
             if (n >= capacity) break;
             names[n] = f->Name;
-            kinds[n] = (std::uint8_t)f->Kind;
+            // A Struct whose type bg3se does not describe cannot be descended
+            // into, so it is reported as unsupported rather than as a struct.
+            // That keeps the reported kind something a caller can act on.
+            kinds[n] = (f->Kind == FieldKind::Struct
+                        && struct_type_of(f) == nullptr)
+                           ? (std::uint8_t)FieldKind::Unsupported
+                           : (std::uint8_t)f->Kind;
             ++n;
         }
     }
     return n;
+}
+
+extern "C" std::size_t bg3le_meta_fields(void const* handle,
+                                         char const** names,
+                                         std::uint8_t* kinds,
+                                         std::size_t capacity) {
+    return bg3le_meta_fields_at(handle, nullptr, names, kinds, capacity);
 }
 
 // How many classes carry metadata, for the startup log.

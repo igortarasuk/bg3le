@@ -419,6 +419,11 @@ extern "C" bool bg3le_meta_field(void const* handle, const char* name,
 extern "C" std::size_t bg3le_meta_fields(void const* handle, const char** names,
                                          std::uint8_t* kinds,
                                          std::size_t capacity);
+extern "C" std::size_t bg3le_meta_fields_at(void const* handle,
+                                            const char* path,
+                                            const char** names,
+                                            std::uint8_t* kinds,
+                                            std::size_t capacity);
 extern "C" std::size_t bg3le_meta_class_count();
 extern "C" std::size_t bg3le_meta_component_count();
 extern "C" const char* bg3le_meta_engine_class(void const* handle);
@@ -474,7 +479,7 @@ std::optional<std::int32_t> component_index(const char* name) {
 // Mirrors bg3le::FieldKind in src/component_meta_abi.h.
 enum class FieldKind : std::uint8_t {
     Unsupported = 0, Bool, Float, Double, Int8, Uint8, Int16, Uint16,
-    Int32, Uint32, Int64, Uint64, Guid, Entity, ScalarArray, Inherit,
+    Int32, Uint32, Int64, Uint64, Guid, Entity, ScalarArray, Struct, Inherit,
 };
 
 const char* field_kind_name(FieldKind kind) {
@@ -493,6 +498,7 @@ const char* field_kind_name(FieldKind kind) {
         case FieldKind::Guid: return "guid";
         case FieldKind::Entity: return "entity";
         case FieldKind::ScalarArray: return "array";
+        case FieldKind::Struct: return "struct";
         default: return "unsupported";
     }
 }
@@ -898,9 +904,13 @@ int l_set_element(lua_State* L) {
     return 1;
 }
 
-// Ext._Internal.ComponentFields(engineName) -> { name = kind, ... }
+// Ext._Internal.ComponentFields(name [, path]) -> { field = kind, ... }, size
+//
+// path names a nested struct, so an inner struct lists the same way a
+// component does.
 int l_component_fields(lua_State* L) {
     const char* engineName = luaL_checkstring(L, 1);
+    const char* path = luaL_optstring(L, 2, nullptr);
     void const* meta = bg3le_meta_component(engineName);
     if (meta == nullptr) {
         lua_pushnil(L);
@@ -911,7 +921,12 @@ int l_component_fields(lua_State* L) {
     constexpr std::size_t kMax = 512;
     const char* names[kMax];
     std::uint8_t kinds[kMax];
-    const std::size_t n = bg3le_meta_fields(meta, names, kinds, kMax);
+    const std::size_t n = bg3le_meta_fields_at(meta, path, names, kinds, kMax);
+    if (n == 0 && path != nullptr && path[0] != '\0') {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s cannot be traversed", engineName, path);
+        return 2;
+    }
 
     lua_newtable(L);
     for (std::size_t i = 0; i < n; ++i) {
@@ -1576,29 +1591,53 @@ local function make_array(handle, comp, field, count)
   })
 end
 
-local function make_component(handle, name, fields)
+-- A view over a set of fields, used for a component and for a struct nested
+-- inside one; the only difference is the path prefix.
+--
+-- Nesting is expressed as a dotted path resolved on the C side rather than by
+-- handing out an object for the inner struct, so reading a nested field stays
+-- one call and nothing has to be kept alive on either side.
+local make_fields
+
+make_fields = function(handle, comp, prefix, fields)
+  local function path_to(key)
+    if prefix == "" then return key end
+    return prefix .. "." .. key
+  end
+
   return setmetatable({}, {
     __index = function(_, key)
       local kind = fields[key]
       if kind == nil then
-        error("bg3le: " .. name .. " has no field " .. tostring(key), 0)
+        local where = prefix == "" and comp or (comp .. "." .. prefix)
+        error("bg3le: " .. where .. " has no field " .. tostring(key), 0)
       end
+      local path = path_to(key)
       if kind == "array" then
-        local _, _, count = Ext._Internal.FieldInfo(name, key)
-        return make_array(handle, name, key, count)
+        local _, _, count = Ext._Internal.FieldInfo(comp, path)
+        return make_array(handle, comp, path, count)
       end
-      local value, err = Ext._Internal.GetField(handle, name, key)
+      if kind == "struct" then
+        local inner, err = Ext._Internal.ComponentFields(comp, path)
+        if inner == nil then error("bg3le: " .. tostring(err), 0) end
+        return make_fields(handle, comp, path, inner)
+      end
+      local value, err = Ext._Internal.GetField(handle, comp, path)
       if value == nil and err ~= nil then error("bg3le: " .. err, 0) end
       return value
     end,
     __newindex = function(_, key, value)
-      local ok, err = Ext._Internal.SetField(handle, name, key, value)
+      local ok, err = Ext._Internal.SetField(handle, comp, path_to(key), value)
       if not ok then error("bg3le: " .. tostring(err), 0) end
     end,
     -- Iterating yields field names and their kinds, which is what is knowable
     -- without reading every field.
     __pairs = function() return pairs(fields) end,
   })
+end
+
+local function make_component(handle, name, fields)
+  return make_fields(handle, name, "", fields)
 end
 
 -- nil if bg3se has no metadata for the name, or if this entity does not carry
