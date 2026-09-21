@@ -117,12 +117,12 @@ void set_handlers(void* call, void* query) {
 
 bool ready() { return g_call != nullptr && g_query != nullptr && accessors().ok(); }
 
-bool invoke(const Function& fn, const std::vector<Value>& inputs,
-            std::vector<Value>* outputs) {
-    if (!ready()) return false;
-    if (fn.kind() == kEvent) return false;  // events are raised by the game
-    if (fn.params.size() > kMaxParams) return false;
-    if (inputs.size() > fn.params.size()) return false;
+Status invoke(const Function& fn, const std::vector<Value>& inputs,
+              std::vector<Value>* outputs) {
+    if (!ready()) return Status::kUnavailable;
+    if (fn.kind() == kEvent) return Status::kUnavailable;  // the game raises these
+    if (fn.params.size() > kMaxParams) return Status::kUnavailable;
+    if (inputs.size() > fn.params.size()) return Status::kUnavailable;
 
     alignas(16) unsigned char storage[kMaxParams][kNodeSize];
     std::memset(storage, 0, sizeof(storage));
@@ -143,7 +143,7 @@ bool invoke(const Function& fn, const std::vector<Value>& inputs,
     Thunk6 handler = fn.kind() == kQuery ? g_query : g_call;
     long rc = handler(static_cast<long>(fn.id),
                       n > 0 ? reinterpret_cast<long>(storage[0]) : 0, 0, 0, 0, 0);
-    if ((rc & 0xff) == 0) return false;
+    if ((rc & 0xff) == 0) return Status::kRejected;
 
     if (outputs != nullptr) {
         for (std::size_t i = inputs.size(); i < n; ++i) {
@@ -151,7 +151,7 @@ bool invoke(const Function& fn, const std::vector<Value>& inputs,
             outputs->push_back(read(storage[i], declared >= 6 ? kGuidString : declared));
         }
     }
-    return true;
+    return Status::kHandled;
 }
 
 }  // namespace bg3le::osi

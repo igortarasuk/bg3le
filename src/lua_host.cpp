@@ -78,12 +78,32 @@ int osi_dispatch(lua_State* L) {
     }
 
     std::vector<osi::Value> outputs;
-    if (!osi::invoke(*fn, inputs, &outputs)) {
-        lua_pushnil(L);
+    const osi::Status status = osi::invoke(*fn, inputs, &outputs);
+
+    if (status == osi::Status::kUnavailable) {
+        return luaL_error(L, "Osi.%s could not be invoked (Osiris not ready?)",
+                          fn->name.c_str());
+    }
+
+    // Matches bg3se: a procedure yields nothing, a query with no outputs
+    // yields the success flag, and a query with outputs yields one value per
+    // output -- all nil when the engine answered false. Returning a bare nil
+    // for both "answered false" and "could not call" conflated a normal
+    // answer with an error.
+    if (fn->kind() == osi::kCall) return 0;
+
+    const int out_count = static_cast<int>(fn->params.size() - inputs.size());
+    if (out_count == 0) {
+        lua_pushboolean(L, status == osi::Status::kHandled);
         return 1;
     }
-    for (const osi::Value& v : outputs) push_value(L, v);
-    return static_cast<int>(outputs.size());
+
+    if (status == osi::Status::kHandled) {
+        for (const osi::Value& v : outputs) push_value(L, v);
+    } else {
+        for (int i = 0; i < out_count; ++i) lua_pushnil(L);
+    }
+    return out_count;
 }
 
 // Output goes to the attached debugger client as well as the log, which is

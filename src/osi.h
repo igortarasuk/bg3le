@@ -40,9 +40,16 @@ struct Value {
 void set_handlers(void* call, void* query);
 bool ready();
 
+enum class Status {
+    kHandled,      // the engine ran it and reported success
+    kRejected,     // the engine ran it and reported false
+    kUnavailable,  // could not be invoked at all
+};
+
 // Invokes fn with inputs, appending any out-parameters to outputs.
-// Returns false if the engine rejected the call.
-bool invoke(const Function& fn, const std::vector<Value>& inputs,
-            std::vector<Value>* outputs);
+// Distinguishing kRejected from kUnavailable matters: a query returning
+// false is a normal answer, not a failure.
+Status invoke(const Function& fn, const std::vector<Value>& inputs,
+              std::vector<Value>* outputs);
 
 }  // namespace bg3le::osi
