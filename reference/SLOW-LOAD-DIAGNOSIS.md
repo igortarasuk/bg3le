@@ -49,10 +49,32 @@ in this platform's binary format and is converted per asset at load time.
 The threads are blocked rather than computing: they queue on PhysX's shared
 `TempAllocator`, serialising work that is nominally parallel.
 
+## Scale, measured
+
+Instrumenting the conversion path (`BG3LE_PHYSX_PROBE=1`) for one level load:
+
+    641 top-level conversions
+    6,874,980 class conversions
+    566.31s summed inside convertClass
+    75.7s wall
+
+The 566s is summed across ~7 worker threads, which have ~530 thread-seconds
+available over 75.7s of wall time, so effectively all worker time during the
+stall is inside PhysX conversion. (It also double-counts nested calls, since
+convertClass recurses.) Conversion is not a contributor to the stall -- it is
+the stall.
+
+641 serialized collections holding ~6.9M objects get their memory layout
+rewritten on every single load. Pre-converting those 641 collections to
+`L_64` would eliminate essentially all of it.
+
 ## Why the obvious measurements mislead
 
-- **~10% CPU** while "busy": the threads are waiting on a lock. The 450%
-  seen from `/proc` is the uncapped loading screen redrawing, not load work.
+- **~10% CPU** while "busy": the work is ~6.9M tiny operations serialised
+  through PhysX's shared allocator, so threads spend most of their time
+  queued rather than running. Stack samples catch them blocked, but the work
+  is real. The 450% seen from `/proc` is the uncapped loading screen
+  redrawing, not load work.
 - **No disk I/O**: the source data is already in page cache.
 - **Duration independent of level size** (a new game on the Nautiloid stalls
   the same) but varying 65-78s: lock contention, not a fixed timeout.
