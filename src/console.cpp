@@ -101,7 +101,7 @@ struct Launch {
     bool via_host = false;
 };
 
-// $TERMINAL, then a guess from the desktop, then xterm -- each tried inside
+// $TERMINAL, then a guess from the desktop, then generic fallbacks -- each tried inside
 // the container first, then on the host.
 Launch pick_terminal() {
     std::vector<std::string> candidates;
@@ -126,6 +126,7 @@ Launch pick_terminal() {
         }
     }
 
+    candidates.emplace_back("alacritty");
     candidates.emplace_back("xterm");
 
     for (const std::string& candidate : candidates) {

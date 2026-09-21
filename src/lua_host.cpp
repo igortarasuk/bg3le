@@ -64,7 +64,17 @@ int osi_dispatch(lua_State* L) {
         lua_touserdata(L, lua_upvalueindex(1)));
     const int argc = lua_gettop(L);
 
-    if (static_cast<std::size_t>(argc) > fn->params.size()) {
+    // With out-param counts recovered from Osiris, the input count is known
+    // exactly and a wrong count is an error, as in bg3se. Without them, fall
+    // back to letting the caller's argument count decide the split.
+    if (fn->out_params >= 0) {
+        const int expected = (int)fn->params.size() - fn->out_params;
+        if (argc != expected) {
+            return luaL_error(L,
+                "Incorrect number of IN arguments for '%s'; expected %d, got %d",
+                fn->name.c_str(), expected, argc);
+        }
+    } else if (static_cast<std::size_t>(argc) > fn->params.size()) {
         return luaL_error(L, "Osi.%s takes at most %d argument(s), got %d",
                           fn->name.c_str(), (int)fn->params.size(), argc);
     }
@@ -95,7 +105,9 @@ int osi_dispatch(lua_State* L) {
     // answer with an error.
     if (fn->kind() == osi::kCall) return 0;
 
-    const int out_count = static_cast<int>(fn->params.size() - inputs.size());
+    const int out_count = fn->out_params >= 0
+                              ? fn->out_params
+                              : static_cast<int>(fn->params.size() - inputs.size());
     if (out_count == 0) {
         lua_pushboolean(L, status == osi::Status::kHandled);
         return 1;

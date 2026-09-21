@@ -8,7 +8,6 @@
 #include <unistd.h>
 
 #include "log.h"
-#include "physx_probe.h"
 
 namespace bg3le {
 namespace {
@@ -130,10 +129,6 @@ std::size_t hook_call_sites(std::uintptr_t func_offset, void* replacement,
     logf("hook: redirected %zu call site(s) of %#lx via trampoline %p", patched,
          (unsigned long)func_offset, tramp);
     return patched;
-}
-
-void* physx_resolve(std::uintptr_t offset) {
-    return reinterpret_cast<void*>(load_bias() + offset);
 }
 
 bool hook_slot(std::uintptr_t slot_offset, std::uintptr_t expected_offset,

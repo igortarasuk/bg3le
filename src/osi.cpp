@@ -291,49 +291,17 @@ std::size_t load_out_param_counts(std::vector<Function>* functions) {
         visit_tree(root, &by_name, 0, &seen);
     }
 
-    // Diagnose the misses: is the bare name absent entirely, or present with
-    // a different arity?
-    std::unordered_map<std::string, std::string> arities_by_name;
-    for (const auto& kv : by_name) {
-        const std::size_t slash = kv.first.rfind('/');
-        if (slash == std::string::npos) continue;
-        const std::string bare = kv.first.substr(0, slash);
-        const std::string ar = kv.first.substr(slash + 1);
-        auto& acc = arities_by_name[bare];
-        acc += (acc.empty() ? "" : ",") + ar;
-    }
-
+    // Functions the story never references have no entry here; those keep the
+    // caller-decides fallback. bg3se has the same limitation -- it reports
+    // "Attempted to call an unbound Osiris function" for them.
     std::size_t applied = 0;
-    std::size_t wrong_arity = 0;
-    std::size_t absent = 0;
-    int shown = 0;
     for (Function& fn : *functions) {
-        const std::string key = fn.name + "/" + std::to_string(fn.params.size());
-        auto it = by_name.find(key);
+        auto it = by_name.find(fn.name + "/" + std::to_string(fn.params.size()));
         if (it != by_name.end()) {
             fn.out_params = it->second;
             ++applied;
-            continue;
-        }
-        auto alt = arities_by_name.find(fn.name);
-        if (alt != arities_by_name.end()) {
-            ++wrong_arity;
-            if (shown < 8) {
-                logf("  miss: %s wants /%zu, db has /%s", fn.name.c_str(),
-                     fn.params.size(), alt->second.c_str());
-                ++shown;
-            }
-        } else {
-            ++absent;
-            if (shown < 8) {
-                logf("  miss: %s (/%zu) -- bare name not in db at all",
-                     fn.name.c_str(), fn.params.size());
-                ++shown;
-            }
         }
     }
-    logf("osiris: %zu matched, %zu wrong arity, %zu absent", applied, wrong_arity,
-         absent);
     logf("osiris: signature walk found %zu entries, matched %zu of %zu functions",
          by_name.size(), applied, functions->size());
     return applied;

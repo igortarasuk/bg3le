@@ -27,7 +27,6 @@
 #include "lua_host.h"
 #include "osi.h"
 #include "fast_alloc.h"
-#include "physx_probe.h"
 #include "stackdump.h"
 #include "mem.h"
 #include "log.h"
@@ -221,8 +220,7 @@ void ensure_symbols() {
                                      kSpinBeforeYield);
         }
         install_tick_hook();
-        fast_alloc_install();  // must claim the allocator sites before the probe
-        physx_probe_install();
+        fast_alloc_install();
     });
 }
 
@@ -464,7 +462,6 @@ void dump_osiris_api(void* self);
 void dump_once(void* self) {
     std::call_once(g_story_once, [self] {
         ensure_symbols();
-        physx_probe_report("level load");
         fast_alloc_report("level load");
         if (g_story_ready_at > 0.0) {
             statusf("Level load took %.1fs after Osiris finished (%lu spin yields)",
@@ -639,7 +636,6 @@ extern "C" long _ZN7COsiris4LoadER12COsiSmartBuf(void* self, void* buf) {
     long rc = real != nullptr ? real(self, buf) : 0;
     statusf("OnAfterOsirisLoad: story loaded in %.2fs", now_s() - t0);
     g_story_ready_at = now_s();
-    physx_probe_reset();  // measure the level load, not everything since startup
     start_stall_profile();
 
     // Sample mid-stall: every thread is parked, so this should show what on.
