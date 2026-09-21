@@ -121,4 +121,45 @@ extern "C" std::uint64_t bg3le_find_entity_with(void* container,
     return 0;
 }
 
+// Finds the component of a given type on whichever entity carries it, by
+// scanning the container's storages. Used for the singleton components, which
+// bg3se normally reaches through EntityWorld -- and the world is the one thing
+// with no symbol and no capture point, so this route avoids needing it.
+static void* find_any_component(void* container, std::uint16_t componentIndex,
+                                std::size_t componentSize) {
+    if (container == nullptr) return nullptr;
+
+    auto* storages = reinterpret_cast<bg3se::ecs::EntityStorageContainer*>(container);
+    const auto type = bg3se::ecs::ComponentTypeIndex(componentIndex);
+
+    for (auto* storage : storages->Storages) {
+        if (storage == nullptr) continue;
+        if (!storage->ComponentTypeToIndex.try_get(type)) continue;
+
+        for (auto const& key : storage->InstanceToPageMap.keys()) {
+            if (key.Handle == bg3se::EntityHandle::NullHandle) continue;
+            auto* component = storage->GetComponent(key, type, componentSize);
+            if (component != nullptr) return component;
+        }
+    }
+    return nullptr;
+}
+
+// UUID string -> EntityHandle, through ls::uuid::ToHandleMappingComponent.
+// Returns 0 if the mapping component cannot be found or the UUID is unknown.
+extern "C" std::uint64_t bg3le_uuid_to_handle(void* container,
+                                              std::uint16_t mappingIndex,
+                                              char const* uuid) {
+    auto* mapping = static_cast<bg3se::UuidToHandleMappingComponent*>(
+        find_any_component(container, mappingIndex,
+                           sizeof(bg3se::UuidToHandleMappingComponent)));
+    if (mapping == nullptr || uuid == nullptr) return 0;
+
+    const auto guid = bg3se::Guid::ParseGuidString(uuid);
+    if (!guid.has_value()) return 0;
+
+    auto* handle = mapping->Mappings.try_get(*guid);
+    return handle != nullptr ? handle->Handle : 0;
+}
+
 }  // namespace bg3le

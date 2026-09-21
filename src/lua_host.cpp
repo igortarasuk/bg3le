@@ -387,6 +387,33 @@ extern "C" bool bg3le_entity_health(void* container, std::uint64_t handle,
                                     std::uint16_t componentIndex,
                                     std::int32_t* hp, std::int32_t* maxHp);
 
+extern "C" std::uint64_t bg3le_uuid_to_handle(void* container,
+                                              std::uint16_t mappingIndex,
+                                              char const* uuid);
+
+// UUID string -> EntityHandle, via ls::uuid::ToHandleMappingComponent. This is
+// what lets Osiris UUIDs, which is all a mod ever has, reach the ECS.
+int l_uuid_to_handle(lua_State* L) {
+    const char* uuid = luaL_checkstring(L, 1);
+    const auto index = ecs::index_of(ecs::Context::Component,
+                                     "ls::uuid::ToHandleMappingComponent");
+    if (!index.has_value()) {
+        lua_pushnil(L);
+        lua_pushstring(L, "ls::uuid::ToHandleMappingComponent has no index");
+        return 2;
+    }
+
+    const std::uint64_t handle = bg3le_uuid_to_handle(
+        ecs::container(), static_cast<std::uint16_t>(*index), uuid);
+    if (handle == 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, "UUID not found in the mapping");
+        return 2;
+    }
+    lua_pushinteger(L, static_cast<lua_Integer>(handle));
+    return 1;
+}
+
 extern "C" void bg3le_entity_probe(void* container, std::uint64_t handle,
                                    std::uint16_t componentIndex,
                                    std::int32_t* storageIndex, void** storage,
@@ -584,6 +611,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "EntityHealth");
     lua_pushcfunction(g_lua, l_entity_probe);
     lua_setfield(g_lua, -2, "EntityProbe");
+    lua_pushcfunction(g_lua, l_uuid_to_handle);
+    lua_setfield(g_lua, -2, "UuidToHandle");
     lua_setfield(g_lua, -2, "_Internal");
 
     lua_setglobal(g_lua, "Ext");
