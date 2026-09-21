@@ -188,7 +188,18 @@ void maybe_open_console() {
 
     std::vector<std::string> args = build_argv(launch.command, client);
     if (launch.via_host) {
-        args.insert(args.begin(), {"steam-runtime-launch-client", "--host", "--"});
+        // launch-client waits for the host command, and pressure-vessel in
+        // turn waits for launch-client -- so without detaching, the game's
+        // container cannot exit until the console window is closed.
+        std::vector<std::string> prefix{"steam-runtime-launch-client", "--host", "--"};
+        if (executable("/run/host/usr/bin/setsid")) {
+            prefix.emplace_back("/usr/bin/setsid");
+            prefix.emplace_back("-f");
+        } else {
+            statusf("CreateConsole: setsid missing on host; the game will not "
+                    "exit until the console is closed");
+        }
+        args.insert(args.begin(), prefix.begin(), prefix.end());
     }
     std::vector<char*> argv;
     argv.reserve(args.size() + 1);
