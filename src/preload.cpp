@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "ecs_types.h"
+#include "ecs_world.h"
 #include "elf_symbols.h"
 #include "hook.h"
 #include "debug_server.h"
@@ -229,6 +230,7 @@ void ensure_symbols() {
                                      kSpinBeforeYield);
         }
         install_tick_hook();
+        ecs::install_storage_capture();
         fast_alloc_install();
     });
 }

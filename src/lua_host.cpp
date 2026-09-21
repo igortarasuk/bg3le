@@ -12,6 +12,7 @@
 
 #include "debug_server.h"
 #include "ecs_types.h"
+#include "ecs_world.h"
 #include "mem.h"
 #include "log.h"
 
@@ -323,6 +324,18 @@ int l_component_index(lua_State* L) {
     return 1;
 }
 
+// The captured ECS storage pointer, for verifying the capture works before
+// anything is built on it.
+int l_ecs_storage(lua_State* L) {
+    void* p = ecs::storage();
+    if (p == nullptr) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushinteger(L, static_cast<lua_Integer>(reinterpret_cast<std::uintptr_t>(p)));
+    return 1;
+}
+
 int l_ecs_counts(lua_State* L) {
     lua_newtable(L);
     const std::pair<ecs::Context, const char*> contexts[] = {
@@ -396,6 +409,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "EcsCounts");
     lua_pushcfunction(g_lua, l_symbol_addr);
     lua_setfield(g_lua, -2, "SymbolAddr");
+    lua_pushcfunction(g_lua, l_ecs_storage);
+    lua_setfield(g_lua, -2, "EcsStorage");
     lua_setfield(g_lua, -2, "_Internal");
 
     lua_setglobal(g_lua, "Ext");

@@ -224,6 +224,7 @@ add_library(bg3le SHARED
     src/preload.cpp
     src/elf_symbols.cpp
     src/ecs_types.cpp
+    src/ecs_world.cpp
     src/log.cpp
     src/mem.cpp
     src/lua_host.cpp
