@@ -143,8 +143,14 @@ void free_hook(void* self, void* ptr) {
 }  // namespace
 
 void fast_alloc_install() {
+    // On by default: it takes level loads from 65-98s to ~1.2s, which is
+    // worth more than the caution once physics has been played on it.
+    // BG3LE_FAST_ALLOC=0 disables it.
     const char* opt = std::getenv("BG3LE_FAST_ALLOC");
-    if (opt == nullptr || opt[0] != '1') return;
+    if (opt != nullptr && opt[0] == '0') {
+        statusf("fast alloc: disabled by BG3LE_FAST_ALLOC=0");
+        return;
+    }
 
     void* original = nullptr;
     const std::size_t a = hook_call_sites(kTempAlloc,
