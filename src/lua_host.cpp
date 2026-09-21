@@ -436,6 +436,8 @@ extern "C" bool bg3le_meta_map_key(void const* handle, const char* path,
                                    void* component, std::size_t index,
                                    void** address, std::uint8_t* kind,
                                    std::uint16_t* size);
+extern "C" bool bg3le_meta_format_guid(void const* bytes, char* out,
+                                       std::size_t capacity);
 extern "C" std::size_t bg3le_meta_class_count();
 extern "C" std::size_t bg3le_meta_component_count();
 extern "C" const char* bg3le_meta_engine_class(void const* handle);
@@ -632,16 +634,13 @@ bool push_field(lua_State* L, const void* address, FieldKind kind,
             return true;
         }
         case FieldKind::Guid: {
-            // The engine stores a GUID as two little-endian words; the text
-            // form is the usual 8-4-4-4-12 grouping of those bytes.
+            // Formatted by bg3se rather than here. The byte order is not the
+            // obvious one -- see bg3le_meta_format_guid -- and open-coding it
+            // produced a UUID that looked right and was not.
             std::uint8_t b[16];
             if (!safe_read(address, b, sizeof(b))) return false;
-            char text[37];
-            std::snprintf(text, sizeof(text),
-                          "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
-                          "%02x%02x%02x%02x%02x%02x",
-                          b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6],
-                          b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+            char text[40];
+            if (!bg3le_meta_format_guid(b, text, sizeof(text))) return false;
             lua_pushstring(L, text);
             return true;
         }
@@ -1385,10 +1384,17 @@ local function encode(v, indent, depth, opts, seen, out)
     end
     seen[v] = true
 
+    -- Walked once, keeping the values, rather than collecting keys and
+    -- indexing them back. On a component view every index is a read from the
+    -- game, so re-indexing would double the work -- and it would bypass the
+    -- view's __pairs, which is what turns a field of an unconvertible kind
+    -- into a marker rather than an error.
+    local items = {}
     local n = 0
     local array = true
-    for k in pairs(v) do
+    for k, val in pairs(v) do
       n = n + 1
+      items[n] = {k = k, v = val}
       if type(k) ~= "number" then array = false end
     end
     array = array and n == #v
@@ -1397,22 +1403,21 @@ local function encode(v, indent, depth, opts, seen, out)
     if n == 0 then
       out[#out+1] = array and "[]" or "{}"
     elseif array then
+      table.sort(items, function(a, b) return a.k < b.k end)
       out[#out+1] = "[\n"
-      for i = 1, #v do
+      for i = 1, n do
         out[#out+1] = pad
-        encode(v[i], pad, depth + 1, opts, seen, out)
-        out[#out+1] = (i < #v) and ",\n" or "\n"
+        encode(items[i].v, pad, depth + 1, opts, seen, out)
+        out[#out+1] = (i < n) and ",\n" or "\n"
       end
       out[#out+1] = indent .. "]"
     else
-      local keys = {}
-      for k in pairs(v) do keys[#keys+1] = k end
-      table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+      table.sort(items, function(a, b) return tostring(a.k) < tostring(b.k) end)
       out[#out+1] = "{\n"
-      for i, k in ipairs(keys) do
-        out[#out+1] = pad .. string.format("%q", tostring(k)) .. ": "
-        encode(v[k], pad, depth + 1, opts, seen, out)
-        out[#out+1] = (i < #keys) and ",\n" or "\n"
+      for i = 1, n do
+        out[#out+1] = pad .. string.format("%q", tostring(items[i].k)) .. ": "
+        encode(items[i].v, pad, depth + 1, opts, seen, out)
+        out[#out+1] = (i < n) and ",\n" or "\n"
       end
       out[#out+1] = indent .. "}"
     end
@@ -1764,9 +1769,25 @@ make_fields = function(handle, comp, prefix, fields)
       local ok, err = Ext._Internal.SetField(handle, comp, path_to(key), value)
       if not ok then error("bg3le: " .. tostring(err), 0) end
     end,
-    -- Iterating yields field names and their kinds, which is what is knowable
-    -- without reading every field.
-    __pairs = function() return pairs(fields) end,
+    -- Iterating yields field names and their values, so dumping a component
+    -- shows what it holds. A field of a kind bg3le cannot convert yields the
+    -- marker string instead of raising the way direct access does -- a dump
+    -- has to be able to walk the whole component, and Ext.Json.Stringify
+    -- reads each key back through __index, so raising there would make any
+    -- component with one unconvertible field undumpable. The marker is a
+    -- string rather than nil for the usual reason: nil would read as absent.
+    __pairs = function(self)
+      local key
+      return function()
+        local kind
+        key, kind = next(fields, key)
+        if key == nil then return nil end
+        if kind == "unsupported" then return key, "<unsupported>" end
+        local ok, value = pcall(function() return self[key] end)
+        if not ok then return key, "<unreadable>" end
+        return key, value
+      end, self, nil
+    end,
   })
 end
 

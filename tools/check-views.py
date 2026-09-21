@@ -55,6 +55,10 @@ make_map = slice_between(
     "-- A map field is a view too, keyed the way the engine keys it.",
     "-- A view over a set of fields, used for a component")
 
+encoder = slice_between(
+    "local function encode(v, indent, depth, opts, seen, out)",
+    "function Ext.DumpExport(v)")
+
 PRELUDE = """
 local fails = 0
 local function check(what, got, want)
@@ -225,10 +229,69 @@ if fails > 0 then
   print(fails .. " failure(s)")
   os.exit(1)
 end
-print("array and map views behave")
 """
 
-harness = PRELUDE + make_array + make_map + ARRAY_TEST + MAP_TEST
+DUMP_TEST = r"""
+-- ---- dumping a view ----
+--
+-- _D on a component was the first thing that broke: the serializer collected
+-- keys from pairs and then indexed each one back, so a component holding any
+-- field of an unconvertible kind raised instead of printing. Reported from the
+-- console as
+--
+--   bg3le: ActionResources.Resources[0][0].DiceValues is of an unsupported
+--   kind (unsupported)
+--
+-- so the serializer now uses the values from the single pairs walk, and the
+-- view's __pairs turns an unconvertible field into a marker. Both halves are
+-- needed: this checks them together.
+local direct = 0
+local proxy = setmetatable({}, {
+  -- Direct access still raises, which is what a script asking for the field
+  -- by name should get.
+  __index = function(_, k)
+    direct = direct + 1
+    error("bg3le: " .. tostring(k) .. " is of an unsupported kind", 0)
+  end,
+  __pairs = function(self)
+    local fields = {Hp = 14, MaxHp = 24, DiceValues = "<unsupported>"}
+    local k
+    return function()
+      local val
+      k, val = next(fields, k)
+      if k == nil then return nil end
+      return k, val
+    end, self, nil
+  end,
+})
+
+local ok, json = pcall(Ext.Json.Stringify, proxy, {})
+check("dumping a view with an unconvertible field succeeds", ok, true)
+if ok then
+  check("the dump names the unconvertible field",
+        json:find("DiceValues", 1, true) ~= nil, true)
+  check("the dump marks it rather than valuing it",
+        json:find("<unsupported>", 1, true) ~= nil, true)
+  check("the dump carries the readable fields",
+        json:find("14", 1, true) ~= nil, true)
+end
+-- The serializer must not have indexed anything back: every value came from
+-- the pairs walk.
+check("the serializer did not re-index the view", direct, 0)
+
+-- Direct access is still an error, which is the whole point of the split.
+check("naming the field directly still raises",
+      pcall(function() return proxy.DiceValues end), false)
+
+if fails > 0 then
+  print(fails .. " failure(s)")
+  os.exit(1)
+end
+print("array, map and dump behaviour all check out")
+"""
+
+harness = (PRELUDE + make_array + make_map + "Ext.Json = {}\n" + encoder
+           + ARRAY_TEST + MAP_TEST + DUMP_TEST)
 
 with tempfile.NamedTemporaryFile("w", suffix=".lua", delete=False) as f:
     f.write(harness)

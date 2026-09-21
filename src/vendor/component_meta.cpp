@@ -902,6 +902,9 @@ extern "C" std::size_t bg3le_meta_fields(void const* handle,
 // precisely because this memory is never handed to the engine.
 //
 // Returns the number of failed checks, and writes a line per failure.
+extern "C" bool bg3le_meta_format_guid(void const* bytes, char* out,
+                                       std::size_t capacity);
+
 extern "C" int bg3le_meta_selftest() {
     int failures = 0;
     auto fail = [&failures](char const* what) {
@@ -1114,6 +1117,40 @@ extern "C" int bg3le_meta_selftest() {
         }
     }
 
+    // Guid formatting, pinned two ways.
+    //
+    // Against a literal, because the byte order is not guessable: the last
+    // eight bytes are pairwise swapped as well as the first three groups, and
+    // getting that wrong produced a UUID that looked entirely plausible.
+    //
+    // And as a round trip, because UuidToHandle parses what this formats -- a
+    // UUID read out of a component has to be handed straight back.
+    {
+        const auto known = Guid{0x1122334455667788ull, 0x99aabbccddeeff00ull};
+        char text[40];
+        if (!bg3le_meta_format_guid(&known, text, sizeof(text))) {
+            fail("formatting a Guid did not fit its buffer");
+        } else if (std::strcmp(text, "55667788-3344-1122-ff00-ddeebbcc99aa")
+                   != 0) {
+            bg3le::logf("meta selftest: FAIL Guid formatted as %s", text);
+            ++failures;
+        }
+
+        const auto parsed = Guid::ParseGuidString(text);
+        if (!parsed.has_value()) {
+            fail("a formatted Guid does not parse back");
+        } else if (*parsed != known) {
+            fail("a Guid does not survive a format and parse round trip");
+        }
+
+        // Too small a buffer has to be refused rather than truncated, since a
+        // truncated UUID would still look like one.
+        char small[8];
+        if (bg3le_meta_format_guid(&known, small, sizeof(small))) {
+            fail("formatting a Guid into a short buffer was allowed");
+        }
+    }
+
     if (failures == 0) {
         bg3le::logf("meta selftest: the container walks behave");
     }
@@ -1121,6 +1158,29 @@ extern "C" int bg3le_meta_selftest() {
 }
 
 extern "C" std::size_t bg3le_meta_class_count() { return std::size(kAllClasses); }
+
+// Formats a Guid the way the engine spells it.
+//
+// Not open-coded on the bg3le side, because the byte order is not the obvious
+// one: the first three groups are little-endian words, as a Microsoft GUID is,
+// but so are the last eight bytes, pairwise. Hand-rolling it produced
+// 8411-0cc7dfacdcfc where the engine writes 1184-c70cacdffcdc -- a UUID that
+// looked entirely plausible and was wrong. Going through bg3se's own ToString
+// also keeps this the exact inverse of the ParseGuidString that UuidToHandle
+// relies on, so a UUID read out of a component can be handed straight back.
+//
+// Writes at most capacity bytes including the terminator, and returns false if
+// it would not fit.
+extern "C" bool bg3le_meta_format_guid(void const* bytes, char* out,
+                                       std::size_t capacity) {
+    if (bytes == nullptr || out == nullptr || capacity == 0) return false;
+
+    const auto text = static_cast<Guid const*>(bytes)->ToString();
+    if (text.size() + 1 > capacity) return false;
+
+    std::memcpy(out, text.c_str(), text.size() + 1);
+    return true;
+}
 
 // The i'th class, for sweeping the whole set -- listing the components a
 // script can reach, or measuring how much of them converts.
