@@ -13,7 +13,9 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <deque>
+#include <vector>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -38,7 +40,12 @@ constexpr unsigned kProtocolVersion = 4;
 constexpr unsigned kValueTypeString = 4;
 
 std::atomic<bool> g_running{false};
-std::atomic<int> g_client{-1};
+
+// Several clients at once: CreateConsole opens one automatically, which
+// would otherwise occupy the only slot and lock out an ad-hoc session.
+// The protocol is single-client per connection, not per server.
+std::mutex g_clients_mutex;
+std::vector<int> g_clients;
 std::mutex g_send_mutex;
 
 struct Job {
@@ -120,7 +127,11 @@ std::string make_evaluate_response(std::uint64_t reply_seq, const std::string& r
 }
 
 void handle_client(int fd) {
-    logf("debug: client attached");
+    {
+        std::lock_guard<std::mutex> lock(g_clients_mutex);
+        g_clients.push_back(fd);
+        logf("debug: client attached (%zu connected)", g_clients.size());
+    }
 
     // Replay what the client missed, so attaching mid-session is informative.
     {
@@ -205,8 +216,12 @@ void handle_client(int fd) {
         if (!send_packet(fd, make_evaluate_response(seq, result, error))) break;
     }
 
-    logf("debug: client detached");
-    g_client.store(-1);
+    {
+        std::lock_guard<std::mutex> lock(g_clients_mutex);
+        g_clients.erase(std::remove(g_clients.begin(), g_clients.end(), fd),
+                        g_clients.end());
+        logf("debug: client detached (%zu remaining)", g_clients.size());
+    }
     ::close(fd);
 }
 
@@ -242,8 +257,7 @@ void listener() {
         const int fd = ::accept(srv, nullptr, nullptr);
         if (fd < 0) break;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        g_client.store(fd);
-        handle_client(fd);  // one client at a time, as the protocol assumes
+        std::thread(handle_client, fd).detach();
     }
     ::close(srv);
 }
@@ -313,14 +327,20 @@ void debug_server_tick() {
 }
 
 void debug_server_output(const char* text, int severity) {
-    const int fd = g_client.load();
-    if (fd < 0 || text == nullptr) return;
+    if (text == nullptr) return;
+    std::vector<int> targets;
+    {
+        std::lock_guard<std::mutex> lock(g_clients_mutex);
+        targets = g_clients;
+    }
+    if (targets.empty()) return;
+
     std::string body;
     pb::bytes_field(&body, 1, text);
     pb::uint_field(&body, 2, static_cast<std::uint64_t>(severity));
     std::string msg;
     pb::bytes_field(&msg, kBkDebugOutput, body);
-    send_packet(fd, msg);
+    for (int fd : targets) send_packet(fd, msg);
 }
 
 }  // namespace bg3le
