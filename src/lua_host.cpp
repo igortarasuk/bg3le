@@ -771,6 +771,133 @@ int l_set_field(lua_State* L) {
     return 1;
 }
 
+// Resolves a field and, for an array, the element kind and extent. Returns
+// nothing if the component or field is unknown.
+//
+// Separate from ComponentFields so that stays a plain name -> kind table,
+// which is what is useful to read; the prelude only needs this for the array
+// fields, to know how long the array is.
+int l_field_info(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    const char* fieldName = luaL_checkstring(L, 2);
+
+    void const* meta = bg3le_meta_component(name);
+    if (meta == nullptr) return 0;
+
+    std::uint32_t offset = 0;
+    std::uint16_t size = 0;
+    std::uint8_t kind = 0;
+    std::uint8_t elemKind = 0;
+    std::uint16_t elemCount = 0;
+    if (!bg3le_meta_field(meta, fieldName, &offset, &size, &kind, &elemKind,
+                          &elemCount)) {
+        return 0;
+    }
+
+    lua_pushstring(L, field_kind_name((FieldKind)kind));
+    lua_pushstring(L, field_kind_name((FieldKind)elemKind));
+    lua_pushinteger(L, elemCount);
+    return 3;
+}
+
+// Resolves an array field down to the address of one element. index is
+// zero-based, as the engine stores it; the prelude presents it one-based.
+void* element_address(std::uint64_t handle, const char* name,
+                      const char* fieldName, lua_Integer index,
+                      const char** error, FieldKind* elemKind) {
+    *error = nullptr;
+
+    void const* meta = nullptr;
+    void* component = component_pointer(handle, name, &meta);
+    if (meta == nullptr) {
+        *error = "no field metadata for that component";
+        return nullptr;
+    }
+    if (component == nullptr) {
+        *error = "the entity does not have that component";
+        return nullptr;
+    }
+
+    std::uint32_t offset = 0;
+    std::uint16_t size = 0;
+    std::uint8_t kind = 0;
+    std::uint8_t rawElemKind = 0;
+    std::uint16_t elemCount = 0;
+    if (!bg3le_meta_field(meta, fieldName, &offset, &size, &kind, &rawElemKind,
+                          &elemCount)) {
+        *error = "no such field";
+        return nullptr;
+    }
+    if ((FieldKind)kind != FieldKind::ScalarArray) {
+        *error = "that field is not an array";
+        return nullptr;
+    }
+    if (index < 0 || index >= elemCount) {
+        *error = "index out of range";
+        return nullptr;
+    }
+
+    const std::size_t stride = field_kind_size((FieldKind)rawElemKind);
+    if (stride == 0) {
+        *error = "the element kind is not supported";
+        return nullptr;
+    }
+
+    *elemKind = (FieldKind)rawElemKind;
+    return (char*)component + offset + (std::size_t)index * stride;
+}
+
+// Ext._Internal.GetElement(handle, component, field, zeroBasedIndex)
+int l_get_element(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
+    const char* name = luaL_checkstring(L, 2);
+    const char* fieldName = luaL_checkstring(L, 3);
+    const lua_Integer index = luaL_checkinteger(L, 4);
+
+    const char* error = nullptr;
+    FieldKind elemKind = FieldKind::Unsupported;
+    void* address =
+        element_address(handle, name, fieldName, index, &error, &elemKind);
+    if (address == nullptr) {
+        lua_pushnil(L);
+        lua_pushstring(L, error);
+        return 2;
+    }
+
+    if (!push_field(L, address, elemKind)) {
+        lua_pushnil(L);
+        lua_pushstring(L, "could not read the element");
+        return 2;
+    }
+    return 1;
+}
+
+// Ext._Internal.SetElement(handle, component, field, zeroBasedIndex, value)
+int l_set_element(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
+    const char* name = luaL_checkstring(L, 2);
+    const char* fieldName = luaL_checkstring(L, 3);
+    const lua_Integer index = luaL_checkinteger(L, 4);
+
+    const char* error = nullptr;
+    FieldKind elemKind = FieldKind::Unsupported;
+    void* address =
+        element_address(handle, name, fieldName, index, &error, &elemKind);
+    if (address == nullptr) {
+        lua_pushnil(L);
+        lua_pushstring(L, error);
+        return 2;
+    }
+
+    if (!write_field(L, 5, address, elemKind)) {
+        lua_pushnil(L);
+        lua_pushstring(L, "could not write the element");
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 // Ext._Internal.ComponentFields(engineName) -> { name = kind, ... }
 int l_component_fields(lua_State* L) {
     const char* engineName = luaL_checkstring(L, 1);
@@ -1186,6 +1313,12 @@ void lua_init() {
     lua_setfield(g_lua, -2, "SetField");
     lua_pushcfunction(g_lua, l_component_fields);
     lua_setfield(g_lua, -2, "ComponentFields");
+    lua_pushcfunction(g_lua, l_field_info);
+    lua_setfield(g_lua, -2, "FieldInfo");
+    lua_pushcfunction(g_lua, l_get_element);
+    lua_setfield(g_lua, -2, "GetElement");
+    lua_pushcfunction(g_lua, l_set_element);
+    lua_setfield(g_lua, -2, "SetElement");
     lua_pushcfunction(g_lua, l_entity_has_component);
     lua_setfield(g_lua, -2, "HasComponent");
     lua_setfield(g_lua, -2, "_Internal");
@@ -1399,11 +1532,60 @@ end
 -- as though it had succeeded. Ext._Internal.ComponentFields(name) reports what
 -- a component offers and the kind of each field.
 
+-- An array field is a view on the component, not a copy of it.
+--
+-- Returning a plain table would read correctly and then swallow writes:
+-- "component.Field[i] = v" would mutate a temporary that is discarded, with
+-- nothing to notice, which is the one outcome worse than raising. So elements
+-- are read and written through to memory one at a time.
+--
+-- One-based, as Lua is. The engine indexes these by an enum whose first value
+-- is None = 0, so element 1 is that None slot and Strength is element 2; that
+-- offset is the engine's, and bg3se presents it the same way.
+--
+-- __len and __pairs are defined because Ext.Json.Stringify uses # and pairs,
+-- and both honour metamethods -- so a view still dumps like an array.
+local function make_array(handle, comp, field, count)
+  local function check(i)
+    if type(i) ~= "number" or i < 1 or i > count then
+      error("bg3le: " .. comp .. "." .. field .. " index " .. tostring(i)
+            .. " is out of range 1.." .. count, 0)
+    end
+  end
+
+  return setmetatable({}, {
+    __index = function(_, i)
+      check(i)
+      local value, err = Ext._Internal.GetElement(handle, comp, field, i - 1)
+      if value == nil and err ~= nil then error("bg3le: " .. err, 0) end
+      return value
+    end,
+    __newindex = function(_, i, v)
+      check(i)
+      local ok, err = Ext._Internal.SetElement(handle, comp, field, i - 1, v)
+      if not ok then error("bg3le: " .. tostring(err), 0) end
+    end,
+    __len = function() return count end,
+    __pairs = function(self)
+      return function(_, k)
+        local i = (k or 0) + 1
+        if i > count then return nil end
+        return i, Ext._Internal.GetElement(handle, comp, field, i - 1)
+      end, self, nil
+    end,
+  })
+end
+
 local function make_component(handle, name, fields)
   return setmetatable({}, {
     __index = function(_, key)
-      if fields[key] == nil then
+      local kind = fields[key]
+      if kind == nil then
         error("bg3le: " .. name .. " has no field " .. tostring(key), 0)
+      end
+      if kind == "array" then
+        local _, _, count = Ext._Internal.FieldInfo(name, key)
+        return make_array(handle, name, key, count)
       end
       local value, err = Ext._Internal.GetField(handle, name, key)
       if value == nil and err ~= nil then error("bg3le: " .. err, 0) end

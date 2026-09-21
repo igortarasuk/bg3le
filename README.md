@@ -48,9 +48,11 @@ none of it behavioural.
 - **Most of `Ext.*`.** Around 265 functions bg3se exposes have no equivalent
   here yet. The ECS plumbing they need is done, so most are now a component
   index plus a vendored struct
-- **Typed components beyond `Health`.** Field access still goes through a
-  hardcoded name map, which will not scale; a generic path driven by bg3se's
-  own property metadata is the obvious next step
+- **Aggregate field kinds.** Scalars, enums and fixed-extent arrays are
+  converted; `HashMap`, `DynamicArray` and nested structs are not, so
+  `ActionResources.Resources` and `SummonContainer.ByTag` read as unsupported.
+  Naming one raises rather than returning nil, so a mod cannot mistake a
+  missing conversion for a missing value
 - **The client-side modules.** `Ext.ClientUI` in particular is blocked on the
   placeholder Noesis RTTI — the native game ships no Noesis typeinfo at all,
   so `src/vendor/noesis_rtti_linux.cpp` aliases 19 of them to one real
@@ -73,6 +75,15 @@ Optional checks:
 
     tools/check-vendor-all.sh      # per-file error counts for vendor/bg3se
     tools/check-vendor-patches.py  # confirms the clang fixes are still applied
+    tools/check-prelude.sh         # parses the Lua embedded in lua_host.cpp
+    tools/check-array-view.py      # runs the prelude's array view against a stub
+    cc -o /tmp/mc tools/meta-check.c -ldl && /tmp/mc build/libbg3le.so
+                                   # component field offsets, no game needed
+
+The first four need no game and no built library (`meta-check` needs the
+library but not the game). The Lua prelude is a raw string literal, so a syntax
+error in it is a runtime failure rather than a build one — hence
+`check-prelude.sh`.
 
 **clang is required, not merely supported.** The vendored bg3se sources need
 `-fdeclspec`, `-fms-extensions` and `-fdelayed-template-parsing`, none of which
