@@ -51,25 +51,31 @@ The threads are blocked rather than computing: they queue on PhysX's shared
 
 ## Scale, measured
 
-Instrumenting the conversion path (`BG3LE_PHYSX_PROBE=1`) for one level load:
+One level load, counters scoped to the load itself:
 
-    641 conversions
-    6,874,980 convertClass calls
+    432 conversions
+    6,384,208 convertClass calls  (6,381,082 outermost -- ~0.05% nested)
+    648.65s elapsed inside outermost convertClass
+    97.8s wall
 
-Those counts are solid. The timing from that run was not: 566s against 75.7s
-of wall clock, which is impossible as stated. Two defects, both mine --
-counters accumulated from probe install (including the pre-menu stall and
-menu time, not just the level load), and convertClass recurses, so timing
-every invocation counted the same interval once per nesting level.
+648.65s over 97.8s of wall clock is ~6.6 threads' worth, so essentially all
+worker-thread time during the stall is spent inside convertClass.
 
-Both are fixed: counters reset when the level load begins, and only the
-outermost call per thread is timed. Times are still summed across worker
-threads, so they legitimately exceed wall time -- but by a factor bounded by
-thread count rather than by recursion depth.
+That has to be read alongside the other measurements: CPU sits at ~10% and
+every thread samples in futex_wait. Threads cannot be running 6.6 cores'
+worth of code and idle at the same time, so the resolution is that they are
+*inside* convertClass but *blocked* there, queued on PhysX's shared
+TempAllocator. The ~102us mean per conversion supports this -- far too slow
+for rewriting one small object's layout, and about right for lock waiting.
 
-What stands regardless of timing: 641 serialized collections holding ~6.9M
-objects have their memory layout rewritten on every load. Pre-converting
-those 641 collections to `L_64` removes that work.
+So the stall is 6.4M conversions serialised through a single allocator. Both
+halves matter: the work is real and the volume enormous, but wall time is
+dominated by contention rather than computation. That is why CPU looks idle,
+why the stack samples show futex_wait, and why donating timeslices with
+sched_yield changed nothing.
+
+Pre-converting the assets to `L_64` addresses it either way, because it
+removes the calls entirely rather than trying to make them faster.
 
 ## Why the obvious measurements mislead
 
