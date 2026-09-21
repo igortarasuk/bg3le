@@ -714,7 +714,7 @@ void* RequireNoesisMapping(lua_State* L, void* address, char const* symbol)
 
 Point InvokeVisualPointConversion(Visual const* visual, Point const& point, void* address)
 {
-    auto proc = static_cast<Visual__PointConversionProc*>(address);
+    auto proc = reinterpret_cast<Visual__PointConversionProc*>(address);
     return proc(visual, point);
 }
 

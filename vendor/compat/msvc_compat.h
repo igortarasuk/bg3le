@@ -227,3 +227,37 @@ inline ULONGLONG GetTickCount64() {
     ::clock_gettime(CLOCK_MONOTONIC, &ts);
     return (ULONGLONG)ts.tv_sec * 1000ULL + (ULONGLONG)(ts.tv_nsec / 1000000);
 }
+
+#include <cstdlib>
+#include <cwchar>
+#include <string>
+
+inline char* _strdup(const char* s) { return ::strdup(s); }
+
+// Win32 returns the raw command line as one wide string. /proc/self/cmdline
+// holds the arguments NUL-separated, so rejoin them. Cached, because the
+// caller expects a pointer that stays valid.
+inline const wchar_t* GetCommandLineW() {
+    static const std::wstring cmdline = [] {
+        std::string joined;
+        if (std::FILE* f = std::fopen("/proc/self/cmdline", "rb")) {
+            char buf[4096];
+            std::size_t n;
+            while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+                joined.append(buf, n);
+            }
+            std::fclose(f);
+        }
+        for (char& c : joined) {
+            if (c == '\0') c = ' ';
+        }
+        while (!joined.empty() && joined.back() == ' ') joined.pop_back();
+
+        std::wstring wide(joined.size() + 1, L'\0');
+        const std::size_t written =
+            std::mbstowcs(wide.data(), joined.c_str(), wide.size());
+        wide.resize(written == static_cast<std::size_t>(-1) ? 0 : written);
+        return wide;
+    }();
+    return cmdline.c_str();
+}

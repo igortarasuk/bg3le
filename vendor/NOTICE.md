@@ -70,16 +70,63 @@ ambiguous. Replaced with `#include <thread>`:
 
 - `BG3Extender/Extender/Shared/Utils.h:6`
 
-**A static data member of a class template specialisation needs `template<>`**:
-
-- `BG3Extender/Extender/Client/SDLManager.h:15` (the `SDL_HOOK` macro)
-
 **`FixedStringUnhashed` had no stream operator.** It is a sibling of
 `FixedString`, not a `FixedString`, so the existing overload did not apply and
 insertion was ambiguous between the base class conversions to `char const*`
 and to `StringView`. Added the matching overload:
 
 - `CoreLib/Base/BaseString.h`
+
+**A static data member of a class template specialisation needs `template<>`**:
+
+- `BG3Extender/Extender/Client/SDLManager.h:15` (the `SDL_HOOK` macro)
+- `BG3Extender/Lua/Libs/ClientUI/Symbols.inl:11` (the `FOR_NOESIS_TYPE` macro,
+  expanded for 23 Noesis types)
+
+**`operator new` must take `size_t` exactly.** Upstream declares it as
+`unsigned __int64`, which is the same width as LP64 `size_t` but a different
+type (`unsigned long long` vs `unsigned long`):
+
+- `BG3Extender/Lua/Libs/ClientUI/Builtins.inl:169,174`
+
+**A `void*` cannot be `static_cast` to a function pointer**; that needs
+`reinterpret_cast`:
+
+- `BG3Extender/Lua/Libs/ClientUI/NsHelpers.inl:717`
+
+**SFINAE has to depend on a parameter of the function template, not of the
+enclosing class.** `TryOpOrFail<T>` detects whether `T` has `Do`/`DoInPlace`
+via a trailing return type, but `T` is fixed once the class is instantiated,
+so a missing member is a hard error rather than a substitution failure in the
+immediate context. Aliasing `T` as a defaulted parameter on each member
+template moves the lookup to where SFINAE applies:
+
+- `BG3Extender/Lua/Libs/Math.inl` (`TryOpOrFail::Do` and `::DoInPlace`)
+
+**`lua_Integer` is `long long`, while `int64_t` is `long` on LP64**, so
+constructing `std::variant<char const*, int64_t, double>` from a `lua_Integer`
+has no viable alternative without an explicit cast. On MSVC they are the same
+type:
+
+- `BG3Extender/Lua/Libs/Json.inl:373,375`
+
+**An `STDString` was passed through a variadic function.** That is undefined on
+both platforms; MSVC only warns:
+
+- `BG3Extender/Lua/Libs/ClientAudio.inl:56` — now passes `c_str()`
+
+**`std::derived_from` requires complete types**, so testing an incomplete type
+is a hard error rather than a false. `IsArray` is evaluated against types that
+are only forward-declared at that point, so the check is now guarded by an
+`IsCompleteType` concept:
+
+- `BG3Extender/GameDefinitions/Base/TypeMetadata.h:19`
+
+**Declaring any class-scope `operator delete` hides the global ones**, and an
+inherited virtual destructor still needs a usual deallocation function.
+`NsCustomDataContext` declared only the placement form:
+
+- `BG3Extender/Lua/Libs/ClientUI/CustomProperties.inl`
 
 **An include used the wrong directory case**, which resolves on Windows and
 not on Linux:
@@ -111,8 +158,9 @@ or sit ahead of the vendored tree on the include path.
 
 - `msvc_compat.h` — SAL annotations, Win32 typedefs (`DWORD` and `LONG` are
   32-bit on Windows, so they are `unsigned int` and `int`, not `long`), the
-  MSVC bit-scan intrinsics, the secure-CRT `sprintf_s` family, `VirtualProtect`
-  over `mprotect`, and `QueryPerformanceCounter` over `CLOCK_MONOTONIC`
+  MSVC bit-scan intrinsics, the secure-CRT `sprintf_s` family, `_strdup`,
+  `VirtualProtect` over `mprotect`, `QueryPerformanceCounter` over
+  `CLOCK_MONOTONIC`, and `GetCommandLineW` over `/proc/self/cmdline`
 - `concurrent_vector.h`, `concurrent_queue.h`, `ppl.h` — MSVC's
   `concurrency::` containers mapped onto [oneTBB](https://github.com/uxlfoundation/oneTBB)
   (Apache-2.0)

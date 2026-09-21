@@ -370,9 +370,11 @@ void StringifyTableAsObjectOrdered(lua_State * L, int index, unsigned depth, Str
             keys.push_back(key);
         } else if (lua_type(L, -2) == LUA_TNUMBER) {
             if (lua_isinteger(L, -2)) {
-                keys.push_back(lua_tointeger(L, -2));
+                // lua_Integer is long long; int64_t is long on LP64, so the
+                // variant has no viable alternative without an explicit cast.
+                keys.push_back((int64_t)lua_tointeger(L, -2));
             } else {
-                keys.push_back(lua_tonumber(L, -2));
+                keys.push_back((double)lua_tonumber(L, -2));
             }
         } else {
             throw std::runtime_error("Can only stringify string or number table keys");

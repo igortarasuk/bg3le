@@ -11,6 +11,12 @@
 /// <lua_module>Math</lua_module>
 BEGIN_NS(lua::math)
 
+// The SFINAE below has to depend on a template parameter of each member
+// function, not on T. T is fixed once TryOpOrFail is instantiated, so a
+// missing T::Do/T::DoInPlace is a hard error rather than a substitution
+// failure in the immediate context. Aliasing T as a defaulted parameter TT
+// moves the lookup into the member template's own substitution, which is
+// where SFINAE applies. MSVC accepts either spelling.
 template <class T>
 struct TryOpOrFail
 {
@@ -19,16 +25,16 @@ struct TryOpOrFail
         return false;
     }
 
-    template <class T1>
-    static __forceinline auto Do(lua_State* L, T1 const& a) -> decltype((void)(T::Do(L, a)), void())
+    template <class T1, class TT = T>
+    static __forceinline auto Do(lua_State* L, T1 const& a) -> decltype((void)(TT::Do(L, a)), void())
     {
-        T::Do(L, a);
+        TT::Do(L, a);
     }
 
-    template <class T1, class T2>
-    static __forceinline auto Do(lua_State* L, T1 const& a, T2 const& b) -> decltype((void)(T::Do(L, a, b)), void())
+    template <class T1, class T2, class TT = T>
+    static __forceinline auto Do(lua_State* L, T1 const& a, T2 const& b) -> decltype((void)(TT::Do(L, a, b)), void())
     {
-        T::Do(L, a, b);
+        TT::Do(L, a, b);
     }
 
     static bool DoInPlace(lua_State* L, ...)
@@ -36,16 +42,16 @@ struct TryOpOrFail
         return false;
     }
 
-    template <class T1>
-    static __forceinline auto DoInPlace(lua_State* L, T1 const& a) -> decltype((void)(T::DoInPlace(L, a)), void())
+    template <class T1, class TT = T>
+    static __forceinline auto DoInPlace(lua_State* L, T1 const& a) -> decltype((void)(TT::DoInPlace(L, a)), void())
     {
-        T::DoInPlace(L, a);
+        TT::DoInPlace(L, a);
     }
 
-    template <class T1, class T2>
-    static __forceinline auto DoInPlace(lua_State* L, T1 const& a, T2 const& b) -> decltype((void)(T::DoInPlace(L, a, b)), void())
+    template <class T1, class T2, class TT = T>
+    static __forceinline auto DoInPlace(lua_State* L, T1 const& a, T2 const& b) -> decltype((void)(TT::DoInPlace(L, a, b)), void())
     {
-        T::DoInPlace(L, a, b);
+        TT::DoInPlace(L, a, b);
     }
 };
 

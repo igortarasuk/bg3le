@@ -8,7 +8,7 @@ struct SymbolInfo
     static Symbol Name;
 };
 
-#define FOR_NOESIS_TYPE(T) Symbol SymbolInfo<T>::Name;
+#define FOR_NOESIS_TYPE(T) template<> Symbol SymbolInfo<T>::Name;
 FOR_EACH_NOESIS_TYPE()
 #undef FOR_NOESIS_TYPE
 

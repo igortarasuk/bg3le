@@ -3,6 +3,13 @@
 BEGIN_SE()
 
 
+// std::derived_from requires both types to be complete, so asking it about an
+// incomplete type is a hard error rather than a false. IsArray is evaluated
+// against plenty of types that are only forward-declared at that point, so
+// guard the check.
+template <class T>
+concept IsCompleteType = requires { sizeof(T); };
+
 // Minimalist version of container requirements
 template <class T>
 concept IsArray = requires(T a)
@@ -16,7 +23,7 @@ concept IsArray = requires(T a)
     typename T::value_type;
     { a[0] } -> std::same_as<typename T::value_type>;
 }
-|| std::derived_from<T, ::Noesis::BaseCollection>;
+|| (IsCompleteType<T> && std::derived_from<T, ::Noesis::BaseCollection>);
 
 template <class T>
 concept IsMap = requires(T a)

@@ -46,6 +46,25 @@ CHECKS = [
      lambda: "__VA_OPT__" in text("CoreLib/Utils.h")),
     ("FixedStringUnhashed has a stream operator",
      lambda: "bg3se::FixedStringUnhashed const& str" in text("CoreLib/Base/BaseString.h")),
+    ("FOR_NOESIS_TYPE specialisations marked template<>",
+     lambda: "template<> Symbol SymbolInfo<T>::Name"
+             in text("BG3Extender/Lua/Libs/ClientUI/Symbols.inl")),
+    ("BaseObject::operator new takes size_t",
+     lambda: "unsigned __int64" not in text("BG3Extender/Lua/Libs/ClientUI/Builtins.inl")),
+    ("function pointer cast uses reinterpret_cast",
+     lambda: "reinterpret_cast<Visual__PointConversionProc*>"
+             in text("BG3Extender/Lua/Libs/ClientUI/NsHelpers.inl")),
+    ("TryOpOrFail SFINAE uses a member template parameter",
+     lambda: "class TT = T" in text("BG3Extender/Lua/Libs/Math.inl")),
+    ("Json variant alternatives cast explicitly",
+     lambda: "(int64_t)lua_tointeger" in text("BG3Extender/Lua/Libs/Json.inl")),
+    ("ClientAudio passes c_str() to the variadic",
+     lambda: "name.c_str()" in text("BG3Extender/Lua/Libs/ClientAudio.inl")),
+    ("derived_from guarded by a completeness check",
+     lambda: "IsCompleteType<T>" in text("BG3Extender/GameDefinitions/Base/TypeMetadata.h")),
+    ("NsCustomDataContext has a usual operator delete",
+     lambda: "static void operator delete(void* ptr) noexcept"
+             in text("BG3Extender/Lua/Libs/ClientUI/CustomProperties.inl")),
 ]
 
 

@@ -33,6 +33,15 @@ public:
     static void operator delete(void* ptr, void* place) noexcept
     {}
 
+    // Declaring any class-scope operator delete hides the global ones, and the
+    // inherited virtual destructor needs a usual deallocation function. This
+    // class is only ever placement-constructed, so this should not run; it
+    // frees through the game allocator to match BaseObject::operator new.
+    static void operator delete(void* ptr) noexcept
+    {
+        bg3se::GameFree(ptr);
+    }
+
     static const TypeClass* StaticGetClassType(TypeTag<NsCustomDataContext>*)
     {
         static const TypeClass* type{ nullptr };
