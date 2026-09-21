@@ -777,30 +777,37 @@ extern "C" bool bg3le_meta_resolve(void const* handle, char const* path,
 
 // The current length of a dynamic array, and the element stride. Needs the
 // component because the length is stored in the container.
-extern "C" bool bg3le_meta_array_length(void const* handle, char const* path,
-                                        void* component, std::size_t* count,
-                                        std::uint16_t* elemSize,
-                                        std::uint8_t* elemKind) {
+// Status rather than a bool, because the caller has to be able to tell "this
+// resolved and holds nothing" from "this did not resolve". Collapsing the two
+// is how an unreadable container came to look like an empty one.
+//
+// 0 ok, 1 bad arguments, 2 the path does not resolve, 3 not a container,
+// 4 a container with no length accessor.
+extern "C" int bg3le_meta_array_length(void const* handle, char const* path,
+                                       void* component, std::size_t* count,
+                                       std::uint16_t* elemSize,
+                                       std::uint8_t* elemKind) {
     *count = 0;
-    if (handle == nullptr || path == nullptr || component == nullptr) return false;
+    if (handle == nullptr || path == nullptr || component == nullptr) return 1;
 
     const auto r = resolve_path(static_cast<ClassFields const*>(handle), path,
                                 component);
-    if (!r.Ok || r.Address == nullptr) return false;
+    if (!r.Ok || r.Address == nullptr) return 2;
 
     *elemSize = r.Field.ElemSize;
     *elemKind = (std::uint8_t)r.Field.ElemKind;
 
     if (r.Field.Kind == FieldKind::ScalarArray) {
         *count = r.Field.ElemCount;
-        return true;
+        return 0;
     }
-    if ((r.Field.Kind == FieldKind::DynArray || r.Field.Kind == FieldKind::Map)
-        && r.Field.Count != nullptr) {
-        *count = r.Field.Count(r.Address);
-        return true;
+    if (r.Field.Kind != FieldKind::DynArray && r.Field.Kind != FieldKind::Map) {
+        return 3;
     }
-    return false;
+    if (r.Field.Count == nullptr) return 4;
+
+    *count = r.Field.Count(r.Address);
+    return 0;
 }
 
 // The key of one slot of a map.
@@ -938,8 +945,8 @@ extern "C" int bg3le_meta_selftest() {
     std::size_t count = 0;
     std::uint16_t elemSize = 0;
     std::uint8_t elemKind = 0;
-    if (!bg3le_meta_array_length(meta, "Events", &component, &count, &elemSize,
-                                 &elemKind)) {
+    if (bg3le_meta_array_length(meta, "Events", &component, &count, &elemSize,
+                                &elemKind) != 0) {
         fail("Events has no array length");
     } else {
         if (count != 2) fail("Events length is not 2");
@@ -1009,8 +1016,9 @@ extern "C" int bg3le_meta_selftest() {
         std::size_t setCount = 0;
         std::uint16_t setElemSize = 0;
         std::uint8_t setElemKind = 0;
-        if (!bg3le_meta_array_length(summonMeta, "Characters", &summons,
-                                     &setCount, &setElemSize, &setElemKind)) {
+        if (bg3le_meta_array_length(summonMeta, "Characters", &summons,
+                                    &setCount, &setElemSize, &setElemKind)
+            != 0) {
             fail("Characters has no array length");
         } else if (setCount != 2) {
             fail("Characters length is not 2");
@@ -1053,8 +1061,9 @@ extern "C" int bg3le_meta_selftest() {
         std::size_t mapCount = 0;
         std::uint16_t mapElemSize = 0;
         std::uint8_t mapElemKind = 0;
-        if (!bg3le_meta_array_length(resMeta, "Resources", &resources,
-                                     &mapCount, &mapElemSize, &mapElemKind)) {
+        if (bg3le_meta_array_length(resMeta, "Resources", &resources,
+                                    &mapCount, &mapElemSize, &mapElemKind)
+            != 0) {
             fail("Resources has no length");
         } else if (mapCount != 1) {
             fail("Resources length is not 1");

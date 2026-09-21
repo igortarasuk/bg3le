@@ -89,7 +89,10 @@ local function index_of(path)
   return tonumber(i)
 end
 
-function Ext._Internal.ArrayInfo(handle, comp, path) return count, "int32" end
+function Ext._Internal.ArrayInfo(handle, comp, path)
+  if count == nil then return nil, "stubbed failure" end
+  return count, "int32"
+end
 
 function Ext._Internal.GetField(handle, comp, path)
   local i, err = index_of(path)
@@ -144,6 +147,14 @@ check("write a.nope raises", pcall(function() a.nope = 1 end), false)
 count = 5
 check("#a after shrink", #a, 5)
 check("a[7] raises after shrink", pcall(function() return a[7] end), false)
+
+-- A failure to size must raise, not read as an empty array. Returning zero
+-- there made an unreadable container look like a present, empty one, which is
+-- the one answer with nothing to notice -- it hid a real discrepancy in
+-- SummonContainer.ByTag until bg3se on Windows was there to compare against.
+count = nil
+check("a failure to size raises", pcall(function() return #a end), false)
+count = 7
 """
 
 MAP_TEST = r"""

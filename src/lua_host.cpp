@@ -428,10 +428,10 @@ extern "C" bool bg3le_meta_resolve(void const* handle, const char* path,
                                    void* component, void** address,
                                    std::uint8_t* kind, std::uint16_t* size,
                                    bool* readOnly);
-extern "C" bool bg3le_meta_array_length(void const* handle, const char* path,
-                                        void* component, std::size_t* count,
-                                        std::uint16_t* elemSize,
-                                        std::uint8_t* elemKind);
+extern "C" int bg3le_meta_array_length(void const* handle, const char* path,
+                                       void* component, std::size_t* count,
+                                       std::uint16_t* elemSize,
+                                       std::uint8_t* elemKind);
 extern "C" bool bg3le_meta_map_key(void const* handle, const char* path,
                                    void* component, std::size_t index,
                                    void** address, std::uint8_t* kind,
@@ -868,10 +868,20 @@ int l_array_info(lua_State* L) {
     std::size_t count = 0;
     std::uint16_t elemSize = 0;
     std::uint8_t elemKind = 0;
-    if (!bg3le_meta_array_length(meta, path, component, &count, &elemSize,
-                                 &elemKind)) {
+    const int status = bg3le_meta_array_length(meta, path, component, &count,
+                                               &elemSize, &elemKind);
+    if (status != 0) {
+        static const char* const reasons[] = {
+            "",
+            "bad arguments",
+            "the path does not resolve",
+            "it is not a container",
+            "it is a container with no length accessor",
+        };
         lua_pushnil(L);
-        lua_pushfstring(L, "%s.%s is not an array", name, path);
+        lua_pushfstring(L, "cannot size %s.%s: %s", name, path,
+                        (status >= 1 && status <= 4) ? reasons[status]
+                                                     : "unknown error");
         return 2;
     }
 
@@ -1758,9 +1768,15 @@ local make_fields
 local make_map
 
 local function make_array(handle, comp, path)
+  -- Raises rather than reporting zero, for the reason in make_map below: a
+  -- failure to resolve must not read as an empty array.
   local function length()
-    local count = Ext._Internal.ArrayInfo(handle, comp, path)
-    return count or 0
+    local count, err = Ext._Internal.ArrayInfo(handle, comp, path)
+    if count == nil then
+      error("bg3le: cannot size " .. comp .. "." .. path .. ": "
+            .. tostring(err), 0)
+    end
+    return count
   end
 
   local function element_path(i)
@@ -1815,9 +1831,18 @@ end
 -- engine's global string table -- leave the key side unavailable while the
 -- values stay reachable by slot, which is what Entries() is for.
 make_map = function(handle, comp, path)
+  -- Raises rather than reporting zero. "or 0" here turned any failure to
+  -- resolve into an empty map, which is the worst possible answer: a mod sees
+  -- a container that is present and empty, and there is nothing to notice.
+  -- It hid a real discrepancy in SummonContainer.ByTag for exactly as long as
+  -- it took to compare against bg3se on Windows.
   local function count()
-    local n = Ext._Internal.ArrayInfo(handle, comp, path)
-    return n or 0
+    local n, err = Ext._Internal.ArrayInfo(handle, comp, path)
+    if n == nil then
+      error("bg3le: cannot size " .. comp .. "." .. path .. ": "
+            .. tostring(err), 0)
+    end
+    return n
   end
 
   local function key_at(i)
