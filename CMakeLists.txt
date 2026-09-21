@@ -64,6 +64,26 @@ target_compile_options(lua_static PRIVATE -include cstdint)
 set_target_properties(lua_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
+# ImGui (Norbyte's fork), for the extender's in-game UI. Only the Vulkan
+# backend: the native Linux build renders through Vulkan, and the D3D11 one
+# needs the DirectX headers.
+# ---------------------------------------------------------------------------
+set(EXTERNAL ${CMAKE_CURRENT_SOURCE_DIR}/external/third_party)
+
+add_library(imgui STATIC
+    ${EXTERNAL}/imgui/imgui.cpp
+    ${EXTERNAL}/imgui/imgui_draw.cpp
+    ${EXTERNAL}/imgui/imgui_tables.cpp
+    ${EXTERNAL}/imgui/imgui_widgets.cpp
+    ${EXTERNAL}/imgui/backends/imgui_impl_vulkan.cpp
+    ${EXTERNAL}/imgui/backends/imgui_impl_sdl2.cpp
+)
+target_include_directories(imgui PUBLIC ${EXTERNAL}/imgui
+    ${EXTERNAL}/Vulkan/include /usr/include/SDL2)
+target_compile_options(imgui PRIVATE -w)
+set_target_properties(imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# ---------------------------------------------------------------------------
 # Vendored bg3se
 #
 # See vendor/NOTICE.md for attribution and for every change made to build this
@@ -71,7 +91,6 @@ set_target_properties(lua_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # deliberately does not build, and why.
 # ---------------------------------------------------------------------------
 set(VENDOR_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/vendor/bg3se)
-set(EXTERNAL ${CMAKE_CURRENT_SOURCE_DIR}/external/third_party)
 set(NOESIS ${EXTERNAL}/Noesis/NoesisGUI-NativeSDK-win-3.1.7-Indie/Include)
 
 if(NOT EXISTS ${NOESIS})
@@ -79,6 +98,12 @@ if(NOT EXISTS ${NOESIS})
 endif()
 
 file(GLOB_RECURSE VENDOR_SOURCES ${VENDOR_ROOT}/*.cpp ${VENDOR_ROOT}/*.cc)
+
+# Upstream compiles one .inl as a translation unit -- BG3Extender.vcxproj lists
+# it under ClCompile and nothing includes it. CMake will not generate a rule
+# for an .inl, so src/vendor/ wraps it.
+list(APPEND VENDOR_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/stats_object_tu.cpp)
 
 # Kept in step with tools/vendor-exclude.txt.
 set(VENDOR_EXCLUDE
@@ -90,7 +115,6 @@ set(VENDOR_EXCLUDE
     BG3Extender/GameHooks/OsirisWrappers.cpp       # Detours; we interpose PLT
     BG3Extender/GameHooks/EngineHooks.cpp
     CoreLib/SymbolMapper.cpp
-    BG3Extender/Extender/Client/IMGUI/IMGUI.cpp    # client UI, not a target yet
     BG3Extender/Extender/Client/SDL.cpp
     CoreLib/Console.cpp                            # Windows console internals
     # Byte-identical duplicate of CoreLib/tinyxml2.cpp; building both would
@@ -124,6 +148,7 @@ target_compile_definitions(bg3se_vendor PUBLIC
     GLM_FORCE_INTRINSICS   # MSVC enables SIMD implicitly; glm needs it set
     GOOGLE_PROTOBUF_NO_RTTI
     _ITERATOR_DEBUG_LEVEL=0
+    BG3LE_NO_DX11   # the D3D11 ImGui backend needs the DirectX headers
 )
 
 # -fdeclspec/-fms-extensions: __declspec and MSVC struct extensions.
@@ -140,7 +165,7 @@ target_compile_options(bg3se_vendor PUBLIC
 # Upstream warnings are not ours to fix, and there are some 1800 of them.
 target_compile_options(bg3se_vendor PRIVATE -w)
 
-target_link_libraries(bg3se_vendor PUBLIC lua_static protobuf-lite tbb)
+target_link_libraries(bg3se_vendor PUBLIC lua_static imgui protobuf-lite tbb)
 
 # ---------------------------------------------------------------------------
 # bg3le

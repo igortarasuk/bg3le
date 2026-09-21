@@ -11,7 +11,11 @@
 #define IMGUI_FRAME_DEBUG(msg, ...) if ((frameNo_ % 100) == 0) { IMGUI_DEBUG(msg, __VA_ARGS__); }
 
 #include <Extender/Client/IMGUI/Vulkan.inl>
+// The D3D11 backend needs the DirectX headers. The native Linux build
+// renders through Vulkan, so only that backend is compiled here.
+#if !defined(BG3LE_NO_DX11)
 #include <Extender/Client/IMGUI/DX11.inl>
+#endif
 #include <Lua/Shared/LuaMethodCallHelpers.h>
 
 BEGIN_NS(extui)
@@ -1776,11 +1780,17 @@ void IMGUIObjectManager::Clear()
 IMGUIManager::IMGUIManager(SDLManager& sdl)
     : sdl_(sdl)
 {
+#if defined(BG3LE_NO_DX11)
+    // There is no D3D11 build of the native Linux game, and the backend is
+    // not compiled; see the DX11.inl include above.
+    renderer_ = std::make_unique<VulkanBackend>(*this);
+#else
     if (GetModuleHandleW(L"bg3_dx11.exe") == NULL) {
         renderer_ = std::make_unique<VulkanBackend>(*this);
     } else {
         renderer_ = std::make_unique<DX11Backend>(*this);
     }
+#endif
 
     textureLoader_.BindRenderer(renderer_.get());
 }

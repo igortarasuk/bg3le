@@ -13,7 +13,7 @@ BEGIN_SE()
 
 #define VK_HOOK(name) enum class Vk##name##HookTag {}; \
     using Vk##name##HookType = WrappableFunction<Vk##name##HookTag, decltype(vk##name)>; \
-    Vk##name##HookType* Vk##name##HookType::gHook;
+    template<> Vk##name##HookType* Vk##name##HookType::gHook = nullptr;
 
 VK_HOOK(CreateInstance)
 VK_HOOK(CreateDevice)
@@ -62,7 +62,7 @@ public:
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
         auto createInstance = vkGetInstanceProcAddr(nullptr, "vkCreateInstance");
-        CreateInstanceHook_.Wrap(ResolveFunctionTrampoline(createInstance));
+        CreateInstanceHook_.Wrap((void*)ResolveFunctionTrampoline(createInstance));
         DetourTransactionCommit();
 
         CreateInstanceHook_.SetPostHook(&VulkanBackend::vkCreateInstanceHooked, this);
@@ -369,8 +369,8 @@ private:
             DetourUpdateThread(GetCurrentThread());
             auto createDevice = vkGetInstanceProcAddr(instance_, "vkCreateDevice");
             auto destroyDevice = vkGetInstanceProcAddr(instance_, "vkDestroyDevice");
-            CreateDeviceHook_.Wrap(ResolveFunctionTrampoline(createDevice));
-            DestroyDeviceHook_.Wrap(ResolveFunctionTrampoline(destroyDevice));
+            CreateDeviceHook_.Wrap((void*)ResolveFunctionTrampoline(createDevice));
+            DestroyDeviceHook_.Wrap((void*)ResolveFunctionTrampoline(destroyDevice));
             DetourTransactionCommit();
         }
     }

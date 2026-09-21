@@ -8,7 +8,7 @@
 // specifier, but an alias naming the same type can.
 #define STATIC_HOOK(name) \
     using name##HookType = decltype(bg3se::ecl::ScriptExtender::name); \
-    template<> name##HookType* name##HookType::gHook;
+    template<> name##HookType* name##HookType::gHook = nullptr;
 STATIC_HOOK(gameStateWorkerStart_)
 STATIC_HOOK(gameStateMachineUpdate_)
 

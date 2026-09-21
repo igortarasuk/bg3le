@@ -225,6 +225,24 @@ the static hook members have to be defined through an alias:
 - `BG3Extender/Extender/Client/ScriptExtenderClient.cpp:7` (`STATIC_HOOK`)
 - `BG3Extender/Extender/Shared/Hooks.cpp:8`
 
+**An explicit specialisation of a static data member is only a definition if
+it has an initialiser.** Adding `template<>` to satisfy the rule above turns
+the declaration into just that — a declaration — and the symbol is never
+emitted. Every one of them needs an initialiser:
+
+- `BG3Extender/Extender/Client/SDLManager.h` (`SDL_HOOK`)
+- `BG3Extender/Extender/Client/IMGUI/Vulkan.inl` (`VK_HOOK`)
+- `BG3Extender/Lua/Libs/ClientUI/Symbols.inl` (`FOR_NOESIS_TYPE`)
+- `BG3Extender/Extender/ScriptExtender.cpp`,
+  `.../Server/ScriptExtenderServer.cpp`, `.../Client/ScriptExtenderClient.cpp`,
+  `.../Shared/Hooks.cpp`
+
+**The D3D11 ImGui backend cannot build on Linux.** There is no D3D11 build of
+the native game, so only the Vulkan backend is compiled and the backend
+selection is fixed accordingly, under `BG3LE_NO_DX11`:
+
+- `BG3Extender/Extender/Client/IMGUI/IMGUI.cpp`
+
 **An include used the wrong directory case**, which resolves on Windows and
 not on Linux:
 
@@ -234,6 +252,13 @@ not on Linux:
 
 - `CoreLib/Config.h`
 - `BG3Extender/Extender/BuildInfo.h`
+
+### One .inl is a translation unit
+
+`BG3Extender.vcxproj` lists `GameDefinitions/Stats/StatsObject.inl` under
+`ClCompile`, so MSVC compiles it despite the extension, and nothing includes
+it. It defines the `stats::Object` members — 21 symbols. CMake will not
+generate a rule for an `.inl`, so `src/vendor/stats_object_tu.cpp` wraps it.
 
 ### Generated files
 

@@ -91,6 +91,17 @@ CHECKS = [
     ("static hook members defined through an alias",
      lambda: "decltype(ScriptExtender::CoreLibInit)::gHook"
              not in text("BG3Extender/Extender/ScriptExtender.cpp")),
+    ("static member specialisations have initialisers",
+     lambda: all("::gHook;" not in text(f) for f in (
+         "BG3Extender/Extender/Client/SDLManager.h",
+         "BG3Extender/Extender/Client/IMGUI/Vulkan.inl",
+         "BG3Extender/Extender/ScriptExtender.cpp",
+         "BG3Extender/Extender/Server/ScriptExtenderServer.cpp",
+         "BG3Extender/Extender/Client/ScriptExtenderClient.cpp",
+         "BG3Extender/Extender/Shared/Hooks.cpp"))),
+    ("ImGui D3D11 backend gated",
+     lambda: "BG3LE_NO_DX11"
+             in text("BG3Extender/Extender/Client/IMGUI/IMGUI.cpp")),
     ("NsCustomDataContext has a usual operator delete",
      lambda: "static void operator delete(void* ptr) noexcept"
              in text("BG3Extender/Lua/Libs/ClientUI/CustomProperties.inl")),

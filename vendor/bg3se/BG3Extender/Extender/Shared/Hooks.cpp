@@ -11,7 +11,7 @@ using ClientConnectMessageSerializeHook =
     WrappableFunction<Hooks::ClientConnectMessageSerializeTag,
                       void(net::Message*, net::BitstreamSerializer*)>;
 template<> ClientConnectMessageSerializeHook*
-    ClientConnectMessageSerializeHook::gHook;
+    ClientConnectMessageSerializeHook::gHook = nullptr;
 
 void Hooks::Startup()
 {

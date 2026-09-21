@@ -28,9 +28,9 @@ void ShutdownCrashReporting();
 using CoreLibInitHookType = decltype(ScriptExtender::CoreLibInit);
 using AppUpdatePathsHookType = decltype(ScriptExtender::AppUpdatePaths);
 using AppLoadGraphicSettingsHookType = decltype(ScriptExtender::AppLoadGraphicSettings);
-template<> CoreLibInitHookType* CoreLibInitHookType::gHook;
-template<> AppUpdatePathsHookType* AppUpdatePathsHookType::gHook;
-template<> AppLoadGraphicSettingsHookType* AppLoadGraphicSettingsHookType::gHook;
+template<> CoreLibInitHookType* CoreLibInitHookType::gHook = nullptr;
+template<> AppUpdatePathsHookType* AppUpdatePathsHookType::gHook = nullptr;
+template<> AppLoadGraphicSettingsHookType* AppLoadGraphicSettingsHookType::gHook = nullptr;
 
 std::unique_ptr<ScriptExtender> gExtender;
 
