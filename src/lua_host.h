@@ -16,6 +16,14 @@ void lua_bind_osi(const std::vector<osi::Function>& functions);
 // Runs a chunk, logging the result or the error. For bring-up checks.
 void lua_run(const char* code);
 
+// Runs any timer callbacks that have come due. Called once per server tick,
+// so callbacks land on the story thread and may call Osiris.
+void lua_tick();
+
+// Loads loose-file mods from the search path. Deferred until Osiris is bound,
+// since a mod's load-time code may call it.
+void lua_load_mods();
+
 // Evaluates a chunk, returning its stringified results or the error text.
 // Must be called from the story thread.
 void lua_eval(const char* code, std::string* result, std::string* error);

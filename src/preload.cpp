@@ -180,6 +180,7 @@ UpdateMessagesProc g_orig_update_messages = nullptr;
 void update_messages_hook(void* self) {
     debug_server_note_story_thread();
     debug_server_pump();
+    lua_tick();
     if (g_orig_update_messages != nullptr) g_orig_update_messages(self);
 }
 
@@ -550,6 +551,7 @@ void dump_osiris_api(void* self) {
             typed, bindable.size());
 
     lua_bind_osi(bindable);
+    lua_load_mods();  // after Osi, so a mod's load-time code can call it
 
     auto free_types = next<FreeMappings>("_ZN7COsiris16FreeTypeMappingsEP11MappingInfoj");
     auto free_funcs = next<FreeMappings>("_ZN7COsiris20FreeFunctionMappingsEP11MappingInfoj");

@@ -1,7 +1,10 @@
 #include "lua_host.h"
 
+#include <cerrno>
 #include <cstring>
 #include <ctime>
+#include <dirent.h>
+#include <dlfcn.h>
 #include <link.h>
 #include <string>
 
@@ -218,6 +221,51 @@ int l_clock_time(lua_State* L) {
     return 1;
 }
 
+// The project root, derived from our own .so path: it lives in <root>/build/.
+// Mod discovery uses it to find <root>/mods without hardcoding a path.
+int l_extender_root(lua_State* L) {
+    ::Dl_info info{};
+    if (::dladdr(reinterpret_cast<const void*>(&l_extender_root), &info) == 0 ||
+        info.dli_fname == nullptr) {
+        lua_pushnil(L);
+        return 1;
+    }
+    std::string path(info.dli_fname);
+    for (int up = 0; up < 2; ++up) {  // strip the filename, then build/
+        const std::size_t slash = path.find_last_of('/');
+        if (slash == std::string::npos) {
+            lua_pushnil(L);
+            return 1;
+        }
+        path.erase(slash);
+    }
+    lua_pushstring(L, path.c_str());
+    return 1;
+}
+
+// Mod discovery needs to enumerate directories, which Lua cannot do without
+// shelling out. Returns names only, with "." and ".." dropped.
+int l_list_dir(lua_State* L) {
+    const char* path = luaL_checkstring(L, 1);
+    DIR* dir = ::opendir(path);
+    if (dir == nullptr) {
+        lua_pushnil(L);
+        lua_pushstring(L, std::strerror(errno));
+        return 2;
+    }
+    lua_newtable(L);
+    int n = 0;
+    while (dirent* e = ::readdir(dir)) {
+        if (std::strcmp(e->d_name, ".") == 0 || std::strcmp(e->d_name, "..") == 0) {
+            continue;
+        }
+        lua_pushstring(L, e->d_name);
+        lua_rawseti(L, -2, ++n);
+    }
+    ::closedir(dir);
+    return 1;
+}
+
 void register_log(lua_State* L, const char* name, int severity) {
     lua_pushinteger(L, severity);
     lua_pushcclosure(L, l_log, 1);
@@ -261,6 +309,10 @@ void lua_init() {
     lua_setfield(g_lua, -2, "Peek");
     lua_pushcfunction(g_lua, l_peek_string);
     lua_setfield(g_lua, -2, "PeekString");
+    lua_pushcfunction(g_lua, l_list_dir);
+    lua_setfield(g_lua, -2, "ListDir");
+    lua_pushcfunction(g_lua, l_extender_root);
+    lua_setfield(g_lua, -2, "ExtenderRoot");
     lua_setfield(g_lua, -2, "_Internal");
 
     lua_setglobal(g_lua, "Ext");
@@ -425,6 +477,122 @@ _PW = Ext.Log.PrintWarning
 _PE = Ext.Log.PrintError
 Print = Ext.Log.Print
 print = Ext.Log.Print
+
+-- Timers are driven from the server tick, so callbacks run on the story
+-- thread and may call Osiris.
+local timers, next_handle = {}, 1
+
+function Ext.Timer.WaitFor(ms, fn, repeat_ms)
+  local handle = next_handle
+  next_handle = handle + 1
+  timers[handle] = {
+    due = Ext.Timer.MonotonicTime() + ms, fn = fn, every = repeat_ms
+  }
+  return handle
+end
+
+function Ext.Timer.Cancel(handle) timers[handle] = nil end
+
+function Ext._Internal.RunTimers()
+  local now = Ext.Timer.MonotonicTime()
+  for handle, t in pairs(timers) do
+    if now >= t.due then
+      if t.every then t.due = now + t.every else timers[handle] = nil end
+      local ok, err = pcall(t.fn)
+      if not ok then
+        Ext.Log.PrintError("Timer callback failed: " .. tostring(err))
+      end
+    end
+  end
+end
+
+-- ---- mod loading ----
+--
+-- Loose-file mods only: a root on the search path is a directory containing
+-- Mods/<Name>/ScriptExtender/. Reading .pak archives is not implemented.
+local loaded = {}
+
+local function read_file(path)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local text = f:read("a")
+  f:close()
+  return text
+end
+
+local function mod_roots()
+  local roots = {}
+  local env = os.getenv("BG3LE_MOD_PATH")
+  if env then
+    for dir in string.gmatch(env, "[^:]+") do table.insert(roots, dir) end
+  end
+  local root = Ext._Internal.ExtenderRoot()
+  if root then table.insert(roots, root .. "/mods") end
+  return roots
+end
+
+-- Config.json only ever needs ModTable here, so match it directly rather
+-- than pulling in a JSON parser.
+local function mod_table_name(config)
+  return string.match(config, '"ModTable"%s*:%s*"([^"]+)"')
+end
+
+local function load_mod(root, name)
+  local dir = root .. "/Mods/" .. name .. "/ScriptExtender"
+  local config = read_file(dir .. "/Config.json")
+  if not config then return end
+
+  local table_name = mod_table_name(config)
+  if not table_name then
+    Ext.Log.PrintWarning(string.format(
+      "bg3le: %s has no ModTable in Config.json; skipping", name))
+    return
+  end
+  if loaded[table_name] then return end
+
+  local bootstrap = dir .. "/Lua/BootstrapServer.lua"
+  local source = read_file(bootstrap)
+  if not source then return end
+
+  Mods[table_name] = Mods[table_name] or {}
+
+  -- Ext.Require resolves against the mod currently being loaded, as it does
+  -- in bg3se.
+  local lua_dir = dir .. "/Lua"
+  function Ext.Require(path)
+    local text = read_file(lua_dir .. "/" .. path)
+    if not text then
+      error("bg3le: Ext.Require could not read " .. path, 0)
+    end
+    local chunk, err = load(text, "@" .. path)
+    if not chunk then error(err, 0) end
+    return chunk()
+  end
+
+  local chunk, err = load(source, "@" .. name .. "/BootstrapServer.lua")
+  if not chunk then
+    Ext.Log.PrintError(string.format("bg3le: %s failed to compile: %s", name, err))
+    return
+  end
+  local ok, run_err = pcall(chunk)
+  if not ok then
+    Ext.Log.PrintError(string.format("bg3le: %s failed to load: %s", name, run_err))
+    return
+  end
+
+  loaded[table_name] = true
+  Ext.Log.Print(string.format("bg3le: loaded mod %s (Mods.%s)", name, table_name))
+end
+
+function Ext._Internal.LoadMods()
+  for _, root in ipairs(mod_roots()) do
+    local names = Ext._Internal.ListDir(root .. "/Mods")
+    if names then
+      table.sort(names)
+      for _, name in ipairs(names) do load_mod(root, name) end
+    end
+  end
+end
 )LUA";
     if (luaL_dostring(g_lua, kPrelude) != LUA_OK) {
         logf("lua: prelude failed: %s", lua_tostring(g_lua, -1));
@@ -432,6 +600,37 @@ print = Ext.Log.Print
     }
     statusf("LUA VM initialised (%s)", LUA_RELEASE);
 }
+
+// Calls a niladic Ext._Internal function, if it is present. Errors are logged
+// rather than propagated: this runs on the game's own threads.
+void call_internal(const char* name) {
+    if (g_lua == nullptr) return;
+    lua_getglobal(g_lua, "Ext");
+    if (!lua_istable(g_lua, -1)) {
+        lua_pop(g_lua, 1);
+        return;
+    }
+    lua_getfield(g_lua, -1, "_Internal");
+    lua_remove(g_lua, -2);
+    if (!lua_istable(g_lua, -1)) {
+        lua_pop(g_lua, 1);
+        return;
+    }
+    lua_getfield(g_lua, -1, name);
+    lua_remove(g_lua, -2);
+    if (!lua_isfunction(g_lua, -1)) {
+        lua_pop(g_lua, 1);
+        return;
+    }
+    if (lua_pcall(g_lua, 0, 0, 0) != LUA_OK) {
+        logf("lua: Ext._Internal.%s failed: %s", name, lua_tostring(g_lua, -1));
+        lua_pop(g_lua, 1);
+    }
+}
+
+void lua_tick() { call_internal("RunTimers"); }
+
+void lua_load_mods() { call_internal("LoadMods"); }
 
 void lua_bind_osi(const std::vector<osi::Function>& functions) {
     if (g_lua == nullptr) return;
