@@ -925,7 +925,96 @@ int l_map_key(lua_State* L) {
     return 1;
 }
 
-// Ext._Internal.ComponentFields(name [, path]) -> { field = kind, ... }, size
+// Ext._Internal.FieldAddress(handle, component, path) -> address, size
+//
+// For probing a field whose layout is in doubt. A container's length and
+// buffer are read through the engine's own accessors, which is right only if
+// bg3se's idea of the container's shape matches the engine's -- and a set the
+// engine populated is the only thing that can settle that. Pair this with
+// Peek, or use FieldBytes.
+int l_field_address(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
+    const char* name = luaL_checkstring(L, 2);
+    const char* path = luaL_checkstring(L, 3);
+
+    void const* meta = nullptr;
+    void* component = component_pointer(handle, name, &meta);
+    if (meta == nullptr || component == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s is not available on this entity", name);
+        return 2;
+    }
+
+    void* address = nullptr;
+    std::uint8_t kind = 0;
+    std::uint16_t size = 0;
+    bool readOnly = false;
+    if (!bg3le_meta_resolve(meta, path, component, &address, &kind, &size,
+                            &readOnly)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s does not resolve", name, path);
+        return 2;
+    }
+
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)address);
+    lua_pushinteger(L, size);
+    return 2;
+}
+
+// Ext._Internal.FieldBytes(handle, component, path [, count])
+//
+// The field's raw bytes as hex, grouped in eights, so a struct's shape can be
+// read off directly. Defaults to the field's own size.
+int l_field_bytes(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
+    const char* name = luaL_checkstring(L, 2);
+    const char* path = luaL_checkstring(L, 3);
+
+    void const* meta = nullptr;
+    void* component = component_pointer(handle, name, &meta);
+    if (meta == nullptr || component == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s is not available on this entity", name);
+        return 2;
+    }
+
+    // An empty path means the component itself, which is how to see every
+    // field's bytes at once -- the only way to check a container's shape
+    // against what bg3se believes it to be.
+    void* address = component;
+    std::uint8_t kind = 0;
+    std::uint16_t size = (std::uint16_t)bg3le_meta_component_size(meta);
+    bool readOnly = false;
+    if (path[0] != '\0'
+        && !bg3le_meta_resolve(meta, path, component, &address, &kind, &size,
+                               &readOnly)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s does not resolve", name, path);
+        return 2;
+    }
+
+    const auto want = (std::size_t)luaL_optinteger(L, 4, size);
+    const std::size_t count = want > 256 ? 256 : want;
+
+    std::string out;
+    for (std::size_t i = 0; i < count; i += 8) {
+        std::uint64_t word = 0;
+        const std::size_t n = (count - i) < 8 ? (count - i) : 8;
+        char line[64];
+        if (!safe_read((const char*)address + i, &word, n)) {
+            std::snprintf(line, sizeof(line), "+%02zx unreadable\n", i);
+        } else {
+            std::snprintf(line, sizeof(line), "+%02zx %016llx\n", i,
+                          (unsigned long long)word);
+        }
+        out += line;
+    }
+
+    lua_pushstring(L, out.c_str());
+    return 1;
+}
+
+// Ext._Internal.ComponentFields(name [, path]) ->{ field = kind, ... }, size
 //
 // path names a nested struct, so an inner struct lists the same way a
 // component does.
@@ -1355,6 +1444,10 @@ void lua_init() {
     lua_setfield(g_lua, -2, "ArrayInfo");
     lua_pushcfunction(g_lua, l_map_key);
     lua_setfield(g_lua, -2, "MapKey");
+    lua_pushcfunction(g_lua, l_field_address);
+    lua_setfield(g_lua, -2, "FieldAddress");
+    lua_pushcfunction(g_lua, l_field_bytes);
+    lua_setfield(g_lua, -2, "FieldBytes");
     lua_pushcfunction(g_lua, l_entity_has_component);
     lua_setfield(g_lua, -2, "HasComponent");
     lua_setfield(g_lua, -2, "_Internal");
