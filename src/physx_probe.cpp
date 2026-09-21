@@ -46,6 +46,7 @@ std::atomic<unsigned long> g_converts{0};
 std::atomic<unsigned long> g_convert_ns{0};
 std::atomic<unsigned long> g_classes{0};
 std::atomic<unsigned long> g_class_ns{0};
+std::atomic<unsigned long> g_class_outer{0};
 
 double now_ns() {
     timespec ts{};
@@ -68,10 +69,18 @@ long check_hook(const char* tag) {
 // serialised on PhysX's shared allocator" -- which decides whether caching
 // the results would help at all.
 long convert_hook(void* self, void* a, void* b, void* c, void* d, void* e) {
-    const double t0 = now_ns();
-    const long rc = g_real_convert != nullptr ? g_real_convert(self, a, b, c, d, e) : 0;
-    g_convert_ns.fetch_add((unsigned long)(now_ns() - t0), std::memory_order_relaxed);
+    thread_local int nesting = 0;
     g_converts.fetch_add(1, std::memory_order_relaxed);
+
+    const bool outermost = (nesting == 0);
+    ++nesting;
+    const double t0 = outermost ? now_ns() : 0.0;
+    const long rc = g_real_convert != nullptr ? g_real_convert(self, a, b, c, d, e) : 0;
+    --nesting;
+    if (outermost) {
+        g_convert_ns.fetch_add((unsigned long)(now_ns() - t0),
+                               std::memory_order_relaxed);
+    }
     return rc;
 }
 
@@ -79,16 +88,23 @@ long convert_hook(void* self, void* a, void* b, void* c, void* d, void* e) {
 // top-level convert shows how much of the wall time is spent inside the
 // conversion itself versus waiting to get into it.
 long convert_class_hook(void* self, const char* name, const void* meta, int depth) {
-    const double t0 = now_ns();
+    // convertClass recurses, so timing every invocation counts the same
+    // interval once per nesting level. Only time the outermost call per
+    // thread; count them all.
+    thread_local int nesting = 0;
+    g_classes.fetch_add(1, std::memory_order_relaxed);
+
+    const bool outermost = (nesting == 0);
+    ++nesting;
+    const double t0 = outermost ? now_ns() : 0.0;
     const long rc = g_real_convert_class != nullptr
                         ? g_real_convert_class(self, name, meta, depth)
                         : 0;
-    g_class_ns.fetch_add((unsigned long)(now_ns() - t0), std::memory_order_relaxed);
-    const unsigned long n = g_classes.fetch_add(1, std::memory_order_relaxed);
-    if (n < 3) {
-        char buf[96];
-        statusf("physx: convertClass(\"%s\")",
-                safe_cstr(name, buf, sizeof(buf)) ? buf : "?");
+    --nesting;
+    if (outermost) {
+        g_class_ns.fetch_add((unsigned long)(now_ns() - t0),
+                             std::memory_order_relaxed);
+        g_class_outer.fetch_add(1, std::memory_order_relaxed);
     }
     return rc;
 }
@@ -119,19 +135,28 @@ void physx_probe_install() {
     statusf("physx: probe installed");
 }
 
+void physx_probe_reset() {
+    g_checks.store(0);
+    g_converts.store(0);
+    g_convert_ns.store(0);
+    g_classes.store(0);
+    g_class_ns.store(0);
+    g_class_outer.store(0);
+}
+
 void physx_probe_report(const char* when) {
     const unsigned long conv = g_converts.load();
     const unsigned long ns = g_convert_ns.load();
     const unsigned long cls = g_classes.load();
     const unsigned long cls_ns = g_class_ns.load();
-    statusf("physx (%s): %lu version checks, %lu top-level conversions (%.2fs), "
-            "%lu class conversions (%.2fs)",
-            when, g_checks.load(), conv, (double)ns / 1e9, cls,
-            (double)cls_ns / 1e9);
-    if (cls > 0) {
-        statusf("physx (%s): mean %.4f ms per class conversion", when,
-                (double)cls_ns / 1e6 / (double)cls);
-    }
+    const unsigned long outer = g_class_outer.load();
+    // Times are summed across worker threads, so they legitimately exceed
+    // wall time; nested calls are excluded so they are not double-counted.
+    statusf("physx (%s): %lu version checks, %lu conversions, "
+            "%lu convertClass calls (%lu outermost)",
+            when, g_checks.load(), conv, cls, outer);
+    statusf("physx (%s): %.2fs thread-time in conversions, %.2fs in outermost "
+            "convertClass", when, (double)ns / 1e9, (double)cls_ns / 1e9);
 }
 
 }  // namespace bg3le

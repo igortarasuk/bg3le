@@ -636,6 +636,7 @@ extern "C" long _ZN7COsiris4LoadER12COsiSmartBuf(void* self, void* buf) {
     long rc = real != nullptr ? real(self, buf) : 0;
     statusf("OnAfterOsirisLoad: story loaded in %.2fs", now_s() - t0);
     g_story_ready_at = now_s();
+    physx_probe_reset();  // measure the level load, not everything since startup
     start_stall_profile();
 
     // Sample mid-stall: every thread is parked, so this should show what on.

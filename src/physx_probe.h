@@ -8,7 +8,11 @@ namespace bg3le {
 // BG3LE_PHYSX_PROBE=1.
 void physx_probe_install();
 
-// Logs conversion counts and total time spent converting.
+// Zeroes the counters, so a phase can be measured in isolation rather than
+// cumulatively since startup.
+void physx_probe_reset();
+
+// Logs conversion counts and time spent converting.
 void physx_probe_report(const char* when);
 
 // Link-time offset -> runtime address in the main executable.

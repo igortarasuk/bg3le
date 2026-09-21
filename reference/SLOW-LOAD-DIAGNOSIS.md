@@ -53,20 +53,23 @@ The threads are blocked rather than computing: they queue on PhysX's shared
 
 Instrumenting the conversion path (`BG3LE_PHYSX_PROBE=1`) for one level load:
 
-    641 top-level conversions
-    6,874,980 class conversions
-    566.31s summed inside convertClass
-    75.7s wall
+    641 conversions
+    6,874,980 convertClass calls
 
-The 566s is summed across ~7 worker threads, which have ~530 thread-seconds
-available over 75.7s of wall time, so effectively all worker time during the
-stall is inside PhysX conversion. (It also double-counts nested calls, since
-convertClass recurses.) Conversion is not a contributor to the stall -- it is
-the stall.
+Those counts are solid. The timing from that run was not: 566s against 75.7s
+of wall clock, which is impossible as stated. Two defects, both mine --
+counters accumulated from probe install (including the pre-menu stall and
+menu time, not just the level load), and convertClass recurses, so timing
+every invocation counted the same interval once per nesting level.
 
-641 serialized collections holding ~6.9M objects get their memory layout
-rewritten on every single load. Pre-converting those 641 collections to
-`L_64` would eliminate essentially all of it.
+Both are fixed: counters reset when the level load begins, and only the
+outermost call per thread is timed. Times are still summed across worker
+threads, so they legitimately exceed wall time -- but by a factor bounded by
+thread count rather than by recursion depth.
+
+What stands regardless of timing: 641 serialized collections holding ~6.9M
+objects have their memory layout rewritten on every load. Pre-converting
+those 641 collections to `L_64` removes that work.
 
 ## Why the obvious measurements mislead
 
