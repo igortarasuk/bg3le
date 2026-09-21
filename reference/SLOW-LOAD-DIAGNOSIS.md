@@ -1,4 +1,16 @@
-# Native Linux build: 65-78s stall at 75% on every level load
+# Native Linux build: 65-98s stall at 75% on every level load
+
+**Fixed.** Replacing PhysX's `TempAllocator` with a lock-free thread-local
+pool takes the level load from 65-98s to **1.2s** (`BG3LE_FAST_ALLOC=1`,
+`src/fast_alloc.cpp`):
+
+    fast alloc: active, replacing PhysX TempAllocator at 77/80 sites
+    fast alloc (level load): 12270697 served (12270650 recycled),
+                             0 passed through, 32.0 MB arena
+    Level load took 1.2s after Osiris finished
+
+The conversion work was never the problem. 12.3M allocations per load through
+a single global mutex was.
 
 Reproduces on a stock native build with no extender, no mods, outside the
 Steam runtime container, on a brand-new game as well as an existing save.
@@ -30,7 +42,7 @@ Verify with:
         -filelist <(echo Data/Engine.pak) -dir /tmp/bg3-linux-data
     grep -a -o -E "[0-9A-F]{32}[A-Z]_[0-9]{2}" /tmp/bg3-linux-data/Data/Engine.pak
 
-## Cause
+## Cause (why the allocator is on the hot path)
 
 Seven threads -- all six `WT/Low` workers plus `ServerWorker` -- occupy one
 call path for the duration of the stall:
@@ -74,8 +86,13 @@ dominated by contention rather than computation. That is why CPU looks idle,
 why the stack samples show futex_wait, and why donating timeslices with
 sched_yield changed nothing.
 
-Pre-converting the assets to `L_64` addresses it either way, because it
-removes the calls entirely rather than trying to make them faster.
+Pre-converting the assets to `L_64` would also work, by removing the calls
+entirely -- but it is unnecessary. The allocator measurement below shows the
+conversion work itself is nearly free.
+
+Timing the allocator settled it: 12,038,602 allocations plus as many frees,
+accounting for **99.6%** of all time spent inside `convertClass`. Replacing
+the allocator recovers essentially all of it, without touching game data.
 
 ## Why the obvious measurements mislead
 
