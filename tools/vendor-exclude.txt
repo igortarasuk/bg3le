@@ -1,0 +1,20 @@
+# TUs bg3le does not build: either replaced by its own implementation or
+# client-UI code that is not a target yet. Used by tools/check-vendor-all.sh
+# to separate real remaining work from files that will never be compiled.
+#
+# The symbol mapper scans PE images; bg3le reads the ELF symbol table.
+# The Osiris wrappers and EngineHooks inline-hook via Detours; bg3le uses PLT
+# interposition, vtable slot patching and call-site patching.
+# dllmain/CrashReporter/DWriteWrapper are Windows process plumbing.
+# CoreLib/Console.cpp is a Windows console, down to font and colour tables.
+BG3Extender/Extender/Shared/dllmain.cpp
+BG3Extender/Extender/Shared/CrashReporter.cpp
+BG3Extender/Extender/Shared/DWriteWrapper.cpp
+BG3Extender/GameHooks/DataLibraries.cpp
+BG3Extender/GameHooks/DataLibrariesBG3Game.cpp
+BG3Extender/GameHooks/OsirisWrappers.cpp
+BG3Extender/GameHooks/EngineHooks.cpp
+CoreLib/SymbolMapper.cpp
+BG3Extender/Extender/Client/IMGUI/IMGUI.cpp
+BG3Extender/Extender/Client/SDL.cpp
+CoreLib/Console.cpp

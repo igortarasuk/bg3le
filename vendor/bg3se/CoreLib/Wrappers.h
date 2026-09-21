@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstring>
+
 #include <functional>
 #include <unordered_set>
 #include <detours.h>
@@ -57,7 +59,7 @@ namespace bg3se {
             OriginalFunc = Function;
             TrampolineFunc = Function;
             NewFunc = NewFunction;
-            gRegisteredTrampolines.insert(NewFunction);
+            gRegisteredTrampolines.insert((void const*)NewFunction);
             auto status = DetourAttachEx((PVOID *)&TrampolineFunc, (PVOID)NewFunc, (PDETOUR_TRAMPOLINE *)&FuncTrampoline, NULL, NULL);
             if (status != NO_ERROR) {
                 ERR("[%s] Detour attach failed on %p", typeid(*this).name(), Function);
@@ -110,16 +112,33 @@ namespace bg3se {
         using FunctionType = R (*)(TObject*, Params...);
         using BaseFunctionType = R (*)(Params...);
         
-        static_assert(sizeof(MethodType) == sizeof(FunctionType));
+        // MSVC gives a pointer-to-member-function the same width as a plain
+        // function pointer for a single-inheritance non-virtual class, so it
+        // can reinterpret one as the other wholesale. The Itanium ABI used on
+        // Linux always makes it two words -- {entry, this-adjustment} -- where
+        // entry is the function address for a non-virtual member and the
+        // adjustment is zero under single inheritance. The conversion is still
+        // sound, but it has to move one word instead of reinterpreting the
+        // whole object: reading a MethodType out of a FunctionType would
+        // over-read by eight bytes.
+        //
+        // This holds only for non-virtual members. Itanium encodes a virtual
+        // member as a vtable offset rather than an address, so converting one
+        // would yield nonsense.
+        static_assert(sizeof(MethodType) >= sizeof(FunctionType));
 
         inline static FunctionType ToFunction(MethodType fun)
         {
-            return *reinterpret_cast<FunctionType*>(&fun);
+            FunctionType out;
+            std::memcpy(&out, &fun, sizeof(out));
+            return out;
         }
 
         inline static MethodType ToMethod(FunctionType fun)
         {
-            return *reinterpret_cast<MethodType*>(&fun);
+            MethodType out{};  // zeroes the this-adjustment word
+            std::memcpy(&out, &fun, sizeof(fun));
+            return out;
         }
     };
 
@@ -200,7 +219,7 @@ namespace bg3se {
                 return;
             }
 
-            gRegisteredTrampolines.insert(ResolveRealFunctionAddress(&NoContextHook));
+            gRegisteredTrampolines.insert(ResolveRealFunctionAddress((void const*)&NoContextHook));
             gRegisteredTrampolines.insert(ResolveRealFunctionAddress(wrapper));
             hook_ = &NoContextHook;
             func_ = wrapper;
@@ -232,7 +251,7 @@ namespace bg3se {
             }
 
             auto fun = MethodPtrHelpers<TContext, R (BaseFuncType*, Params...)>::ToFunction(wrapper);
-            gRegisteredTrampolines.insert(ResolveRealFunctionAddress(fun));
+            gRegisteredTrampolines.insert(ResolveRealFunctionAddress((void const*)fun));
             hook_ = reinterpret_cast<HookFuncType*>(fun);
             func_ = nullptr;
             func2_ = nullptr;
@@ -247,9 +266,9 @@ namespace bg3se {
                 return;
             }
 
-            gRegisteredTrampolines.insert(ResolveRealFunctionAddress(&StaticPreHook));
+            gRegisteredTrampolines.insert(ResolveRealFunctionAddress((void const*)&StaticPreHook));
             hook_ = &StaticPreHook;
-            func_ = MethodPtrHelpers<TContext, void (Params...)>::ToFunction(wrapper);
+            func_ = (void*)MethodPtrHelpers<TContext, void (Params...)>::ToFunction(wrapper);
             func2_ = nullptr;
             context_ = context;
         }
@@ -262,12 +281,12 @@ namespace bg3se {
                 return;
             }
 
-            gRegisteredTrampolines.insert(ResolveRealFunctionAddress(&StaticPostHook));
+            gRegisteredTrampolines.insert(ResolveRealFunctionAddress((void const*)&StaticPostHook));
             hook_ = &StaticPostHook;
             if constexpr (std::is_same_v<R, void>) {
-                func_ = MethodPtrHelpers<TContext, void(Params...)>::ToFunction(wrapper);
+                func_ = (void*)MethodPtrHelpers<TContext, void(Params...)>::ToFunction(wrapper);
             } else {
-                func_ = MethodPtrHelpers<TContext, void(Params..., R)>::ToFunction(wrapper);
+                func_ = (void*)MethodPtrHelpers<TContext, void(Params..., R)>::ToFunction(wrapper);
             }
             func2_ = nullptr;
             context_ = context;
@@ -281,13 +300,13 @@ namespace bg3se {
                 return;
             }
 
-            gRegisteredTrampolines.insert(ResolveRealFunctionAddress(&StaticPrePostHook));
+            gRegisteredTrampolines.insert(ResolveRealFunctionAddress((void const*)&StaticPrePostHook));
             hook_ = &StaticPrePostHook;
-            func_ = MethodPtrHelpers<TContext, void(Params...)>::ToFunction(preHook);
+            func_ = (void*)MethodPtrHelpers<TContext, void(Params...)>::ToFunction(preHook);
             if constexpr (std::is_same_v<R, void>) {
-                func2_ = MethodPtrHelpers<TContext, void(Params...)>::ToFunction(postHook);
+                func2_ = (void*)MethodPtrHelpers<TContext, void(Params...)>::ToFunction(postHook);
             } else {
-                func2_ = MethodPtrHelpers<TContext, void(Params..., R)>::ToFunction(postHook);
+                func2_ = (void*)MethodPtrHelpers<TContext, void(Params..., R)>::ToFunction(postHook);
             }
             context_ = context;
         }
@@ -339,14 +358,14 @@ namespace bg3se {
 
         static R StaticPreHook(void* ctx, BaseFuncType* fun, Params... args)
         {
-            auto hook = static_cast<PreHookFuncType*>(gHook->func_);
+            auto hook = reinterpret_cast<PreHookFuncType*>(gHook->func_);
             hook(ctx, std::forward<Params>(args)...);
             return gHook->CallOriginal(std::forward<Params>(args)...);
         }
 
         static R StaticPostHook(void* ctx, BaseFuncType* fun, Params... args)
         {
-            auto hook = static_cast<PostHookFuncType*>(gHook->func_);
+            auto hook = reinterpret_cast<PostHookFuncType*>(gHook->func_);
             if constexpr (std::is_same_v<R, void>) {
                 gHook->CallOriginal(std::forward<Params>(args)...);
                 hook(ctx, std::forward<Params>(args)...);
@@ -359,10 +378,10 @@ namespace bg3se {
 
         static R StaticPrePostHook(void* ctx, BaseFuncType* fun, Params... args)
         {
-            auto preHook = static_cast<PreHookFuncType*>(gHook->func_);
+            auto preHook = reinterpret_cast<PreHookFuncType*>(gHook->func_);
             preHook(ctx, std::forward<Params>(args)...);
 
-            auto postHook = static_cast<PostHookFuncType*>(gHook->func2_);
+            auto postHook = reinterpret_cast<PostHookFuncType*>(gHook->func2_);
             if constexpr (std::is_same_v<R, void>) {
                 gHook->CallOriginal(std::forward<Params>(args)...);
                 postHook(ctx, std::forward<Params>(args)...);

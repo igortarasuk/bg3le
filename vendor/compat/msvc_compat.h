@@ -234,6 +234,7 @@ inline BOOL VirtualProtect(LPVOID addr, std::size_t size,
 // character count excluding the terminator; snprintf takes a buffer size
 // including it.
 #include <cstdio>
+#include <cstdarg>
 #include <cstddef>
 
 template <std::size_t N, class... Args>
@@ -338,6 +339,14 @@ inline void Sleep(unsigned long ms) {
 
 #define _TRUNCATE ((std::size_t)-1)
 
+inline int strncpy_s(char* buf, std::size_t bufSize, const char* src,
+                     std::size_t count) {
+    const std::size_t limit =
+        (count == (std::size_t)-1 || count >= bufSize) ? bufSize - 1 : count;
+    std::snprintf(buf, limit + 1, "%s", src);
+    return 0;
+}
+
 template <std::size_t N>
 int strncpy_s(char (&buf)[N], const char* src, std::size_t count) {
     const std::size_t limit = (count == (std::size_t)-1 || count >= N) ? N - 1 : count;
@@ -353,13 +362,16 @@ inline int freopen_s(std::FILE** out, const char* path, const char* mode,
 }
 
 // Interlocked intrinsics, over the compiler atomics.
-inline long long InterlockedExchangeAdd64(long long volatile* addend,
-                                          long long value) {
-    return __atomic_fetch_add(addend, value, __ATOMIC_SEQ_CST);
+// Templated on the integer type: callers pass int64_t, which is long on LP64
+// and long long on Windows.
+template <class T, class V>
+inline T InterlockedExchangeAdd64(T volatile* addend, V value) {
+    return __atomic_fetch_add(addend, static_cast<T>(value), __ATOMIC_SEQ_CST);
 }
 
-inline long long InterlockedOr64(long long volatile* dest, long long value) {
-    return __atomic_fetch_or(dest, value, __ATOMIC_SEQ_CST);
+template <class T, class V>
+inline T InterlockedOr64(T volatile* dest, V value) {
+    return __atomic_fetch_or(dest, static_cast<T>(value), __ATOMIC_SEQ_CST);
 }
 
 inline void* GetCurrentThread() { return nullptr; }
@@ -528,3 +540,60 @@ int wcscpy_s(wchar_t (&buf)[N], const wchar_t* src) {
 inline int gmtime_s(std::tm* out, const std::time_t* time) {
     return ::gmtime_r(time, out) == nullptr ? 1 : 0;
 }
+
+inline BOOL CopyFileW(const wchar_t* from, const wchar_t* to, BOOL failIfExists) {
+    auto narrow = [](const wchar_t* w) {
+        const std::size_t needed = std::wcstombs(nullptr, w, 0);
+        if (needed == (std::size_t)-1) return std::string();
+        std::string out(needed + 1, '\0');
+        std::wcstombs(out.data(), w, out.size());
+        out.resize(needed);
+        return out;
+    };
+    const std::string src = narrow(from);
+    const std::string dst = narrow(to);
+    if (src.empty() || dst.empty()) return 0;
+    if (failIfExists && ::access(dst.c_str(), F_OK) == 0) return 0;
+
+    std::FILE* in = std::fopen(src.c_str(), "rb");
+    if (in == nullptr) return 0;
+    std::FILE* out = std::fopen(dst.c_str(), "wb");
+    if (out == nullptr) {
+        std::fclose(in);
+        return 0;
+    }
+    char buf[65536];
+    std::size_t n;
+    bool ok = true;
+    while ((n = std::fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (std::fwrite(buf, 1, n, out) != n) { ok = false; break; }
+    }
+    std::fclose(in);
+    std::fclose(out);
+    return ok ? 1 : 0;
+}
+
+inline void TerminateProcess(HANDLE, unsigned int code) { ::_exit((int)code); }
+inline int MessageBoxA(HANDLE, const char* text, const char* caption, unsigned int) {
+    std::fprintf(stderr, "%s: %s\n", caption != nullptr ? caption : "bg3se",
+                 text != nullptr ? text : "");
+    return 0;
+}
+// There are no PE resources in an ELF image. GetExeResource is used for the
+// embedded Lua bundle, which will have to come from a file instead.
+template <class TName, class TType>
+inline void* FindResource(HMODULE, TName, TType) { return nullptr; }
+inline void* LoadResource(HMODULE, void*) { return nullptr; }
+inline void* LockResource(void*) { return nullptr; }
+inline DWORD SizeofResource(HMODULE, void*) { return 0; }
+
+template <std::size_t N, class... Args>
+int _vsnprintf_s(char (&buf)[N], std::size_t count, const char* fmt, va_list args) {
+    const std::size_t size = (count + 1 < N) ? count + 1 : N;
+    return std::vsnprintf(buf, size, fmt, args);
+}
+
+#define MAKEWORD(a, b) ((WORD)(((BYTE)(a)) | (((WORD)((BYTE)(b))) << 8)))
+#define WSAECONNRESET ECONNRESET
+#define WSAEWOULDBLOCK EWOULDBLOCK
+#define WSAEINPROGRESS EINPROGRESS

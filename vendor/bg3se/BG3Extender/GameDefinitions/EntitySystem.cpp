@@ -883,7 +883,7 @@ void* EntitySystemHelpersBase::CreateComponentRaw(EntityHandle entity, ExtCompon
     }
 
     ComponentFrameStorageIndex index;
-    auto ptr = GetEntityWorld()->Deferred()->CreateComponentRaw(entity, *meta.ComponentIndex, meta.InlineSize, index, meta.Properties->ProxyDestroy);
+    auto ptr = GetEntityWorld()->Deferred()->CreateComponentRaw(entity, *meta.ComponentIndex, meta.InlineSize, index, (void*)meta.Properties->ProxyDestroy);
 
     if (meta.IsProxy) {
         auto external = GameAllocRaw(meta.ExternalSize);

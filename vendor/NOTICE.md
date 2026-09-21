@@ -148,6 +148,48 @@ extension. These now convert with upstream's own `ToUTF8`:
 - `BG3Extender/Lua/Shared/LuaBundle.cpp:39`
 - `CoreLib/Crypto.cpp:85`
 
+**A pointer-to-member-function is not the same width as a function pointer on
+the Itanium ABI.** MSVC makes them both 8 bytes for a single-inheritance
+non-virtual class, so upstream reinterprets one as the other wholesale. Linux
+uses two words, `{entry, this-adjustment}`, so the conversion has to move one
+word: reading a `MethodType` out of a `FunctionType` over-reads by eight
+bytes. Valid only for non-virtual members, since Itanium encodes a virtual one
+as a vtable offset:
+
+- `CoreLib/Wrappers.h` (`MethodPtrHelpers::ToFunction`/`::ToMethod`, and the
+  `static_assert` that compared the two sizes)
+
+**Converting a function pointer to or from `void*` is conditionally supported**
+and never implicit. MSVC does it silently:
+
+- `CoreLib/Wrappers.h` — `ResolveRealFunctionAddress` arguments, the
+  `gRegisteredTrampolines` inserts, the `func_` assignments, and
+  `static_cast` to the hook types, which needs `reinterpret_cast`
+- `BG3Extender/GameDefinitions/EntitySystem.cpp:886,944` — `ProxyDestroy`
+
+**A `##` cannot lead a replacement list** — the operator has to sit between two
+tokens. MSVC ignores a stray one, and this single macro broke three TUs:
+
+- `BG3Extender/Extender/Shared/ExtenderConfig.h:79` (`PERF_REPORT`)
+
+**A `decltype` specifier cannot appear in a declarative nested name
+specifier**, so the hook type has to be named:
+
+- `BG3Extender/Extender/Shared/Hooks.cpp:8`
+
+**libc++ has no wide-path `fstream` constructor**; MSVC provides one as an
+extension. These convert with upstream's own `ToUTF8`:
+
+- `BG3Extender/Lua/Shared/LuaBundle.cpp:39`
+- `BG3Extender/Extender/Shared/ScriptHelpers.cpp:70,117`
+- `CoreLib/Crypto.cpp:85`
+- `CoreLib/Utils.cpp` (four sites)
+
+**Winsock spellings that POSIX names differently:**
+
+- `BG3Extender/Osiris/Debugger/DebugInterface.cpp` — `in_addr::S_un.S_addr` is
+  `s_addr`, and `accept` takes a `socklen_t*` rather than an `int*`
+
 **An include used the wrong directory case**, which resolves on Windows and
 not on Linux:
 

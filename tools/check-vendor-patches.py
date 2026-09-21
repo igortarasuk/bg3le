@@ -70,6 +70,16 @@ CHECKS = [
              in text("BG3Extender/Lua/Shared/Proxies/LuaObjectProxies.cpp")),
     ("fstream paths converted to UTF-8",
      lambda: "ToUTF8(resPath)" in text("BG3Extender/Lua/Shared/LuaBundle.cpp")),
+    ("pointer-to-member conversion ported to the Itanium ABI",
+     lambda: "sizeof(MethodType) >= sizeof(FunctionType)"
+             in text("CoreLib/Wrappers.h")),
+    ("PERF_REPORT has no leading ##",
+     lambda: "WARN(##" not in text("BG3Extender/Extender/Shared/ExtenderConfig.h")),
+    ("Hooks.cpp names its hook type",
+     lambda: "decltype(Hooks::eocnet__ClientConnectMessage__Serialize)::gHook"
+             not in text("BG3Extender/Extender/Shared/Hooks.cpp")),
+    ("DebugInterface uses POSIX socket spellings",
+     lambda: "S_un.S_addr" not in text("BG3Extender/Osiris/Debugger/DebugInterface.cpp")),
     ("NsCustomDataContext has a usual operator delete",
      lambda: "static void operator delete(void* ptr) noexcept"
              in text("BG3Extender/Lua/Libs/ClientUI/CustomProperties.inl")),

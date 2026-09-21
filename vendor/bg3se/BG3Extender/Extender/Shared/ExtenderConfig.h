@@ -76,7 +76,9 @@ inline bool ProfilerShouldReport(uint64_t took, ExtenderConfig const& config, Pr
         && took >= threshold.Error;
 }
 
-#define PERF_REPORT(type, took, ...) WARN(##__VA_ARGS__)
+// A leading ## is meaningless in standard C++ -- the operator has to sit
+// between two tokens. MSVC ignores it.
+#define PERF_REPORT(type, took, ...) WARN(__VA_ARGS__)
 #define PERF_SHOULD_REPORT(type, took) ProfilerShouldReport((took), gExtender->GetConfig(), gExtender->GetConfig().Profiler##type##Threshold)
 
 END_SE()

@@ -5,7 +5,13 @@
 
 BEGIN_SE()
 
-decltype(Hooks::eocnet__ClientConnectMessage__Serialize)* decltype(Hooks::eocnet__ClientConnectMessage__Serialize)::gHook;
+// A decltype specifier cannot appear in a declarative nested name specifier,
+// so the type has to be named. MSVC accepts the decltype spelling.
+using ClientConnectMessageSerializeHook =
+    WrappableFunction<ClientConnectMessageSerializeTag,
+                      void(net::Message*, net::BitstreamSerializer*)>;
+template<> ClientConnectMessageSerializeHook*
+    ClientConnectMessageSerializeHook::gHook;
 
 void Hooks::Startup()
 {
