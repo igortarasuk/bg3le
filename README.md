@@ -48,11 +48,13 @@ none of it behavioural.
 - **Most of `Ext.*`.** Around 265 functions bg3se exposes have no equivalent
   here yet. The ECS plumbing they need is done, so most are now a component
   index plus a vendored struct
-- **Container field kinds.** Scalars, enums, fixed-extent arrays and nested
-  structs are converted; `HashMap` and `DynamicArray` are not, so
+- **`HashMap` fields.** Scalars, enums, nested structs, fixed-extent arrays,
+  dynamic arrays and hash sets are converted; maps are not, so
   `ActionResources.Resources` and `SummonContainer.ByTag` read as unsupported.
   Naming an unsupported field raises rather than returning nil, so a mod
-  cannot mistake a missing conversion for a missing value
+  cannot mistake a missing conversion for a missing value. Hash sets read as
+  arrays of their keys and are read-only, because writing a key in place would
+  leave the table's hashes stale
 - **The client-side modules.** `Ext.ClientUI` in particular is blocked on the
   placeholder Noesis RTTI — the native game ships no Noesis typeinfo at all,
   so `src/vendor/noesis_rtti_linux.cpp` aliases 19 of them to one real

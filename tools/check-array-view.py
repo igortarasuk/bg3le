@@ -12,8 +12,9 @@ write -- no error and no effect, which is worse than refusing. A test that
 only checked reads would have passed.
 
 The function is sliced out of lua_host.cpp rather than restated here, so what
-runs is the text that ships. GetElement and SetElement are stubbed with a
-plain table, so this needs neither the game nor the built library.
+runs is the text that ships. The internals it calls are stubbed over a plain
+table, which also means the path syntax the view builds ("Field[0]") is
+checked: the stub parses it back out, so a malformed path fails the test.
 
 Needs lua on PATH.
 """
@@ -33,31 +34,44 @@ if shutil.which("lua") is None:
 
 src = io.open(SOURCE, encoding="utf-8").read()
 
-start = src.index("local function make_array(")
-end = src.index("local function make_component(")
+start = src.index("-- An array field is a view on the component, not a copy of it.")
+end = src.index("-- A view over a set of fields, used for a component")
 make_array = src[start:end]
 
-harness = (
-    make_array
-    + r"""
--- Stub: a 7-element backing store, zero-based as the engine is.
+harness = make_array + r"""
+-- Stub: a 7-element backing store, zero-based as the engine is. The stub
+-- parses the element path the view builds, so a malformed path shows up here.
 local store = {[0]=0, [1]=17, [2]=13, [3]=15, [4]=8, [5]=12, [6]=10}
-local reads, writes = 0, 0
+local count = 7
 
 Ext = {_Internal = {}}
-function Ext._Internal.GetElement(handle, comp, field, i)
-  reads = reads + 1
+
+local function index_of(path)
+  local base, i = path:match("^([%w_]+)%[(%d+)%]$")
+  if base == nil then return nil, "unparseable path: " .. tostring(path) end
+  return tonumber(i)
+end
+
+function Ext._Internal.ArrayInfo(handle, comp, path)
+  return count, "int32"
+end
+
+function Ext._Internal.GetField(handle, comp, path)
+  local i, err = index_of(path)
+  if i == nil then return nil, err end
   if store[i] == nil then return nil, "index out of range" end
   return store[i]
 end
-function Ext._Internal.SetElement(handle, comp, field, i, v)
-  writes = writes + 1
+
+function Ext._Internal.SetField(handle, comp, path, v)
+  local i, err = index_of(path)
+  if i == nil then return nil, err end
   if store[i] == nil then return nil, "index out of range" end
   store[i] = v
   return true
 end
 
-local a = make_array(1, "Stats", "Abilities", 7)
+local a = make_array(1, "Stats", "Abilities")
 local fails = 0
 local function check(what, got, want)
   if got ~= want then
@@ -82,8 +96,7 @@ check("store[1] after write", store[1], 99)
 -- Length and iteration, which the JSON serializer relies on.
 check("#a", #a, 7)
 
-local seen = 0
-local last
+local seen, last = 0, nil
 for i, v in pairs(a) do
   seen = seen + 1
   last = i
@@ -107,13 +120,19 @@ end
 local ok = pcall(function() a.nope = 1 end)
 check("write a.nope raises", ok, false)
 
+-- The length is re-read rather than captured, so a dynamic array that grows
+-- between accesses is seen at its new length.
+count = 5
+check("#a after shrink", #a, 5)
+local shrunk = pcall(function() return a[7] end)
+check("a[7] raises after shrink", shrunk, false)
+
 if fails > 0 then
   print(fails .. " failure(s)")
   os.exit(1)
 end
 print("array view behaves")
 """
-)
 
 with tempfile.NamedTemporaryFile("w", suffix=".lua", delete=False) as f:
     f.write(harness)

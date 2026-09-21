@@ -13,6 +13,7 @@
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void const* (*meta_component)(char const*);
@@ -24,6 +25,8 @@ static size_t (*meta_fields_at)(void const*, char const*, char const**,
                                 uint8_t*, size_t);
 static size_t (*meta_class_count)(void);
 static size_t (*meta_component_count)(void);
+static int (*meta_selftest)(void);
+static int (*install_game_allocator)(void*, void*);
 
 static int failures = 0;
 
@@ -188,7 +191,26 @@ int main(int argc, char** argv) {
     BIND(meta_fields_at, "bg3le_meta_fields_at")
     BIND(meta_class_count, "bg3le_meta_class_count")
     BIND(meta_component_count, "bg3le_meta_component_count")
+    BIND(meta_selftest, "bg3le_meta_selftest")
+    BIND(install_game_allocator, "bg3le_install_game_allocator")
 #undef BIND
+
+    // The self-test builds a real dynamic array, which allocates through
+    // bg3se. In the game that goes to the engine's heap; here malloc will do,
+    // because none of this memory is ever handed to the engine.
+    if (!install_game_allocator(malloc, free)) {
+        printf("  FAIL could not install the test allocator\n");
+        failures++;
+    } else {
+        const int selftestFailures = meta_selftest();
+        if (selftestFailures != 0) {
+            printf("  FAIL the dynamic array self-test reported %d failure(s)"
+                   " (see the log for detail)\n", selftestFailures);
+            failures += selftestFailures;
+        } else {
+            printf("  ok   dynamic array walk self-test\n");
+        }
+    }
 
     printf("%zu classes, %zu of them named components\n", meta_class_count(),
            meta_component_count());

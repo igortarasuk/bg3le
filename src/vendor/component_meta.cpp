@@ -41,6 +41,11 @@
 #include <vector>
 
 #include "../component_meta_abi.h"
+#include "../log.h"
+
+// From platform_linux.cpp; the self-test below needs an allocator to build an
+// array with.
+extern "C" bool bg3le_game_allocator_ready();
 
 namespace bg3le {
 
@@ -78,6 +83,60 @@ struct ArrayTraits<std::array<T, N>> {
     using Elem = T;
     static constexpr std::size_t kCount = N;
 };
+
+// bg3se's Array is the engine's dynamically sized array. Its length and buffer
+// members are private, so they are reached through size() and data(), which
+// are public and constexpr -- instantiated per field type below, so no member
+// offset is ever guessed at.
+template <class T>
+struct VectorTraits {
+    static constexpr bool kIsVector = false;
+    using Elem = void;
+};
+
+template <class T>
+struct VectorTraits<Array<T>> {
+    static constexpr bool kIsVector = true;
+    using Elem = T;
+};
+
+template <class A>
+std::size_t array_count_thunk(void const* container) {
+    return (std::size_t)static_cast<A const*>(container)->size();
+}
+
+template <class A>
+void* array_data_thunk(void const* container) {
+    // const is dropped deliberately: the same descriptor serves reads and
+    // writes, and a write has a non-const component to begin with.
+    return (void*)static_cast<A const*>(container)->data();
+}
+
+// A hash set keeps its elements in a contiguous key array, which keys() hands
+// back, so it reads as an array with no extra machinery. Writing one would
+// desynchronise the table's hashes from its keys, so these are marked
+// read-only rather than left writable.
+template <class T>
+struct SetTraits {
+    static constexpr bool kIsSet = false;
+    using Elem = void;
+};
+
+template <class T>
+struct SetTraits<HashSet<T>> {
+    static constexpr bool kIsSet = true;
+    using Elem = T;
+};
+
+template <class S>
+std::size_t set_count_thunk(void const* container) {
+    return (std::size_t)static_cast<S const*>(container)->keys().size();
+}
+
+template <class S>
+void* set_data_thunk(void const* container) {
+    return (void*)static_cast<S const*>(container)->keys().data();
+}
 
 // The field kinds bg3le can read and write without interpretation. Enums
 // resolve to their underlying integer, which is how the engine stores them and
@@ -117,6 +176,9 @@ constexpr FieldKind kind_of() {
         } else {
             return FieldKind::Unsupported;
         }
+    } else if constexpr (VectorTraits<T>::kIsVector
+                         || SetTraits<T>::kIsSet) {
+        return FieldKind::DynArray;
     } else if constexpr (scalar_kind_of<T>() != FieldKind::Unsupported) {
         return scalar_kind_of<T>();
     } else if constexpr (std::is_class_v<T>) {
@@ -126,18 +188,66 @@ constexpr FieldKind kind_of() {
     }
 }
 
-template <class T>
-constexpr FieldKind elem_kind_of() {
-    if constexpr (ArrayTraits<T>::kIsArray) {
-        return scalar_kind_of<typename ArrayTraits<T>::Elem>();
-    } else {
-        return FieldKind::Unsupported;
-    }
+// Not a field: records that a class also has the fields of another, named so
+// it can be resolved at load rather than needing that class to be complete
+// here.
+constexpr FieldDesc inherit_field(char const* baseName) {
+    FieldDesc f{};
+    f.Name = baseName;
+    f.Kind = FieldKind::Inherit;
+    f.ElemKind = FieldKind::Unsupported;
+    return f;
 }
 
+// Builds a field descriptor from its type. Having every kind decision here
+// rather than spelled out in each macro means adding a kind is one edit.
 template <class T>
-constexpr std::uint16_t elem_count_of() {
-    return (std::uint16_t)ArrayTraits<T>::kCount;
+constexpr FieldDesc make_field(char const* name, std::size_t offset) {
+    FieldDesc f{};
+    f.Name = name;
+    f.Offset = (std::uint32_t)offset;
+    f.Size = (std::uint16_t)sizeof(T);
+    f.Kind = kind_of<T>();
+    f.ElemKind = FieldKind::Unsupported;
+    f.ElemCount = 0;
+    f.ElemSize = 0;
+    f.TypeName = nullptr;
+    f.TypeNameLength = 0;
+    f.ElemTypeName = nullptr;
+    f.ElemTypeNameLength = 0;
+
+    // Element description, shared by both array kinds. A struct element is
+    // named so it can be descended into, exactly as a struct field is.
+    auto describe_elements = [&f]<class E>() {
+        f.ElemKind = scalar_kind_of<E>();
+        f.ElemSize = (std::uint16_t)sizeof(E);
+        if constexpr (std::is_class_v<E>) {
+            f.ElemTypeName = type_name<E>().data();
+            f.ElemTypeNameLength = (std::uint16_t)type_name<E>().size();
+        }
+    };
+
+    if constexpr (ArrayTraits<T>::kIsArray) {
+        using E = typename ArrayTraits<T>::Elem;
+        describe_elements.template operator()<E>();
+        f.ElemCount = (std::uint16_t)ArrayTraits<T>::kCount;
+    } else if constexpr (VectorTraits<T>::kIsVector) {
+        using E = typename VectorTraits<T>::Elem;
+        describe_elements.template operator()<E>();
+        f.Count = &array_count_thunk<T>;
+        f.Data = &array_data_thunk<T>;
+    } else if constexpr (SetTraits<T>::kIsSet) {
+        using E = typename SetTraits<T>::Elem;
+        describe_elements.template operator()<E>();
+        f.Count = &set_count_thunk<T>;
+        f.Data = &set_data_thunk<T>;
+        f.ReadOnly = true;
+    } else if constexpr (std::is_class_v<T>) {
+        f.TypeName = type_name<T>().data();
+        f.TypeNameLength = (std::uint16_t)type_name<T>().size();
+    }
+
+    return f;
 }
 
 // Components carry two names, and both are wanted.
@@ -212,8 +322,7 @@ struct FieldTable;
 // A class with no offset-based fields would otherwise declare a zero-length
 // array, which is not valid C++, so every table is null-terminated.
 #define END_CLS()                                                             \
-            { nullptr, 0, 0, FieldKind::Unsupported,                          \
-              FieldKind::Unsupported, 0, nullptr, 0 },                        \
+            FieldDesc{},  /* the null terminator */                          \
         };                                                                    \
     };                                                                        \
     }
@@ -222,17 +331,11 @@ struct FieldTable;
 // initialiser list and so multiple bases work. Resolved by name at load,
 // because a class's table may be declared before its base's.
 #define INHERIT(base)                                                         \
-        { #base, 0, 0, FieldKind::Inherit, FieldKind::Unsupported, 0,         \
-          nullptr, 0 },
+        inherit_field(#base),
 
 #define PN(name, prop)                                                        \
-        { #name, (std::uint32_t)offsetof(ObjectType, prop),                   \
-          (std::uint16_t)sizeof(decltype(ObjectType::prop)),                  \
-          kind_of<decltype(ObjectType::prop)>(),                              \
-          elem_kind_of<decltype(ObjectType::prop)>(),                         \
-          elem_count_of<decltype(ObjectType::prop)>(),                        \
-          type_name<decltype(ObjectType::prop)>().data(),                     \
-          (std::uint16_t)type_name<decltype(ObjectType::prop)>().size() },
+        make_field<decltype(ObjectType::prop)>(                               \
+            #name, offsetof(ObjectType, prop)),
 
 #define P(prop) PN(prop, prop)
 #define P_RO(prop) PN(prop, prop)
@@ -377,42 +480,131 @@ ClassFields const* struct_type_of(FieldDesc const* field) {
     return it != by_type_name().end() ? it->second : nullptr;
 }
 
-// Resolves a dotted path -- "DiceValues.Amount" -- accumulating the offset of
-// each step.
+// The table describing an array field's element type, or null.
+ClassFields const* elem_type_of(FieldDesc const* field) {
+    if (field == nullptr || field->ElemTypeName == nullptr) return nullptr;
+    auto it = by_type_name().find(
+        std::string_view(field->ElemTypeName, field->ElemTypeNameLength));
+    return it != by_type_name().end() ? it->second : nullptr;
+}
+
+// What a path resolved to.
 //
-// Nesting is expressed as a path rather than by handing out a table for the
-// inner struct, so reading a nested field stays a single call and needs no
-// object to be kept alive on either side.
-FieldDesc const* find_field_path(ClassFields const* cls, char const* path,
-                                 std::uint32_t* offset) {
-    *offset = 0;
-    if (cls == nullptr || path == nullptr) return nullptr;
+// Address is only filled in when a base was supplied. It has to be, rather
+// than an offset being enough, because crossing a dynamic array means
+// following its buffer pointer -- the element does not live at a fixed offset
+// from the component at all.
+struct Resolved {
+    FieldDesc Field{};      // synthesised for an element, copied for a field
+    void* Address{nullptr};
+    bool Ok{false};
+};
+
+// Resolves a path, which may name nested fields and index arrays:
+//
+//   "Hp"                     a field
+//   "Transform.Translate"    a field of a nested struct
+//   "Resources[2].Amount"    a field of an element of a dynamic array
+//
+// base may be null to resolve the type only, which is what listing fields and
+// reporting kinds need; then Address stays null and an array index is still
+// crossed, because the element type is known statically even when the element
+// address is not.
+Resolved resolve_path(ClassFields const* cls, char const* path, void* base) {
+    Resolved out;
+    if (cls == nullptr || path == nullptr) return out;
 
     std::string_view rest(path);
-    FieldDesc const* field = nullptr;
+    void* address = base;
 
-    // Bounded so a pathological path cannot spin; nothing in the metadata
-    // nests anywhere near this deep.
+    // Bounded so a pathological path cannot spin; nothing nests near this
+    // deep.
     for (unsigned step = 0; step < 16; ++step) {
+        // A segment is a name, optionally followed by [index], and the path
+        // continues after a dot.
         const auto dot = rest.find('.');
-        const std::string_view segment =
+        std::string_view segment =
             dot == std::string_view::npos ? rest : rest.substr(0, dot);
-        if (segment.empty()) return nullptr;
+        if (segment.empty()) return out;
 
-        // find_field takes a NUL-terminated name, and a path segment is not
-        // one.
+        bool indexed = false;
+        long long index = 0;
+        if (const auto open = segment.find('['); open != std::string_view::npos) {
+            if (segment.back() != ']') return out;
+            const auto digits = segment.substr(open + 1, segment.size() - open - 2);
+            if (digits.empty()) return out;
+            index = 0;
+            for (const char c : digits) {
+                if (c < '0' || c > '9') return out;
+                index = index * 10 + (c - '0');
+                if (index > 0xffffff) return out;  // absurd; refuse
+            }
+            indexed = true;
+            segment = segment.substr(0, open);
+            if (segment.empty()) return out;
+        }
+
+        // find_field takes a NUL-terminated name; a path segment is not one.
         const std::string name(segment);
-        field = find_field(cls, name.c_str());
-        if (field == nullptr) return nullptr;
-        *offset += field->Offset;
+        FieldDesc const* field = find_field(cls, name.c_str());
+        if (field == nullptr) return out;
 
-        if (dot == std::string_view::npos) return field;
+        FieldDesc current = *field;
+        if (address != nullptr) {
+            address = (char*)address + field->Offset;
+        }
 
-        cls = struct_type_of(field);
-        if (cls == nullptr) return nullptr;  // cannot descend through this
+        if (indexed) {
+            if (current.Kind != FieldKind::ScalarArray
+                && current.Kind != FieldKind::DynArray) {
+                return out;
+            }
+            if (current.ElemSize == 0) return out;
+
+            if (current.Kind == FieldKind::DynArray) {
+                if (current.Count == nullptr || current.Data == nullptr) return out;
+                if (address != nullptr) {
+                    if ((std::size_t)index >= current.Count(address)) return out;
+                    void* data = current.Data(address);
+                    if (data == nullptr) return out;
+                    address = (char*)data + (std::size_t)index * current.ElemSize;
+                }
+            } else {
+                if ((std::size_t)index >= current.ElemCount) return out;
+                if (address != nullptr) {
+                    address = (char*)address + (std::size_t)index * current.ElemSize;
+                }
+            }
+
+            // The element takes the place of the field. A struct element keeps
+            // its type name so the path can carry on into it.
+            FieldDesc elem{};
+            elem.Name = current.Name;
+            elem.Size = current.ElemSize;
+            elem.Kind = current.ElemKind != FieldKind::Unsupported
+                            ? current.ElemKind
+                            : FieldKind::Struct;
+            elem.ElemKind = FieldKind::Unsupported;
+            elem.TypeName = current.ElemTypeName;
+            elem.TypeNameLength = current.ElemTypeNameLength;
+            // An element of a read-only view is itself read-only: writing a
+            // hash set's key in place is exactly what must not happen.
+            elem.ReadOnly = current.ReadOnly;
+            current = elem;
+        }
+
+        if (dot == std::string_view::npos) {
+            out.Field = current;
+            out.Address = address;
+            out.Ok = true;
+            return out;
+        }
+
+        cls = struct_type_of(&current);
+        if (cls == nullptr) return out;  // cannot descend through this
         rest = rest.substr(dot + 1);
     }
-    return nullptr;
+    return out;
 }
 
 }  // namespace
@@ -437,28 +629,92 @@ extern "C" std::size_t bg3le_meta_component_size(void const* handle) {
     return static_cast<ClassFields const*>(handle)->Size;
 }
 
+namespace {
+
+// The kind to report for a resolved field. A struct with no table behind it,
+// and an array whose elements are structs with no table, cannot be acted on,
+// so they are reported as unsupported rather than as something traversable.
+std::uint8_t reportable_kind(FieldDesc const& field) {
+    if (field.Kind == FieldKind::Struct && struct_type_of(&field) == nullptr) {
+        return (std::uint8_t)FieldKind::Unsupported;
+    }
+    if ((field.Kind == FieldKind::ScalarArray || field.Kind == FieldKind::DynArray)
+        && field.ElemKind == FieldKind::Unsupported
+        && elem_type_of(&field) == nullptr) {
+        return (std::uint8_t)FieldKind::Unsupported;
+    }
+    return (std::uint8_t)field.Kind;
+}
+
+}  // namespace
+
 // Resolves a field of a component by name or by dotted path, following base
-// classes. Returns false if the path does not resolve, including when it tries
-// to descend through a type bg3se does not describe.
+// classes. Type information only -- no component instance, so a path may
+// index an array (the element type is static) but the offset returned is not
+// meaningful once it has, because a dynamic array's elements do not live at a
+// fixed offset from the component. Use bg3le_meta_resolve to reach a value.
 extern "C" bool bg3le_meta_field(void const* handle, char const* name,
                                  std::uint32_t* offset, std::uint16_t* size,
                                  std::uint8_t* kind, std::uint8_t* elemKind,
                                  std::uint16_t* elemCount) {
     if (handle == nullptr || name == nullptr) return false;
-    std::uint32_t pathOffset = 0;
-    auto const* field = find_field_path(
-        static_cast<ClassFields const*>(handle), name, &pathOffset);
-    if (field == nullptr) return false;
-    *offset = pathOffset;
-    *size = field->Size;
-    // As in bg3le_meta_fields_at: a struct with no table behind it is reported
-    // as unsupported, because nothing can be done with it.
-    *kind = (field->Kind == FieldKind::Struct && struct_type_of(field) == nullptr)
-                ? (std::uint8_t)FieldKind::Unsupported
-                : (std::uint8_t)field->Kind;
-    *elemKind = (std::uint8_t)field->ElemKind;
-    *elemCount = field->ElemCount;
+    const auto r =
+        resolve_path(static_cast<ClassFields const*>(handle), name, nullptr);
+    if (!r.Ok) return false;
+    *offset = r.Field.Offset;
+    *size = r.Field.Size;
+    *kind = reportable_kind(r.Field);
+    *elemKind = (std::uint8_t)r.Field.ElemKind;
+    *elemCount = r.Field.ElemCount;
     return true;
+}
+
+// Resolves a path against a live component and hands back the address of the
+// value, following array buffers where the path indexes one.
+extern "C" bool bg3le_meta_resolve(void const* handle, char const* path,
+                                   void* component, void** address,
+                                   std::uint8_t* kind, std::uint16_t* size,
+                                   bool* readOnly) {
+    *address = nullptr;
+    *readOnly = false;
+    if (handle == nullptr || path == nullptr || component == nullptr) return false;
+
+    const auto r = resolve_path(static_cast<ClassFields const*>(handle), path,
+                                component);
+    if (!r.Ok || r.Address == nullptr) return false;
+
+    *address = r.Address;
+    *kind = reportable_kind(r.Field);
+    *size = r.Field.Size;
+    *readOnly = r.Field.ReadOnly;
+    return true;
+}
+
+// The current length of a dynamic array, and the element stride. Needs the
+// component because the length is stored in the container.
+extern "C" bool bg3le_meta_array_length(void const* handle, char const* path,
+                                        void* component, std::size_t* count,
+                                        std::uint16_t* elemSize,
+                                        std::uint8_t* elemKind) {
+    *count = 0;
+    if (handle == nullptr || path == nullptr || component == nullptr) return false;
+
+    const auto r = resolve_path(static_cast<ClassFields const*>(handle), path,
+                                component);
+    if (!r.Ok || r.Address == nullptr) return false;
+
+    *elemSize = r.Field.ElemSize;
+    *elemKind = (std::uint8_t)r.Field.ElemKind;
+
+    if (r.Field.Kind == FieldKind::ScalarArray) {
+        *count = r.Field.ElemCount;
+        return true;
+    }
+    if (r.Field.Kind == FieldKind::DynArray && r.Field.Count != nullptr) {
+        *count = r.Field.Count(r.Address);
+        return true;
+    }
+    return false;
 }
 
 // Enumerates a component's own fields, base classes included, for listing a
@@ -475,9 +731,11 @@ extern "C" std::size_t bg3le_meta_fields_at(void const* handle,
 
     auto const* cls = static_cast<ClassFields const*>(handle);
     if (path != nullptr && path[0] != '\0') {
-        std::uint32_t offset = 0;
-        auto const* field = find_field_path(cls, path, &offset);
-        cls = struct_type_of(field);
+        const auto r = resolve_path(cls, path, nullptr);
+        if (!r.Ok) return 0;
+        // Either a nested struct, or an element of an array of structs; both
+        // resolve to a field whose type has a table.
+        cls = struct_type_of(&r.Field);
         if (cls == nullptr) return 0;
     }
 
@@ -498,10 +756,7 @@ extern "C" std::size_t bg3le_meta_fields_at(void const* handle,
             // A Struct whose type bg3se does not describe cannot be descended
             // into, so it is reported as unsupported rather than as a struct.
             // That keeps the reported kind something a caller can act on.
-            kinds[n] = (f->Kind == FieldKind::Struct
-                        && struct_type_of(f) == nullptr)
-                           ? (std::uint8_t)FieldKind::Unsupported
-                           : (std::uint8_t)f->Kind;
+            kinds[n] = reportable_kind(*f);
             ++n;
         }
     }
@@ -516,6 +771,148 @@ extern "C" std::size_t bg3le_meta_fields(void const* handle,
 }
 
 // How many classes carry metadata, for the startup log.
+// Walks a real component holding a real dynamic array, so the container
+// accessors and the indexed path walk are exercised on genuine memory rather
+// than inferred from the tables.
+//
+// Everything the static tables say can be checked from outside (see
+// tools/meta-check.c), but following a dynamic array's buffer cannot: it needs
+// an instance. Building one here is the only way to test that without the
+// game.
+//
+// Pushing onto the array allocates through bg3se, so the caller has to install
+// an allocator first. In the test harness that is malloc, which is safe
+// precisely because this memory is never handed to the engine.
+//
+// Returns the number of failed checks, and writes a line per failure.
+extern "C" int bg3le_meta_selftest() {
+    int failures = 0;
+    auto fail = [&failures](char const* what) {
+        bg3le::logf("meta selftest: FAIL %s", what);
+        ++failures;
+    };
+
+    if (!bg3le_game_allocator_ready()) {
+        fail("no allocator installed; cannot build a test array");
+        return failures;
+    }
+
+    ActionResourceEventsOneFrameComponent component;
+    ActionResourceSetValueRequest a{};
+    a.Amount = 11.5;
+    a.OldAmount = 1.0;
+    ActionResourceSetValueRequest b{};
+    b.Amount = 22.25;
+    b.OldAmount = 2.0;
+    component.Events.push_back(a);
+    component.Events.push_back(b);
+
+    auto const* meta = static_cast<ClassFields const*>(
+        bg3le_meta_component("eoc::ActionResourceEventsOneFrameComponent"));
+    if (meta == nullptr) {
+        fail("no metadata for ActionResourceEventsOneFrameComponent");
+        return failures;
+    }
+
+    // The length has to come from the container, not from the table.
+    std::size_t count = 0;
+    std::uint16_t elemSize = 0;
+    std::uint8_t elemKind = 0;
+    if (!bg3le_meta_array_length(meta, "Events", &component, &count, &elemSize,
+                                 &elemKind)) {
+        fail("Events has no array length");
+    } else {
+        if (count != 2) fail("Events length is not 2");
+        if (elemSize != sizeof(ActionResourceSetValueRequest)) {
+            fail("Events element stride does not match the element type");
+        }
+    }
+
+    // Indexing the array and then descending into the element struct.
+    void* address = nullptr;
+    std::uint8_t kind = 0;
+    std::uint16_t size = 0;
+    bool readOnly = false;
+    if (!bg3le_meta_resolve(meta, "Events[1].Amount", &component, &address,
+                            &kind, &size, &readOnly)) {
+        fail("Events[1].Amount does not resolve");
+    } else if (address != &component.Events[1].Amount) {
+        fail("Events[1].Amount resolved to the wrong address");
+    } else if (kind != (std::uint8_t)FieldKind::Double) {
+        fail("Events[1].Amount is not reported as a double");
+    } else if (*(double*)address != 22.25) {
+        fail("Events[1].Amount does not read back what was written");
+    }
+
+    if (bg3le_meta_resolve(meta, "Events[0].OldAmount", &component, &address,
+                           &kind, &size, &readOnly)
+        && address != &component.Events[0].OldAmount) {
+        fail("Events[0].OldAmount resolved to the wrong address");
+    }
+
+    // Past the end has to fail rather than run off the buffer.
+    if (bg3le_meta_resolve(meta, "Events[2].Amount", &component, &address,
+                           &kind, &size, &readOnly)) {
+        fail("Events[2] resolved despite the array holding two elements");
+    }
+
+    // Descending into a dynamic array without indexing it is not meaningful
+    // and must fail rather than read the container's own bytes as a struct.
+    if (bg3le_meta_resolve(meta, "Events.Amount", &component, &address, &kind,
+                           &size, &readOnly)) {
+        fail("Events.Amount resolved without an index");
+    }
+
+    // A write through a resolved address has to land in the component.
+    if (bg3le_meta_resolve(meta, "Events[0].Amount", &component, &address,
+                           &kind, &size, &readOnly)) {
+        *(double*)address = 99.5;
+        if (component.Events[0].Amount != 99.5) {
+            fail("a write through a resolved address did not land");
+        }
+    } else {
+        fail("Events[0].Amount does not resolve");
+    }
+
+    // A hash set reads as an array of its keys, and has to report itself
+    // read-only: its elements are the keys the table's hashes were computed
+    // from, so writing one in place would desynchronise the two.
+    SummonContainerComponent summons;
+    summons.Characters.insert(EntityHandle((std::uint64_t)0x1234));
+    summons.Characters.insert(EntityHandle((std::uint64_t)0x5678));
+
+    auto const* summonMeta = static_cast<ClassFields const*>(
+        bg3le_meta_component("eoc::summon::ContainerComponent"));
+    if (summonMeta == nullptr) {
+        fail("no metadata for the summon container component");
+    } else {
+        std::size_t setCount = 0;
+        std::uint16_t setElemSize = 0;
+        std::uint8_t setElemKind = 0;
+        if (!bg3le_meta_array_length(summonMeta, "Characters", &summons,
+                                     &setCount, &setElemSize, &setElemKind)) {
+            fail("Characters has no array length");
+        } else if (setCount != 2) {
+            fail("Characters length is not 2");
+        }
+
+        if (!bg3le_meta_resolve(summonMeta, "Characters[0]", &summons, &address,
+                                &kind, &size, &readOnly)) {
+            fail("Characters[0] does not resolve");
+        } else {
+            if (!readOnly) fail("a hash set element is not reported read-only");
+            if (address != summons.Characters.keys().data()) {
+                fail("Characters[0] is not the first key");
+            }
+        }
+    }
+
+    if (failures == 0) {
+        bg3le::logf("meta selftest: the container walks behave");
+    }
+    return failures;
+}
+
 extern "C" std::size_t bg3le_meta_class_count() { return std::size(kAllClasses); }
 
 extern "C" std::size_t bg3le_meta_component_count() {

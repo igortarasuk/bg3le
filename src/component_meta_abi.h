@@ -37,6 +37,10 @@ enum class FieldKind : std::uint8_t {
     // load rather than at compile time -- a field's type does not have to have
     // a field table of its own for the field itself to be recorded.
     Struct,
+    // A dynamically sized array. Its length and buffer are read through
+    // Count and Data below rather than through guessed member offsets.
+    // ElemKind, ElemSize and ElemTypeName describe the elements.
+    DynArray,
     // Not a field: records that the class also has the fields of the class
     // named in Name. Classes are declared in dependency-free order, so bases
     // are resolved by name at load rather than by pointer.
@@ -50,10 +54,24 @@ struct FieldDesc {
     FieldKind Kind;
     FieldKind ElemKind;       // ScalarArray only
     std::uint16_t ElemCount;  // ScalarArray only
-    // The field's C++ type, for Struct. Not NUL-terminated: it is a slice of a
-    // compiler-generated function-name string, so it carries its own length.
+    std::uint16_t ElemSize;   // element stride, for the array kinds
+    // The field's C++ type, for Struct, and the element type for an array of
+    // structs. Neither is NUL-terminated: both are slices of a
+    // compiler-generated function-name string, so they carry their own length.
     char const* TypeName;
     std::uint16_t TypeNameLength;
+    char const* ElemTypeName;
+    std::uint16_t ElemTypeNameLength;
+    // DynArray only: the container's own size() and data(), instantiated for
+    // the field's exact type. Going through the real accessors rather than
+    // reading a guessed offset for the length and buffer members keeps this
+    // correct by construction, the same way offsetof does for a plain field.
+    std::size_t (*Count)(void const* container);
+    void* (*Data)(void const* container);
+    // Set for a view that must not be written through. A hash set's elements
+    // are its keys, and writing one in place would leave the table's hashes
+    // pointing at the old value, so the set is readable and not writable.
+    bool ReadOnly;
 };
 
 }  // namespace bg3le
