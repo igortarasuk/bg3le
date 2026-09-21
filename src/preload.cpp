@@ -21,6 +21,7 @@
 #include <ctime>
 #include <unistd.h>
 
+#include "ecs_types.h"
 #include "elf_symbols.h"
 #include "hook.h"
 #include "debug_server.h"
@@ -207,6 +208,12 @@ void ensure_symbols() {
         statusf("Extender runtime log written to '%s'", log_path());
         statusf("Resolved %zu symbols (load bias 0x%lx)", g_symbols.count(),
                 g_symbols.bias());
+
+        // The engine names every ECS type index, so the whole registry comes
+        // straight out of the symbol table.
+        const std::size_t types = ecs::load(g_symbols);
+        statusf("ECS registry: %zu type indices (%zu components)", types,
+                ecs::count(ecs::Context::Component));
         void* p = g_symbols.find(
             "_ZN2ls11TypeContextIN3esv4tags8_private23TagComponentTypeContextEE7m_StateE");
         logf("  sentinel esv TagComponentTypeContext::m_State -> %p", p);

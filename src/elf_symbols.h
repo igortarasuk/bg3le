@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
 
@@ -23,6 +24,11 @@ public:
     T find_as(const std::string& mangled) const {
         return reinterpret_cast<T>(find(mangled));
     }
+
+    // Visits every symbol, for enumerating a family by pattern rather than
+    // looking one up by exact name. Addresses are already biased.
+    void for_each(
+        const std::function<void(const std::string&, std::uintptr_t)>& fn) const;
 
     std::size_t count() const { return symbols_.size(); }
     std::uintptr_t bias() const { return bias_; }

@@ -143,4 +143,11 @@ void* SymbolTable::find(const std::string& mangled) const {
     return reinterpret_cast<void*>(bias_ + it->second);
 }
 
+void SymbolTable::for_each(
+    const std::function<void(const std::string&, std::uintptr_t)>& fn) const {
+    for (const auto& [name, value] : symbols_) {
+        fn(name, bias_ + value);
+    }
+}
+
 }  // namespace bg3le
