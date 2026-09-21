@@ -26,6 +26,7 @@
 #include "debug_server.h"
 #include "lua_host.h"
 #include "osi.h"
+#include "fast_alloc.h"
 #include "physx_probe.h"
 #include "stackdump.h"
 #include "mem.h"
@@ -221,6 +222,7 @@ void ensure_symbols() {
         }
         install_tick_hook();
         physx_probe_install();
+        fast_alloc_install();
     });
 }
 
@@ -463,6 +465,7 @@ void dump_once(void* self) {
     std::call_once(g_story_once, [self] {
         ensure_symbols();
         physx_probe_report("level load");
+        fast_alloc_report("level load");
         if (g_story_ready_at > 0.0) {
             statusf("Level load took %.1fs after Osiris finished (%lu spin yields)",
                     now_s() - g_story_ready_at,

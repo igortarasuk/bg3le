@@ -25,6 +25,7 @@ add_library(bg3le SHARED
     src/console.cpp
     src/stackdump.cpp
     src/physx_probe.cpp
+    src/fast_alloc.cpp
 )
 target_link_libraries(bg3le PRIVATE dl lua_static)
 target_link_options(bg3le PRIVATE -static-libstdc++ -static-libgcc
