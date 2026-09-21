@@ -925,6 +925,69 @@ int l_map_key(lua_State* L) {
     return 1;
 }
 
+extern "C" int bg3le_component_engine_size(void* container,
+                                           std::uint16_t componentIndex);
+extern "C" void const* bg3le_meta_class_at(std::size_t index);
+
+// Ext._Internal.SizeAudit() -> { Checked, Matched, Mismatches = {...} }
+//
+// Compares every component's declared struct size against the size the engine
+// recorded for it. A mismatch means every read of that component is
+// misaligned, because the size is the stride GetComponent multiplies the
+// entity's slot by -- so the entity at index 0 reads correctly and the rest do
+// not. That is worth knowing across all of them at once rather than one
+// surprising result at a time.
+//
+// Components no live entity carries are skipped: the engine only records a
+// size where a storage holds one.
+int l_size_audit(lua_State* L) {
+    lua_newtable(L);
+    lua_newtable(L);  // the mismatch list
+
+    std::size_t checked = 0;
+    std::size_t matched = 0;
+    std::size_t mismatches = 0;
+
+    const std::size_t classes = bg3le_meta_class_count();
+    for (std::size_t i = 0; i < classes; ++i) {
+        void const* cls = bg3le_meta_class_at(i);
+        if (cls == nullptr) continue;
+        const char* engineName = bg3le_meta_engine_class(cls);
+        if (engineName == nullptr) continue;
+
+        const auto index = component_index(engineName);
+        if (!index.has_value()) continue;
+
+        const int engineSize = bg3le_component_engine_size(
+            server_container(), static_cast<std::uint16_t>(*index));
+        if (engineSize < 0) continue;  // no live entity has it
+
+        ++checked;
+        const auto declared = (int)bg3le_meta_component_size(cls);
+        if (declared == engineSize) {
+            ++matched;
+            continue;
+        }
+
+        ++mismatches;
+        lua_newtable(L);
+        lua_pushstring(L, engineName);
+        lua_setfield(L, -2, "Component");
+        lua_pushinteger(L, declared);
+        lua_setfield(L, -2, "Declared");
+        lua_pushinteger(L, engineSize);
+        lua_setfield(L, -2, "Engine");
+        lua_rawseti(L, -2, (int)mismatches);
+    }
+
+    lua_setfield(L, -2, "Mismatches");
+    lua_pushinteger(L, (lua_Integer)checked);
+    lua_setfield(L, -2, "Checked");
+    lua_pushinteger(L, (lua_Integer)matched);
+    lua_setfield(L, -2, "Matched");
+    return 1;
+}
+
 // Ext._Internal.FieldAddress(handle, component, path) -> address, size
 //
 // For probing a field whose layout is in doubt. A container's length and
@@ -1448,6 +1511,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "FieldAddress");
     lua_pushcfunction(g_lua, l_field_bytes);
     lua_setfield(g_lua, -2, "FieldBytes");
+    lua_pushcfunction(g_lua, l_size_audit);
+    lua_setfield(g_lua, -2, "SizeAudit");
     lua_pushcfunction(g_lua, l_entity_has_component);
     lua_setfield(g_lua, -2, "HasComponent");
     lua_setfield(g_lua, -2, "_Internal");

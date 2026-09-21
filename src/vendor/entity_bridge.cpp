@@ -271,6 +271,33 @@ extern "C" void bg3le_world_probe(void* container, void** world,
     *poolCount = (std::int32_t)w->Replication->ComponentPools.Size();
 }
 
+// The engine's own recorded size for a component.
+//
+// Worth having because the size is not cosmetic: GetComponent returns
+// buf + componentSize * entryIndex, so if bg3se's struct is the wrong size
+// every read of that component is misaligned -- for every entity except
+// whichever one happens to sit at index 0, which is exactly the sort of bug
+// that looks like correct code failing intermittently.
+//
+// The engine keeps the sizes per storage, indexed by the component's slot
+// within that storage, so this searches the storages for one that carries the
+// component. Returns -1 if none does, which only means no live entity has it.
+extern "C" int bg3le_component_engine_size(void* container,
+                                           std::uint16_t componentIndex) {
+    if (container == nullptr) return -1;
+
+    auto* storages = reinterpret_cast<bg3se::ecs::EntityStorageContainer*>(container);
+    const auto type = bg3se::ecs::ComponentTypeIndex(componentIndex);
+
+    for (auto* storage : storages->Storages) {
+        if (storage == nullptr || storage->ComponentSizes == nullptr) continue;
+        auto const* slot = storage->ComponentTypeToIndex.try_get(type);
+        if (slot == nullptr) continue;
+        return (int)storage->ComponentSizes[*slot];
+    }
+    return -1;
+}
+
 // Whether this container belongs to the server world.
 //
 // The client and server each have an EntityWorld, and replication buffers are
