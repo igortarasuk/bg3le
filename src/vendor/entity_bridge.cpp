@@ -65,4 +65,60 @@ extern "C" bool bg3le_entity_health(void* container, std::uint64_t handle,
     return true;
 }
 
+// Reports each step of the walk separately, because a single null cannot
+// distinguish "the entity genuinely has no such component" from "the storage
+// lookup failed". Returns the storage index (-1 if none), the storage pointer,
+// and the component pointer.
+extern "C" void bg3le_entity_probe(void* container, std::uint64_t handle,
+                                   std::uint16_t componentIndex,
+                                   std::int32_t* storageIndex,
+                                   void** storage, void** component) {
+    *storageIndex = -1;
+    *storage = nullptr;
+    *component = nullptr;
+    if (container == nullptr) return;
+
+    auto* storages = reinterpret_cast<bg3se::ecs::EntityStorageContainer*>(container);
+    const auto entity = bg3se::EntityHandle(handle);
+
+    const auto index = storages->GetEntityStorageIndex(entity);
+    if (!index.has_value()) return;
+    *storageIndex = *index;
+
+    auto* data = storages->GetEntityStorage(*index);
+    if (data == nullptr) return;
+    *storage = data;
+
+    *component = data->GetComponent(entity,
+                                    bg3se::ecs::ComponentTypeIndex(componentIndex),
+                                    sizeof(bg3se::HealthComponent));
+}
+
+// Walks the container's storages looking for one whose component set includes
+// the given type, and returns an entity out of it. Needed because the handle
+// the thunk captures is whatever the engine touched last, which is usually
+// something with no Health at all.
+extern "C" std::uint64_t bg3le_find_entity_with(void* container,
+                                                std::uint16_t componentIndex,
+                                                std::uint32_t* storagesSeen) {
+    *storagesSeen = 0;
+    if (container == nullptr) return 0;
+
+    auto* storages = reinterpret_cast<bg3se::ecs::EntityStorageContainer*>(container);
+    const auto type = bg3se::ecs::ComponentTypeIndex(componentIndex);
+
+    for (auto* storage : storages->Storages) {
+        if (storage == nullptr) continue;
+        ++*storagesSeen;
+        if (!storage->ComponentTypeToIndex.try_get(type)) continue;
+
+        // First live entity in this storage. HashMap keeps its keys in an
+        // array, so they can be read without walking buckets.
+        for (auto const& key : storage->InstanceToPageMap.keys()) {
+            if (key.Handle != bg3se::EntityHandle::NullHandle) return key.Handle;
+        }
+    }
+    return 0;
+}
+
 }  // namespace bg3le

@@ -387,6 +387,72 @@ extern "C" bool bg3le_entity_health(void* container, std::uint64_t handle,
                                     std::uint16_t componentIndex,
                                     std::int32_t* hp, std::int32_t* maxHp);
 
+extern "C" void bg3le_entity_probe(void* container, std::uint64_t handle,
+                                   std::uint16_t componentIndex,
+                                   std::int32_t* storageIndex, void** storage,
+                                   void** component);
+extern "C" std::uint64_t bg3le_find_entity_with(void* container,
+                                                std::uint16_t componentIndex,
+                                                std::uint32_t* storagesSeen);
+
+// Reports each step of the walk, so a null says where it stopped rather than
+// just that it did.
+int l_entity_probe(lua_State* L) {
+    const auto index = ecs::index_of(ecs::Context::Component, "eoc::HealthComponent");
+    if (!index.has_value()) {
+        lua_pushnil(L);
+        lua_pushstring(L, "eoc::HealthComponent has no index");
+        return 2;
+    }
+
+    // Default to an entity that actually carries the component, rather than
+    // whatever the engine happened to look up last.
+    std::uint32_t seen = 0;
+    auto handle = static_cast<std::uint64_t>(luaL_optinteger(L, 1, 0));
+    bool found = false;
+    if (handle == 0) {
+        handle = bg3le_find_entity_with(ecs::container(),
+                                        static_cast<std::uint16_t>(*index), &seen);
+        found = true;
+    }
+
+    std::int32_t storageIndex = -1;
+    void* storage = nullptr;
+    void* component = nullptr;
+    bg3le_entity_probe(ecs::container(), handle,
+                       static_cast<std::uint16_t>(*index), &storageIndex,
+                       &storage, &component);
+
+    lua_newtable(L);
+    lua_pushinteger(L, (lua_Integer)*index);
+    lua_setfield(L, -2, "HealthIndex");
+    lua_pushinteger(L, (lua_Integer)handle);
+    lua_setfield(L, -2, "Handle");
+    if (found) {
+        lua_pushinteger(L, (lua_Integer)seen);
+        lua_setfield(L, -2, "StoragesScanned");
+    }
+    lua_pushinteger(L, storageIndex);
+    lua_setfield(L, -2, "StorageIndex");
+    lua_pushinteger(L, (lua_Integer)reinterpret_cast<std::uintptr_t>(storage));
+    lua_setfield(L, -2, "Storage");
+    lua_pushinteger(L, (lua_Integer)reinterpret_cast<std::uintptr_t>(component));
+    lua_setfield(L, -2, "Component");
+
+    if (component != nullptr) {
+        std::int32_t hp = 0;
+        std::int32_t maxHp = 0;
+        if (bg3le_entity_health(ecs::container(), handle,
+                                static_cast<std::uint16_t>(*index), &hp, &maxHp)) {
+            lua_pushinteger(L, hp);
+            lua_setfield(L, -2, "Hp");
+            lua_pushinteger(L, maxHp);
+            lua_setfield(L, -2, "MaxHp");
+        }
+    }
+    return 1;
+}
+
 // The most recent EntityHandle the engine looked up, so component access can
 // be tested before UUID -> handle exists.
 int l_last_entity(lua_State* L) {
@@ -516,6 +582,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "LastEntity");
     lua_pushcfunction(g_lua, l_entity_health);
     lua_setfield(g_lua, -2, "EntityHealth");
+    lua_pushcfunction(g_lua, l_entity_probe);
+    lua_setfield(g_lua, -2, "EntityProbe");
     lua_setfield(g_lua, -2, "_Internal");
 
     lua_setglobal(g_lua, "Ext");
