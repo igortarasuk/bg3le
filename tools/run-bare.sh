@@ -26,6 +26,16 @@ cd /home/lenon/bg3mods/bg3-linux-native
 export LD_LIBRARY_PATH="$SHIM:$PWD/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export MANGOHUD="${MANGOHUD:-0}"
 
+# BG3LE_NO_STEAM_LAYERS=1 disables Steam's implicit Vulkan layers (shader
+# pre-caching and the overlay). They are injected even outside the runtime
+# container and are a known source of load-time stalls.
+if [ "${BG3LE_NO_STEAM_LAYERS:-0}" = "1" ]; then
+    export DISABLE_VK_LAYER_VALVE_steam_overlay_1=1
+    export DISABLE_VK_LAYER_VALVE_steam_fossilize_1=1
+    export DISABLE_LAYER_AMD_switchable_graphics_1=1
+    echo "Steam Vulkan layers disabled for this run" >&2
+fi
+
 # Attach the extender purely for its timing report, so this run is directly
 # comparable with the sniper one. The control run already established it is
 # not responsible for the slow load.
