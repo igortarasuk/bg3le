@@ -3,8 +3,11 @@
 #include <dlfcn.h>
 
 #include <cstring>
+#include <link.h>
+#include <unordered_map>
 
 #include "log.h"
+#include "mem.h"
 
 namespace bg3le::osi {
 namespace {
@@ -109,6 +112,125 @@ Value read(const void* node, unsigned short type) {
 }
 
 }  // namespace
+
+namespace {
+
+// Osiris keeps its function database in a hash of red-black trees reachable
+// from a static in libOsiris. The layouts below are bg3se's, which were
+// reversed against the Windows build -- the walk validates itself against the
+// names we already enumerated rather than trusting them.
+//
+//   [libOsiris + kFunctionDbHolder] -> holder
+//   holder + 0x10                   -> TypeDb::HashSlot[1023], stride 0x18
+//   HashSlot + 0x00                 -> TMap::Root  (tree header)
+//   TMapNode: Left +00, Parent +08, Right +10, Color +18, IsRoot +19,
+//             Key(OsiString) +20, Value +38
+//   OsiFunctionDef + 0x18           -> FunctionSignature*
+//   FunctionSignature + 0x08        -> const char* Name
+//   FunctionSignature + 0x18/+0x20  -> out-param bitmask / byte count
+constexpr std::uintptr_t kFunctionDbHolder = 0x119d50;
+constexpr std::size_t kBuckets = 1023;
+constexpr std::size_t kSlotStride = 0x18;
+
+int find_osiris(struct dl_phdr_info* info, std::size_t, void* data) {
+    if (info->dlpi_name == nullptr) return 0;
+    if (std::strstr(info->dlpi_name, "libOsiris.so") == nullptr) return 0;
+    *static_cast<std::uintptr_t*>(data) = info->dlpi_addr;
+    return 1;
+}
+
+// These offsets are unverified until the walk validates itself, so every
+// dereference goes through the fault-tolerant reader: a wrong offset yields
+// a failed read instead of taking the game down.
+template <typename T>
+bool peek(std::uintptr_t addr, T* out) {
+    if (addr < 0x1000) return false;
+    return safe_read(reinterpret_cast<const void*>(addr), out, sizeof(T));
+}
+
+// Bitmask is MSB-first within each byte, as bg3se's isOutParam does.
+int count_out_params(std::uintptr_t signature) {
+    std::uintptr_t bits = 0;
+    std::uint32_t bytes = 0;
+    if (!peek(signature + 0x18, &bits) || !peek(signature + 0x20, &bytes)) return -1;
+    if (bits == 0 || bytes == 0 || bytes > 64) return 0;
+
+    int total = 0;
+    for (std::uint32_t i = 0; i < bytes; ++i) {
+        std::uint8_t b = 0;
+        if (!peek(bits + i, &b)) return -1;
+        total += __builtin_popcount(b);
+    }
+    return total;
+}
+
+void visit_tree(std::uintptr_t node, std::unordered_map<std::string, int>* out,
+                int depth) {
+    if (node < 0x1000 || depth > 64) return;
+
+    std::uint8_t is_root = 0;
+    if (!peek(node + 0x19, &is_root) || is_root) return;
+
+    std::uintptr_t left = 0, right = 0, def = 0;
+    if (!peek(node + 0x00, &left) || !peek(node + 0x10, &right) ||
+        !peek(node + 0x38, &def)) {
+        return;
+    }
+
+    std::uintptr_t signature = 0;
+    if (def >= 0x1000 && peek(def + 0x18, &signature) && signature >= 0x1000) {
+        std::uintptr_t name_ptr = 0;
+        if (peek(signature + 0x08, &name_ptr) && name_ptr >= 0x1000) {
+            const int outs = count_out_params(signature);
+            char name[256];
+            if (outs >= 0 && safe_cstr(reinterpret_cast<const void*>(name_ptr), name,
+                                       sizeof(name))) {
+                (*out)[name] = outs;
+            }
+        }
+    }
+
+    visit_tree(left, out, depth + 1);
+    visit_tree(right, out, depth + 1);
+}
+
+}  // namespace
+
+std::size_t load_out_param_counts(std::vector<Function>* functions) {
+    std::uintptr_t base = 0;
+    ::dl_iterate_phdr(find_osiris, &base);
+    if (base == 0) {
+        logf("osiris: libOsiris.so not found; cannot read signatures");
+        return 0;
+    }
+
+    std::uintptr_t holder = 0;
+    if (!peek(base + kFunctionDbHolder, &holder) || holder < 0x1000) {
+        logf("osiris: function db holder unreadable");
+        return 0;
+    }
+
+    std::unordered_map<std::string, int> by_name;
+    for (std::size_t i = 0; i < kBuckets; ++i) {
+        std::uintptr_t header = 0;
+        if (!peek(holder + 0x10 + i * kSlotStride, &header) || header < 0x1000) continue;
+        std::uintptr_t root = 0;
+        if (!peek(header + 0x08, &root)) continue;  // header->Root is the real root
+        visit_tree(root, &by_name, 0);
+    }
+
+    std::size_t applied = 0;
+    for (Function& fn : *functions) {
+        auto it = by_name.find(fn.name);
+        if (it != by_name.end()) {
+            fn.out_params = it->second;
+            ++applied;
+        }
+    }
+    logf("osiris: signature walk found %zu entries, matched %zu of %zu functions",
+         by_name.size(), applied, functions->size());
+    return applied;
+}
 
 void set_handlers(void* call, void* query) {
     g_call = reinterpret_cast<Thunk6>(call);

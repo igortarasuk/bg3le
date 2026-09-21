@@ -25,8 +25,17 @@ struct Function {
     std::uint32_t id = 0;
     std::vector<std::uint8_t> params;
 
+    // Which trailing parameters the engine fills in. Known only once the
+    // signature database has been read; -1 until then, in which case the
+    // caller's argument count decides the split.
+    int out_params = -1;
+
     Kind kind() const { return static_cast<Kind>(id & 7); }
 };
+
+// Reads out-parameter counts from Osiris' own function database, keyed by
+// name. Returns the number recovered, or 0 if the walk failed.
+std::size_t load_out_param_counts(std::vector<Function>* functions);
 
 // A value crossing the boundary in either direction.
 struct Value {

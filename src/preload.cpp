@@ -404,6 +404,12 @@ void dump_osiris_api(void* self) {
         }
         bindable.push_back(std::move(fn));
     }
+    // Osiris knows which parameters are outputs; without this the split is
+    // inferred from how many arguments the caller passed.
+    const std::size_t typed = osi::load_out_param_counts(&bindable);
+    statusf("Signature walk: resolved out-params for %zu of %zu functions",
+            typed, bindable.size());
+
     lua_bind_osi(bindable);
 
     auto free_types = next<FreeMappings>("_ZN7COsiris16FreeTypeMappingsEP11MappingInfoj");
