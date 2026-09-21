@@ -409,6 +409,24 @@ extern "C" std::int32_t bg3le_replicate_component(void* container,
 extern "C" bool bg3le_container_is_server(void* container);
 extern "C" bool bg3le_game_allocator_ready();
 
+// The component field tables, from src/vendor/component_meta.cpp.
+extern "C" void const* bg3le_meta_component(const char* engineName);
+extern "C" std::size_t bg3le_meta_component_size(void const* handle);
+extern "C" bool bg3le_meta_field(void const* handle, const char* name,
+                                 std::uint32_t* offset, std::uint16_t* size,
+                                 std::uint8_t* kind, std::uint8_t* elemKind,
+                                 std::uint16_t* elemCount);
+extern "C" std::size_t bg3le_meta_fields(void const* handle, const char** names,
+                                         std::uint8_t* kinds,
+                                         std::size_t capacity);
+extern "C" std::size_t bg3le_meta_class_count();
+extern "C" std::size_t bg3le_meta_component_count();
+extern "C" const char* bg3le_meta_engine_class(void const* handle);
+extern "C" const char* bg3le_meta_short_name(void const* handle);
+extern "C" void* bg3le_entity_component(void* container, std::uint64_t handle,
+                                        std::uint16_t componentIndex,
+                                        std::size_t componentSize);
+
 // The container belonging to the server world.
 //
 // Both worlds come through the capture thunk and the order is not ours to
@@ -426,11 +444,355 @@ void* server_container() {
     return ecs::container();
 }
 
+// Accepts either name a component goes by and yields the engine's.
+//
+// bg3se describes 1,071 components and the symbol table has rather more, so a
+// name it has no metadata for is passed through unchanged. That keeps the raw
+// engine names working for the components bg3se has not mapped, which is the
+// only way to reach them at all.
+const char* engine_name_of(const char* name) {
+    void const* meta = bg3le_meta_component(name);
+    if (meta == nullptr) return name;
+    const char* engine = bg3le_meta_engine_class(meta);
+    return engine != nullptr ? engine : name;
+}
+
 // Resolves a component name to its engine index, trying the one-frame registry
 // as a fallback.
 std::optional<std::int32_t> component_index(const char* name) {
     if (auto i = ecs::index_of(ecs::Context::Component, name)) return i;
     return ecs::index_of(ecs::Context::OneFrameComponent, name);
+}
+
+// Generic component access, driven by bg3se's field tables rather than by a
+// hand-written accessor per component.
+//
+// The type decode stays here rather than in the bridge so that Lua and bg3se
+// remain in separate translation units: the bridge hands back a raw component
+// pointer, and the offset and kind come from the metadata.
+//
+// Mirrors bg3le::FieldKind in src/component_meta_abi.h.
+enum class FieldKind : std::uint8_t {
+    Unsupported = 0, Bool, Float, Double, Int8, Uint8, Int16, Uint16,
+    Int32, Uint32, Int64, Uint64, Guid, Entity, ScalarArray, Inherit,
+};
+
+const char* field_kind_name(FieldKind kind) {
+    switch (kind) {
+        case FieldKind::Bool: return "boolean";
+        case FieldKind::Float: return "float";
+        case FieldKind::Double: return "double";
+        case FieldKind::Int8: return "int8";
+        case FieldKind::Uint8: return "uint8";
+        case FieldKind::Int16: return "int16";
+        case FieldKind::Uint16: return "uint16";
+        case FieldKind::Int32: return "int32";
+        case FieldKind::Uint32: return "uint32";
+        case FieldKind::Int64: return "int64";
+        case FieldKind::Uint64: return "uint64";
+        case FieldKind::Guid: return "guid";
+        case FieldKind::Entity: return "entity";
+        case FieldKind::ScalarArray: return "array";
+        default: return "unsupported";
+    }
+}
+
+// The stride of a scalar kind, used to walk a fixed-extent array. Zero for
+// anything that is not a scalar, which stops an array of them being walked.
+std::size_t field_kind_size(FieldKind kind) {
+    switch (kind) {
+        case FieldKind::Bool: case FieldKind::Int8: case FieldKind::Uint8:
+            return 1;
+        case FieldKind::Int16: case FieldKind::Uint16:
+            return 2;
+        case FieldKind::Float: case FieldKind::Int32: case FieldKind::Uint32:
+            return 4;
+        case FieldKind::Double: case FieldKind::Int64: case FieldKind::Uint64:
+        case FieldKind::Entity:
+            return 8;
+        case FieldKind::Guid:
+            return 16;
+        default:
+            return 0;
+    }
+}
+
+// Resolves an entity's component to a live pointer, using the metadata's size
+// as the page stride and the symbol table's index as the type.
+// name may be either the engine name or bg3se's short name; the index is
+// always looked up under the engine name, which the metadata supplies.
+void* component_pointer(std::uint64_t handle, const char* name,
+                        void const** meta) {
+    *meta = bg3le_meta_component(name);
+    if (*meta == nullptr) return nullptr;
+
+    const char* engineName = bg3le_meta_engine_class(*meta);
+    if (engineName == nullptr) return nullptr;
+
+    const auto index = component_index(engineName);
+    if (!index.has_value()) return nullptr;
+
+    return bg3le_entity_component(server_container(), handle,
+                                  static_cast<std::uint16_t>(*index),
+                                  bg3le_meta_component_size(*meta));
+}
+
+// Pushes a field, read through safe_read so a stale handle yields nil rather
+// than a fault.
+bool push_field(lua_State* L, const void* address, FieldKind kind,
+                FieldKind elemKind = FieldKind::Unsupported,
+                std::uint16_t elemCount = 0) {
+    std::uint64_t raw = 0;
+    switch (kind) {
+        case FieldKind::ScalarArray: {
+            // One-based, as Lua tables are. The stride comes from the element
+            // kind, and a partial read fails the whole field rather than
+            // returning a short table.
+            const std::size_t stride = field_kind_size(elemKind);
+            if (stride == 0) return false;
+            lua_createtable(L, elemCount, 0);
+            for (std::uint16_t i = 0; i < elemCount; ++i) {
+                if (!push_field(L, (const char*)address + i * stride,
+                                elemKind)) {
+                    lua_pop(L, 1);
+                    return false;
+                }
+                lua_rawseti(L, -2, i + 1);
+            }
+            return true;
+        }
+        case FieldKind::Bool:
+            if (!safe_read(address, &raw, 1)) return false;
+            lua_pushboolean(L, (int)(raw & 0xff));
+            return true;
+        case FieldKind::Int8:
+            if (!safe_read(address, &raw, 1)) return false;
+            lua_pushinteger(L, (std::int8_t)raw);
+            return true;
+        case FieldKind::Uint8:
+            if (!safe_read(address, &raw, 1)) return false;
+            lua_pushinteger(L, (std::uint8_t)raw);
+            return true;
+        case FieldKind::Int16:
+            if (!safe_read(address, &raw, 2)) return false;
+            lua_pushinteger(L, (std::int16_t)raw);
+            return true;
+        case FieldKind::Uint16:
+            if (!safe_read(address, &raw, 2)) return false;
+            lua_pushinteger(L, (std::uint16_t)raw);
+            return true;
+        case FieldKind::Int32:
+            if (!safe_read(address, &raw, 4)) return false;
+            lua_pushinteger(L, (std::int32_t)raw);
+            return true;
+        case FieldKind::Uint32:
+            if (!safe_read(address, &raw, 4)) return false;
+            lua_pushinteger(L, (std::uint32_t)raw);
+            return true;
+        case FieldKind::Int64:
+        case FieldKind::Entity:
+            if (!safe_read(address, &raw, 8)) return false;
+            lua_pushinteger(L, (lua_Integer)(std::int64_t)raw);
+            return true;
+        case FieldKind::Uint64:
+            if (!safe_read(address, &raw, 8)) return false;
+            lua_pushinteger(L, (lua_Integer)raw);
+            return true;
+        case FieldKind::Float: {
+            float f = 0;
+            if (!safe_read(address, &f, 4)) return false;
+            lua_pushnumber(L, f);
+            return true;
+        }
+        case FieldKind::Double: {
+            double d = 0;
+            if (!safe_read(address, &d, 8)) return false;
+            lua_pushnumber(L, d);
+            return true;
+        }
+        case FieldKind::Guid: {
+            // The engine stores a GUID as two little-endian words; the text
+            // form is the usual 8-4-4-4-12 grouping of those bytes.
+            std::uint8_t b[16];
+            if (!safe_read(address, b, sizeof(b))) return false;
+            char text[37];
+            std::snprintf(text, sizeof(text),
+                          "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+                          "%02x%02x%02x%02x%02x%02x",
+                          b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6],
+                          b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+            lua_pushstring(L, text);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+// Writes a field. Narrower than the read side on purpose: only the numeric
+// and boolean kinds, because writing a GUID or an entity handle by value is
+// not something a mod should be doing by accident.
+bool write_field(lua_State* L, int index, void* address, FieldKind kind,
+                 FieldKind elemKind = FieldKind::Unsupported,
+                 std::uint16_t elemCount = 0) {
+    switch (kind) {
+        case FieldKind::ScalarArray: {
+            const std::size_t stride = field_kind_size(elemKind);
+            if (stride == 0 || !lua_istable(L, index)) return false;
+            // Written element-wise so a short table leaves the rest alone
+            // rather than zeroing it.
+            for (std::uint16_t i = 0; i < elemCount; ++i) {
+                lua_rawgeti(L, index, i + 1);
+                if (!lua_isnil(L, -1)) {
+                    if (!write_field(L, lua_gettop(L),
+                                     (char*)address + i * stride, elemKind)) {
+                        lua_pop(L, 1);
+                        return false;
+                    }
+                }
+                lua_pop(L, 1);
+            }
+            return true;
+        }
+        case FieldKind::Bool: {
+            const std::uint8_t v = lua_toboolean(L, index) != 0 ? 1 : 0;
+            std::memcpy(address, &v, 1);
+            return true;
+        }
+        case FieldKind::Int8: case FieldKind::Uint8: {
+            const auto v = (std::uint8_t)luaL_checkinteger(L, index);
+            std::memcpy(address, &v, 1);
+            return true;
+        }
+        case FieldKind::Int16: case FieldKind::Uint16: {
+            const auto v = (std::uint16_t)luaL_checkinteger(L, index);
+            std::memcpy(address, &v, 2);
+            return true;
+        }
+        case FieldKind::Int32: case FieldKind::Uint32: {
+            const auto v = (std::uint32_t)luaL_checkinteger(L, index);
+            std::memcpy(address, &v, 4);
+            return true;
+        }
+        case FieldKind::Int64: case FieldKind::Uint64: {
+            const auto v = (std::uint64_t)luaL_checkinteger(L, index);
+            std::memcpy(address, &v, 8);
+            return true;
+        }
+        case FieldKind::Float: {
+            const auto v = (float)luaL_checknumber(L, index);
+            std::memcpy(address, &v, 4);
+            return true;
+        }
+        case FieldKind::Double: {
+            const double v = luaL_checknumber(L, index);
+            std::memcpy(address, &v, 8);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+// Ext._Internal.GetField(handle, engineName, fieldName)
+int l_get_field(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
+    const char* engineName = luaL_checkstring(L, 2);
+    const char* fieldName = luaL_checkstring(L, 3);
+
+    void const* meta = nullptr;
+    void* component = component_pointer(handle, engineName, &meta);
+    if (meta == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "no field metadata for %s", engineName);
+        return 2;
+    }
+    if (component == nullptr) {
+        lua_pushnil(L);
+        return 1;  // the entity simply does not have this component
+    }
+
+    std::uint32_t offset = 0;
+    std::uint16_t size = 0;
+    std::uint8_t kind = 0;
+    std::uint8_t elemKind = 0;
+    std::uint16_t elemCount = 0;
+    if (!bg3le_meta_field(meta, fieldName, &offset, &size, &kind, &elemKind,
+                          &elemCount)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s has no field %s", engineName, fieldName);
+        return 2;
+    }
+
+    if (!push_field(L, (const char*)component + offset, (FieldKind)kind,
+                    (FieldKind)elemKind, elemCount)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s is of an unsupported kind (%s)", engineName,
+                        fieldName, field_kind_name((FieldKind)kind));
+        return 2;
+    }
+    return 1;
+}
+
+// Ext._Internal.SetField(handle, engineName, fieldName, value)
+int l_set_field(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
+    const char* engineName = luaL_checkstring(L, 2);
+    const char* fieldName = luaL_checkstring(L, 3);
+
+    void const* meta = nullptr;
+    void* component = component_pointer(handle, engineName, &meta);
+    if (meta == nullptr || component == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s is not available on this entity", engineName);
+        return 2;
+    }
+
+    std::uint32_t offset = 0;
+    std::uint16_t size = 0;
+    std::uint8_t kind = 0;
+    std::uint8_t elemKind = 0;
+    std::uint16_t elemCount = 0;
+    if (!bg3le_meta_field(meta, fieldName, &offset, &size, &kind, &elemKind,
+                          &elemCount)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s has no field %s", engineName, fieldName);
+        return 2;
+    }
+
+    if (!write_field(L, 4, (char*)component + offset, (FieldKind)kind,
+                     (FieldKind)elemKind, elemCount)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s is not writable (%s)", engineName, fieldName,
+                        field_kind_name((FieldKind)kind));
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+// Ext._Internal.ComponentFields(engineName) -> { name = kind, ... }
+int l_component_fields(lua_State* L) {
+    const char* engineName = luaL_checkstring(L, 1);
+    void const* meta = bg3le_meta_component(engineName);
+    if (meta == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "no field metadata for %s", engineName);
+        return 2;
+    }
+
+    constexpr std::size_t kMax = 512;
+    const char* names[kMax];
+    std::uint8_t kinds[kMax];
+    const std::size_t n = bg3le_meta_fields(meta, names, kinds, kMax);
+
+    lua_newtable(L);
+    for (std::size_t i = 0; i < n; ++i) {
+        lua_pushstring(L, field_kind_name((FieldKind)kinds[i]));
+        lua_setfield(L, -2, names[i]);
+    }
+    lua_pushinteger(L, (lua_Integer)bg3le_meta_component_size(meta));
+    return 2;
 }
 
 // Ext.Entity primitives. The Lua-visible object model is assembled in the
@@ -468,7 +830,7 @@ int l_entity_set_health(lua_State* L) {
 
 int l_entity_mark_changed(lua_State* L) {
     const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
-    const char* name = luaL_checkstring(L, 2);
+    const char* name = engine_name_of(luaL_checkstring(L, 2));
     const auto index = component_index(name);
     if (!index.has_value()) {
         lua_pushboolean(L, 0);
@@ -486,7 +848,7 @@ int l_entity_mark_changed(lua_State* L) {
 // matching pool is what sends the value to the client.
 int l_entity_replicate(lua_State* L) {
     const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
-    const char* name = luaL_checkstring(L, 2);
+    const char* name = engine_name_of(luaL_checkstring(L, 2));
 
     const auto index = ecs::index_of(ecs::Context::Replication, name);
     if (!index.has_value()) {
@@ -570,7 +932,7 @@ int l_world_probe(lua_State* L) {
 // missing component as nil rather than as an error.
 int l_entity_has_component(lua_State* L) {
     const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
-    const char* name = luaL_checkstring(L, 2);
+    const char* name = engine_name_of(luaL_checkstring(L, 2));
     const auto index = component_index(name);
     if (!index.has_value()) {
         lua_pushboolean(L, 0);
@@ -818,6 +1180,12 @@ void lua_init() {
     lua_setfield(g_lua, -2, "Replicate");
     lua_pushcfunction(g_lua, l_world_probe);
     lua_setfield(g_lua, -2, "WorldProbe");
+    lua_pushcfunction(g_lua, l_get_field);
+    lua_setfield(g_lua, -2, "GetField");
+    lua_pushcfunction(g_lua, l_set_field);
+    lua_setfield(g_lua, -2, "SetField");
+    lua_pushcfunction(g_lua, l_component_fields);
+    lua_setfield(g_lua, -2, "ComponentFields");
     lua_pushcfunction(g_lua, l_entity_has_component);
     lua_setfield(g_lua, -2, "HasComponent");
     lua_setfield(g_lua, -2, "_Internal");
@@ -1013,70 +1381,68 @@ function Ext._Internal.RunTimers()
   end
 end
 
+
 -- ---- Ext.Entity ----
 --
--- Property access over the ECS primitives in Ext._Internal. Only the
--- components bg3le can reach typed accessors for are exposed; anything else
--- reports itself rather than returning a silently empty table, because a mod
--- guarding on "if not entity.Foo then return end" would otherwise skip work
--- and look like it succeeded.
-local component_proxies = {}
+-- Components are reached through bg3se's own field metadata rather than
+-- through an accessor written per component, so every component it describes
+-- is available by name with nothing listed here. Either name works: bg3se's
+-- short one (entity.Health) or the engine's (entity["eoc::HealthComponent"]).
+--
+-- Reads and writes go straight to the component in place, so a value is never
+-- stale and a write is visible to the next read. The proxy holds only the
+-- handle, the name and the field table.
+--
+-- Naming a field that does not exist raises rather than reading as nil, and so
+-- does one whose kind bg3le cannot convert yet. A mod guarding on
+-- "if not entity.Foo.Bar then return end" would otherwise skip work and look
+-- as though it had succeeded. Ext._Internal.ComponentFields(name) reports what
+-- a component offers and the kind of each field.
 
-component_proxies.Health = {
-  fields = {Hp = true, MaxHp = true},
-  read = function(handle)
-    local hp, maxHp = Ext._Internal.GetHealth(handle)
-    if hp == nil then return nil end
-    return {Hp = hp, MaxHp = maxHp}
-  end,
-  write = function(handle, key, value)
-    if key ~= "Hp" and key ~= "MaxHp" then
-      error("Health." .. tostring(key) .. " is not writable yet", 0)
-    end
-    Ext._Internal.SetHealth(handle, value, key == "MaxHp")
-  end,
-}
-
-local function make_component(handle, name, proxy)
-  local values = proxy.read(handle)
-  if values == nil then return nil end
+local function make_component(handle, name, fields)
   return setmetatable({}, {
-    __index = function(_, key) return values[key] end,
-    __newindex = function(_, key, value)
-      proxy.write(handle, key, value)
-      values[key] = value
+    __index = function(_, key)
+      if fields[key] == nil then
+        error("bg3le: " .. name .. " has no field " .. tostring(key), 0)
+      end
+      local value, err = Ext._Internal.GetField(handle, name, key)
+      if value == nil and err ~= nil then error("bg3le: " .. err, 0) end
+      return value
     end,
-    __pairs = function() return pairs(values) end,
+    __newindex = function(_, key, value)
+      local ok, err = Ext._Internal.SetField(handle, name, key, value)
+      if not ok then error("bg3le: " .. tostring(err), 0) end
+    end,
+    -- Iterating yields field names and their kinds, which is what is knowable
+    -- without reading every field.
+    __pairs = function() return pairs(fields) end,
   })
+end
+
+-- nil if bg3se has no metadata for the name, or if this entity does not carry
+-- the component. Those are different answers, but both mean "not available
+-- here", which is what a script branches on.
+local function get_component(handle, name)
+  local fields = Ext._Internal.ComponentFields(name)
+  if fields == nil then return nil end
+  if not Ext._Internal.HasComponent(handle, name) then return nil end
+  return make_component(handle, name, fields)
 end
 
 local entity_methods = {}
 
 function entity_methods:GetComponent(name)
-  local proxy = component_proxies[name]
-  if proxy == nil then
-    if Ext._Internal.HasComponent(self.Handle, "eoc::" .. name .. "Component") then
-      error("bg3le: the " .. name .. " component exists on this entity but is "
-            .. "not exposed yet; only Health is", 0)
-    end
-    return nil
-  end
-  return make_component(self.Handle, name, proxy)
+  return get_component(self.Handle, name)
 end
 
 -- Marking the component changed is what the server acts on; setting the
 -- replication flags is what reaches the client. Both are needed for a write
 -- to show up in the UI.
 function entity_methods:Replicate(name)
-  local mapped = ({Health = "eoc::HealthComponent"})[name]
-  if mapped == nil then
-    error("bg3le: Replicate does not know the " .. tostring(name)
-          .. " component yet", 0)
+  if not Ext._Internal.MarkChanged(self.Handle, name) then
+    error("bg3le: could not mark " .. tostring(name) .. " as changed", 0)
   end
-  if not Ext._Internal.MarkChanged(self.Handle, mapped) then
-    error("bg3le: could not mark " .. name .. " as changed", 0)
-  end
-  local ok, err = Ext._Internal.Replicate(self.Handle, mapped)
+  local ok, err = Ext._Internal.Replicate(self.Handle, name)
   if not ok then error("bg3le: " .. tostring(err), 0) end
   return true
 end
@@ -1085,14 +1451,7 @@ local entity_meta = {
   __index = function(entity, key)
     local method = entity_methods[key]
     if method ~= nil then return method end
-    if key == "Uuid" then
-      return entity.EntityUuid and {EntityUuid = entity.EntityUuid} or nil
-    end
-    local proxy = component_proxies[key]
-    if proxy ~= nil then
-      return make_component(rawget(entity, "Handle"), key, proxy)
-    end
-    return nil
+    return get_component(rawget(entity, "Handle"), key)
   end,
 }
 
@@ -1115,7 +1474,10 @@ function Ext.Entity.Get(id)
                       entity_meta)
 end
 
-function Ext.Entity.HandleToUuid(handle) return nil end
+function Ext.Entity.HandleToUuid(handle)
+  return Ext._Internal.GetField(handle, "Uuid", "EntityUuid")
+end
+
 function Ext.Entity.UuidToHandle(uuid) return Ext._Internal.UuidToHandle(uuid) end
 
 -- ---- mod loading ----
