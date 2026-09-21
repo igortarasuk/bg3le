@@ -1,0 +1,510 @@
+#pragma once
+
+#include <GameDefinitions/Base/Base.h>
+#include <GameDefinitions/Camera.h>
+#include <GameDefinitions/EntitySystem.h>
+
+BEGIN_SE()
+
+struct CameraGlobalSwitches
+{
+    float MoveOnTerrainSpeed;
+    float MoveOnTerrainSpringForce;
+    float MoveSpeed;
+    float TargetFallSpeed;
+    float TargetFollowSpeed;
+    float TargetFollowSpringForce;
+    float TargetIsFallingHeight;
+    float TargetMinimumHeight;
+    float TargetSnapDistance;
+    float ControllerDistanceDefault;
+    float DefaultDistanceMax;
+    float DefaultDistanceMin;
+    float ControllerDistanceMax;
+    float ControllerDistanceMin;
+    float ControllerCursorFallSpeed;
+    float ControllerCursorHeightStickRadius;
+    float ControllerCursorLeaveTacticalZoomDistance;
+    float ControllerCursorMaxHeight;
+    float ControllerCursorPitchSpeed;
+    float ControllerCursorToTacticalTimeout;
+    float ControllerPushToTacticalMaxZoomThreshold;
+    float DefaultDistance;
+    float MultiCameraDistanceMax;
+    float MultiCameraDistanceMin;
+    float MultiCameraDistanceDefault;
+    glm::vec3 DefaultTargetHeightMod;
+    glm::vec3 ControllerTargetHeightMod;
+    float DefaultSpeed;
+    float ControllerSpeed;
+    float MinZoomDefaultFoV;
+    float MaxZoomDefaultFoV;
+    float MinZoomControllerFoV;
+    float MaxZoomControllerFoV;
+    float CamAvoidRaycastOffsetMultiplier;
+    float CamAvoidRaycastOffsetMultiplierPanning;
+    float CamAvoidInterpolationSpeed;
+    float CamAvoidInterpolationSpeedPanning;
+    float CamAvoidSpringForce;
+    float CamAvoidSpringForcePanning;
+    float ZoomSnapDistance;
+    float ZoomSpringForce;
+    float WidthBoundOffset;
+    float HeightBoundOffset;
+    float EdgePanSpeed;
+    float EdgePanZoneWidth;
+    float TacticalDistanceDefault;
+    float TacticalDistanceMin;
+    float TacticalDistanceMax;
+    float TacticalFOV;
+    float MaxDistFromChar;
+    float SlowDownDist;
+    float OverheightAllowed;
+    float ArmSweepRadius;
+    float AudioZoomMin;
+    float AudioZoomMax;
+    float DirectionChangeSpeed;
+    float PitchSpeed;
+    float ArmCollidingPitchSpeed;
+    float FoVChangeSpeed;
+    float FollowTargetRotateSpeed;
+    bool AutoFollowEnabled;
+    float AutoFollowTimeout;
+    float AutoFollowIdleTimeout;
+    float AutoFollowPanningExtraTimeout;
+    float AutoFollowDistance;
+    float AutoFollowScreenPart;
+    float AutoFollowTransitionSpeed;
+    float MoveTimeout;
+    float PlayerInterventionTimeout;
+    float AngleThreshold;
+    float PowCoef;
+    float AutoRotationSpeedMin;
+    float AutoRotationSpeedMax;
+    int32_t EnableAutoRotation;
+    float CollisionSpeed;
+    float CollisionMinDistance;
+    float MoveCollisionRadius;
+    float MoveCollisionRadiusOnSlider;
+    float CollisionMaxPitch;
+    float CollisionPitchStepSize;
+    int32_t CollisionPitchSearchSteps;
+    bool RaycastAvoidance;
+    float RotateAboutTargetMaxDistance;
+    float RotateAboutTargetLineMinCollision;
+    float DirectionDefault;
+    float DirectionZoomed;
+    float DirectionCombatDefault;
+    float DirectionCombatZoomed;
+    float DirectionTacticalDefault;
+    float DirectionTacticalZoomed;
+    float DirectionControllerDefault;
+    float DirectionControllerZoomed;
+    bool AutoSwitchEnabled;
+    float AutoSwitchFromFollowDistanceCoef;
+    float AutoSwitchFromFreeDistanceCoe;
+    float UpperBound;
+    float LowerBound;
+};
+
+END_SE()
+
+BEGIN_NS(rf)
+
+struct Camera
+{
+    float field_0;
+    glm::vec3 field_4;
+    glm::mat4 ViewMatrix;
+    glm::mat4 InvViewMatrix;
+    glm::mat4 ProjectionMatrix;
+    glm::mat4 InvProjectionMatrix;
+    //glm::mat4 GetViewProjectionMatrix;
+    //glm::mat4 GetOffsetViewProjectionMatrix;
+    std::array<glm::vec4, 10> CullingPlanes;
+};
+
+struct CameraController : public ProtectedGameObject<CameraController>
+{
+    virtual ~CameraController() = 0;
+    virtual bool Enter() = 0;
+    virtual bool Exit() = 0;
+    virtual float GetFov() = 0;
+    virtual float GetAspectRatio() = 0;
+    virtual void Update(GameTime const&) = 0;
+    virtual bool DoLookAt(glm::vec3 const&, glm::vec3 const&, bool) = 0;
+    virtual bool EditorLookAt(glm::vec3 const&) = 0;
+    virtual void EditorZoomExtents(glm::vec3 const&, float) = 0;
+    virtual glm::vec3 const& GetWorldTranslate() const = 0;
+    virtual void SetWorldTranslate(glm::vec3 const&) = 0;
+    virtual glm::quat const& GetWorldRotate() const = 0;
+    virtual void SetWorldRotate(glm::quat const&) = 0;
+    virtual Transform const& GetWorldTransform() const = 0;
+    virtual void SetWorldTransform(Transform const&) = 0;
+    virtual void WarpMouse(bool) = 0;
+    virtual void ClearInputState() = 0;
+    virtual uint16_t* OnInputEvent(uint16_t* eventRetVal, void* inputEvent) = 0;
+    virtual void StopMotion() = 0;
+    virtual bool SetOrientation(float, float) = 0;
+    virtual void SetMoveSpeed(float) = 0;
+    virtual void SetLookAtShake(float, float) = 0;
+    virtual void SetWobble(float, float) = 0;
+    virtual glm::vec3 GetDistance_M() = 0;
+
+    [[bg3::hidden]] __int64 field_8;
+    bool ViewDirty;
+    bool ProjectionDirty;
+    bool IsOrthographic;
+    bool OffCenter;
+    float FOV;
+    float NearPlane;
+    float FarPlane;
+    float AspectRatio;
+    Transform WorldTransform;
+    glm::vec3 LookAt;
+    glm::vec3 field_58;
+    float OrthoLeft;
+    float OrthoRight;
+    float OrthoBottom;
+    float OrthoTop;
+    FixedString ID;
+    [[bg3::hidden]] __int64 field_78;
+    Camera Camera;
+    std::array<glm::vec3, 8> FrustumPoints;
+};
+
+END_NS()
+
+BEGIN_SE()
+
+struct CameraComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(Camera, "ls::CameraComponent")
+
+    uint32_t MasterBehaviorType;
+    rf::CameraController* Controller;
+    int ExposureSettingIndex;
+    bool Active;
+    bool AcceptsInput;
+    bool UseCameraPPSettings;
+    bool UseSplitScreenFov;
+    PostProcessCameraSetting PostProcess;
+};
+
+
+struct DefaultCameraBehavior : public BaseComponent
+{
+    DEFINE_COMPONENT(DefaultCameraBehavior, "ls::DefaultCameraBehavior")
+
+    float field_0;
+    float Left;
+    float Forward;
+    float RotationX;
+    float RotationY;
+    float Zoom;
+    bool CaptureInput;
+    [[bg3::legacy(field_19)]] bool LockMovement;
+    [[bg3::legacy(field_1A)]] bool LockScroll;
+};
+
+struct EffectCameraBehavior : public BaseComponent
+{
+    DEFINE_COMPONENT(EffectCameraBehavior, "ls::EffectCameraBehavior")
+
+    [[bg3::legacy(field_0)]] glm::vec3 LookAtShake;
+};
+
+END_SE()
+
+BEGIN_NS(ecl)
+
+struct GameCameraBehavior : public BaseComponent
+{
+    DEFINE_COMPONENT(GameCameraBehavior, "ecl::GameCameraBehavior")
+
+    EntityHandle Trigger;
+    EntityHandle Target;
+    bool TargetFalling;
+    bool field_11;
+    bool MovingToTarget;
+    [[bg3::legacy(field_13)]] bool BlockPanning;
+    [[bg3::legacy(field_14)]] float ControllerHeight;
+    glm::vec3 TargetPreviousDestination;
+    glm::vec3 TargetDestination;
+    [[bg3::legacy(field_30)]] glm::vec3 TargetDestinationHigh;
+    [[bg3::legacy(field_3C)]] glm::vec3 TargetCurrentLow;
+    glm::vec3 TargetCurrent;
+    float Distance;
+    [[bg3::legacy(field_58)]] float DistanceCurrent;
+    [[bg3::legacy(field_5C)]] float DistanceDestination;
+    [[bg3::legacy(field_60)]] float DistanceBeforeLock;
+    [[bg3::legacy(field_64)]] float ArmCollisionDistance;
+    [[bg3::legacy(field_68)]] float ArmCollisionDistanceCur;
+    float MovementDistanceMax;
+    glm::vec3 Direction;
+    glm::vec3 DirectionDestination;
+    [[bg3::legacy(field_88)]] glm::vec3 AvoidanceDirection;
+    glm::vec2 SpeedXZ;
+    float XRotationSpeed;
+    float XRotationSpeedMouse;
+    float ZoomSpeed;
+    uint8_t CameraMode;
+    uint8_t field_A9;
+    float RotationY;
+    std::optional<glm::vec3> RotationTarget;
+    float MouseRotationSpeed;
+    glm::vec3 TargetLastPosition;
+    [[bg3::legacy(field_D0)]] glm::vec2 RotateDestination;
+    [[bg3::legacy(field_D8)]] float ActionTimer;
+    [[bg3::legacy(field_DC)]] float MoveTimer;
+    [[bg3::legacy(field_E0)]] float FollowTimer;
+    [[bg3::legacy(field_E4)]] float FollowIdleTimer;
+    [[bg3::legacy(field_E8)]] float FollowTransitionTimer;
+    std::optional<EntityHandle> FollowTarget;
+    [[bg3::hidden]] void* Trigger1;
+    int Trigger1ID;
+    [[bg3::hidden]] void* Trigger2;
+    int Trigger2ID;
+    [[bg3::hidden]] void* Trigger3;
+    int Trigger3ID;
+    Array<EntityHandle> Targets;
+    float LastPlayerInputTime;
+    bool PlayerInControl;
+    bool field_145;
+    bool IsPaused;
+    uint32_t TargetMode;
+    bool SelectMode;
+    bool WasInSelectMode;
+    [[bg3::legacy(field_150)]] glm::vec3 Ghost;
+    [[bg3::legacy(field_15C)]] float GhostDistance;
+    float Zoom;
+    float PitchDegrees;
+    std::optional<bool> TacticalMode;
+    std::optional<float> TacticalTimeout;
+    Array<EntityHandle> EffectEntities;
+    [[bg3::legacy(field_188)]] bool ResetRotation;
+    bool FreezeHeight;
+    bool field_18A;
+    bool field_18B;
+    [[bg3::hidden]] HashMap<EntityHandle, void*> field_190__EH_CameraCollisionDebugInfo;
+    glm::vec3 DebugPosition;
+    float DebugOffset;
+    [[bg3::legacy(field_1E0)]] std::optional<float> AvoidanceAngle;
+    EntityHandle TrackTarget;
+    bool IsMoving;
+    bool IsRotating;
+    [[bg3::legacy(field_1F2)]] bool AtLeashLimit;
+    bool IsSnapping;
+    EntityHandle LastPickingTarget;
+    uint8_t field_200;
+    HashSet<int16_t> field_208;
+    std::optional<glm::vec3> field_238;
+    std::optional<glm::vec3> field_248;
+};
+
+END_NS()
+
+BEGIN_NS(ecl::camera)
+
+struct SelectorModeComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(CameraSelectorMode, "ecl::camera::SelectorModeComponent")
+
+    uint8_t Mode;
+};
+
+struct Target
+{
+    Array<EntityHandle> Targets;
+    bool SetPlayerTargets{ false };
+    glm::vec3 Position{ .0f };
+    float Distance{ false };
+    float CameraDistance{ false };
+    uint8_t TargetMode{ 1 };
+    bool ZoomToDistance{ false };
+    bool SetCameraDistance{ false };
+    bool TrackingSwarm{ false };
+    uint8_t Flags{ 0 };
+    bool ClearTargets{ false };
+};
+
+struct TargetComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(CameraTarget, "ecl::camera::TargetComponent")
+
+    Target Target;
+};
+
+struct CombatTargetComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(CameraCombatTarget, "ecl::camera::CombatTargetComponent")
+
+    Target Target;
+};
+
+struct TemporaryAdditionalFocusTarget
+{
+    EntityHandle Entity;
+    float Lifetime{ .0f };
+    glm::vec3 Position{ .0f };
+    bool Active{ false };
+};
+
+struct TargetRequest
+{
+    TargetRequestType Type;
+    EntityHandle Target;
+    Array<EntityHandle> Targets;
+    glm::vec3 Position{ .0f };
+    float FallbackTimer{ .0f };
+    float field_30{ .0f };
+    float CameraDistance{ .0f };
+    bool RestorePosition{ false };
+    bool Active{ false };
+    uint8_t field_3A{ 0 };
+    uint32_t field_3C{ 0 };
+    Array<TemporaryAdditionalFocusTarget> FocusTargets;
+};
+
+
+struct CombatTargetRequestsComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(CameraCombatTargetRequests, "ecl::camera::CombatTargetRequestsComponent")
+
+    Array<TargetRequest> Requests;
+};
+
+struct PhotoModeCameraTransformRequestsSingletonComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(PhotoModeCameraTransformRequests, "ecl::camera::PhotoModeCameraTransformRequestsSingletonComponent")
+
+    HashMap<EntityHandle, Transform> SetTransform;
+};
+
+struct PhotoModeCameraBehaviorComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(PhotoModeCameraBehavior, "ecl::camera::PhotoModeCameraBehaviorComponent")
+
+    uint8_t PhotoModeSession;
+    FixedString CameraControllerId;
+};
+
+struct ClearScreenFadeData
+{
+    Guid FadeId;
+    float FadeSpeed;
+    float FadeTime;
+    uint8_t field_18;
+    int field_1C;
+};
+
+struct ScreenFadeCreationData
+{
+    Guid FadeId;
+    int field_10;
+    int field_14;
+    int field_18;
+    int field_1C;
+};
+
+
+struct ClearScreenFadeRequestManualOneFrameComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(CameraClearScreenFadeRequestManual, "ecl::camera::ClearScreenFadeRequestManualOneFrameComponent")
+
+    Array<ClearScreenFadeData> Requests;
+};
+
+struct PhotoModeExitScreenFadeClearRequestsSingletonComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(PhotoModeExitScreenFadeClearRequests, "ecl::camera::PhotoModeExitScreenFadeClearRequestsSingletonComponent")
+
+    Array<ClearScreenFadeData> Requests;
+};
+
+struct PhotoModeExitScreenFadeCreateRequestsSingletonComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(PhotoModeExitScreenFadeCreateRequests, "ecl::camera::PhotoModeExitScreenFadeCreateRequestsSingletonComponent")
+
+    HashMap<int16_t, ScreenFadeCreationData> Requests;
+};
+
+struct ScreenFadeToRequestManualOneFrameComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(CameraScreenFadeToRequestManual, "ecl::camera::ScreenFadeToRequestManualOneFrameComponent")
+
+    HashMap<int16_t, ScreenFadeCreationData> Requests;
+};
+
+struct PlatformTargetComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(CameraPlatformTarget, "ecl::camera::PlatformTargetComponent")
+
+    uint64_t TargetData0;
+    uint64_t TargetData1;
+};
+
+struct ArriveWatcherComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(CameraArriveWatcher, "ecl::camera::ArriveWatcherComponent")
+
+    int16_t Peer;
+};
+
+struct CameraModeTrackerSingletonComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(CameraModeTracker, "ecl::camera::CameraModeTrackerSingletonComponent")
+
+    HashMap<EntityHandle, uint8_t> Modes;
+};
+
+struct EnterPhotoModeRequest
+{
+    EntityHandle Player;
+    uint8_t PhotoModeSession;
+    FixedString CameraControllerId;
+};
+
+struct EnterPhotoModeRequestSingletonComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(PhotoModeCameraEnterRequests, "ecl::camera::EnterPhotoModeRequestSingletonComponent")
+
+    Array<EnterPhotoModeRequest> Requests;
+};
+
+struct PhotoModeDestructionRequestsSingletonComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(PhotoModeCameraDestructionRequests, "ecl::camera::PhotoModeDestructionRequestsSingletonComponent")
+
+    HashSet<EntityHandle> Requests;
+};
+
+struct PhotoModeCameraOriginalTransformComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(PhotoModeCameraOriginalTransform, "ecl::camera::PhotoModeCameraOriginalTransformComponent")
+
+    Transform Transform;
+};
+
+struct PhotoModeCameraInputComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(PhotoModeCameraInput, "ecl::camera::PhotoModeCameraInputComponent")
+
+    bool Active;
+    float LeftRight;
+    float HeightIncDec;
+    float ForwardBackward;
+    uint8_t field_10;
+    float MouseRotateLeftRight;
+    float MouseRotateUpDown;
+    float RotateLeftRight;
+    float RotateUpDown;
+    float TiltLeftRight;
+};
+
+
+DEFINE_TAG_COMPONENT(ecl::camera, IsInSelectorModeComponent, CameraInSelectorMode)
+DEFINE_TAG_COMPONENT(ecl::camera, IsInSelectorWhileInactiveComponent, CameraInSelectorWhileInactive)
+DEFINE_TAG_COMPONENT(ecl::camera, SpellTrackingComponent, CameraSpellTracking)
+
+END_NS()

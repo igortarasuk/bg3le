@@ -1,0 +1,1211 @@
+#pragma once
+
+#include <GameDefinitions/Base/Base.h>
+#include <GameDefinitions/AllSparkShared.h>
+#include <GameDefinitions/Camera.h>
+#include <GameDefinitions/MaterialParameters.h>
+
+BEGIN_SE()
+
+#define FOR_EACH_NONGUID_RESOURCE_TYPE() \
+    FOR_RESOURCE_TYPE(Visual) \
+    FOR_RESOURCE_TYPE(VisualSet) \
+    FOR_RESOURCE_TYPE(Animation) \
+    FOR_RESOURCE_TYPE(AnimationSet) \
+    FOR_RESOURCE_TYPE(Texture) \
+    FOR_RESOURCE_TYPE(Material) \
+    FOR_RESOURCE_TYPE(Physics) \
+    FOR_RESOURCE_TYPE(Effect) \
+    FOR_RESOURCE_TYPE(Script) \
+    FOR_RESOURCE_TYPE(Sound) \
+    FOR_RESOURCE_TYPE(Lighting) \
+    FOR_RESOURCE_TYPE(Atmosphere) \
+    FOR_RESOURCE_TYPE(AnimationBlueprint) \
+    FOR_RESOURCE_TYPE(MeshProxy) \
+    FOR_RESOURCE_TYPE(MaterialSet) \
+    FOR_RESOURCE_TYPE(BlendSpace) \
+    FOR_RESOURCE_TYPE(FCurve) \
+    FOR_RESOURCE_TYPE(Timeline) \
+    FOR_RESOURCE_TYPE(Dialog) \
+    FOR_RESOURCE_TYPE(VoiceBark) \
+    FOR_RESOURCE_TYPE(TileSet) \
+    FOR_RESOURCE_TYPE(IKRig) \
+    FOR_RESOURCE_TYPE(Skeleton) \
+    FOR_RESOURCE_TYPE(VirtualTexture) \
+    FOR_RESOURCE_TYPE(TerrainBrush) \
+    FOR_RESOURCE_TYPE(ColorList) \
+    FOR_RESOURCE_TYPE(CharacterVisual) \
+    FOR_RESOURCE_TYPE(MaterialPreset) \
+    FOR_RESOURCE_TYPE(SkinPreset) \
+    FOR_RESOURCE_TYPE(ClothCollider) \
+    FOR_RESOURCE_TYPE(DiffusionProfile) \
+    FOR_RESOURCE_TYPE(LightCookie) \
+    FOR_RESOURCE_TYPE(TimelineScene) \
+    FOR_RESOURCE_TYPE(SkeletonMirrorTable)
+
+struct TextureLayerConfigId
+{
+    uint32_t TextureLayerConfig;
+    uint8_t Flag;
+
+    inline bool operator == (TextureLayerConfigId const& o) const
+    {
+        return o.TextureLayerConfig == TextureLayerConfig
+            && o.Flag == Flag;
+    }
+};
+
+inline constexpr uint64_t Hash(TextureLayerConfigId const& v)
+{
+    return v.Flag ^ (v.TextureLayerConfig * 397);
+}
+
+struct [[bg3::hidden]] VirtualTextureManagerBase : public ProtectedGameObject<VirtualTextureManagerBase>
+{
+    struct [[bg3::hidden]] GTSInfo
+    {
+        int32_t GTSHandle;
+        int32_t RefCount;
+    };
+
+    struct [[bg3::hidden]] LayerConfig
+    {
+        uint64_t A;
+        uint64_t B;
+        uint64_t C;
+    };
+
+    virtual ~VirtualTextureManagerBase() = 0;
+    virtual void MakePackedTilesResident(void*, int, int, int) = 0;
+    virtual void MakePackedTilesResident2(void*, int) = 0;
+    virtual void Update() = 0;
+    virtual void UpdateGraniteDevice() = 0;
+    virtual void BeginFrame() = 0;
+    virtual void VMT_30() = 0;
+    virtual bool Init() = 0;
+    virtual void* KeepWarm(int32_t gtsHandle, FixedString const& gtexFileName, uint8_t r9_0) = 0;
+    virtual bool Cooldown(int32_t gtsHandle, void* graphineTexture) = 0;
+    virtual void FillTextureMap(void*, void*) = 0;
+    virtual bool IsPartialUpdate() = 0;
+    virtual void VMT_60() = 0;
+    virtual void VMT_68() = 0;
+    virtual void GetDataLoaderBufferBindingInfo() = 0;
+    virtual void UpdateCacheSizes() = 0;
+    virtual void VMT_88() = 0;
+    virtual void PrefetchOneImmediately(void*, uint32_t) = 0;
+    virtual void Prefetch(void*, uint32_t, void*) = 0;
+    virtual void ProcessFeedbackData(void*, void*) = 0;
+    virtual void ResolveFeedbackData(void*, void*) = 0;
+    virtual void SuspendWarmTextures(uint8_t) = 0;
+    virtual void ResumeWarmTextures(uint8_t) = 0;
+    virtual int32_t OpenVirtualTextureFile(uint32_t textureLayerConfig, STDString const& path, uint8_t textureSetId, Array<LayerConfig>& layerConfigs) = 0;
+    virtual void CloseVirtualTextureFile(uint32_t textureLayerConfig, int32_t gtsHandle, bool releaseTexSet0, bool releaseTexSet1) = 0;
+
+    bool UseChunkedVirtualTextures;
+    SRWLOCK GTSLock;
+    LegacyRefMap<STDString, GTSInfo> LoadedGTS;
+    HashMap<TextureLayerConfigId, Array<STDString>> field_28;
+    HashMap<Guid, STDString> TileSets;
+};
+
+struct [[bg3::hidden]] VirtualTexturePrefetcher
+{
+    void* VMT;
+    void* field_8;
+    VirtualTextureManagerBase* ThisPtr;
+    CRITICAL_SECTION CriticalSection;
+    Array<void*> Arr_pGranitePrefetchWorker_BatchedPrefetchJob;
+};
+
+
+struct [[bg3::hidden]] VirtualTextureManager : public VirtualTextureManagerBase
+{
+    struct [[bg3::hidden]] SomeVal
+    {
+        __int64 field_0;
+        int field_8;
+    };
+
+    void* Renderer;
+    void* GraphineContext;
+    void* GraphineDevice;
+    void* GraphineTranscoder;
+    SparseArray<void*> TexSet0;
+    SparseArray<void*> TexSet1;
+    SRWLOCK Lock2;
+    void* DataLoaderBuffer;
+    void* DataLoaderBufferBindingInfo[2];
+    SRWLOCK PerThreadLocks[64];
+    Array<void*> PerThreadPrefetches[64]; // GranitePrefetch*
+    Array<void*> PerThreadWStrings[64]; // GranitePrefetch*
+    SparseArray<void*> CpuCaches;
+    SparseArray<void*> GpuCaches;
+    int field_388;
+    int field_38C;
+    int field_390;
+    int field_394;
+    int field_398;
+    int field_39C;
+    int field_3A0;
+    int field_3A4;
+    VirtualTexturePrefetcher Prefetcher;
+    std::optional<int> field_3F8;
+    bool WasShutdown;
+    bool PackedTilesResident;
+    bool UpdateFinished;
+    bool PartialUpdate;
+    int field_404;
+    int field_408;
+    int field_40C;
+    int GPUCachesSize;
+    bool RequestResizeGPUCaches;
+};
+
+struct [[bg3::hidden]] ViewDescriptor
+{
+    uint16_t Format;
+    uint8_t BaseMip;
+    uint8_t MipCount;
+    uint16_t BaseSlice;
+    uint16_t SliceCount;
+    uint16_t unk;
+};
+
+struct [[bg3::hidden]] ImageView
+{
+    uint64_t unk;
+    uint64_t View;
+};
+
+struct [[bg3::hidden]] Image
+{
+    Array<ViewDescriptor> ViewDescriptors;
+    uint32_t Width;
+    uint32_t Height;
+    uint32_t Depth;
+    uint16_t unk;
+    uint16_t MipCount;
+    uint16_t ArraySize;
+    uint16_t Usage;
+    uint8_t Dimension;
+    uint8_t Format;
+    uint8_t SampleCount;
+    uint8_t Access;
+    uint8_t NamedViews;
+};
+
+struct [[bg3::hidden]] ResourceView
+{
+    uint64_t unk;
+    ID3D11ShaderResourceView* View;
+};
+
+struct [[bg3::hidden]] TextureDescriptorDX11
+{
+    ID3D11Resource* Resource;
+    Array<void *> unkArr;
+    uint32_t Width;
+    uint32_t Height;
+    uint32_t Depth;
+    uint8_t unk[16];
+    Array<ResourceView> Views;
+};
+
+struct [[bg3::hidden]] TextureDescriptorVulkan
+{
+    Image ImageData;
+    Array<ImageView*> Views;
+};
+
+union [[bg3::hidden]] TextureDescriptor
+{
+    ~TextureDescriptor() {}
+
+    TextureDescriptorDX11 DX11;
+    TextureDescriptorVulkan Vulkan;
+};
+
+struct [[bg3::hidden]] TrackedTexture
+{
+    TextureDescriptor* Descriptor;
+    uint32_t RefCount;
+    uint32_t WaitingForLoadRefCount;
+    uint8_t State;
+    STDString Path;
+    void* EventObject;
+    CRITICAL_SECTION CriticalSection;
+    Array<void*> LoadCallbacks;
+    uint8_t field_70;
+    uint8_t Flags;
+    uint32_t CriticalSectionRefCount;
+    CRITICAL_SECTION* TextureStreamerCS;
+};
+
+struct [[bg3::hidden]] TextureManager
+{
+    SRWLOCK Lock;
+    HashMap<TextureDescriptor*, FixedString> Names;
+    HashMap<FixedString, TrackedTexture*> Textures;
+};
+
+struct UVValues
+{
+    glm::vec2 UV0;
+    glm::vec2 UV1;
+};
+
+struct TextureAtlas : public ProtectedGameObject<TextureAtlas>
+{
+    [[bg3::hidden]] void* VMT;
+    LegacyMap<FixedString, UVValues*> Icons;
+    STDString Path;
+    STDString TexturePath;
+    uint32_t IconWidth;
+    uint32_t IconHeight;
+    uint32_t TextureWidth;
+    uint32_t TextureHeight;
+    FixedString TextureUuid;
+    resource::TextureResource* Texture;
+};
+
+struct TextureAtlasMap : public ProtectedGameObject<TextureAtlasMap>
+{
+    [[bg3::hidden]] void* VMT;
+    LegacyRefMap<STDString, TextureAtlas*> AtlasMap;
+    LegacyMap<FixedString, TextureAtlas*> IconMap;
+    [[bg3::hidden]] uint32_t Unknown;
+};
+
+struct [[bg3::hidden]] Bank : public ProtectedGameObject<Bank>
+{
+    void* VMT;
+    LegacyMap<FixedString, resource::Resource*> Resources;
+    SRWLOCK SRWLock;
+    ResourceBankType BankTypeId;
+};
+
+struct [[bg3::hidden]] ResourceContainer : public ProtectedGameObject<ResourceContainer>
+{
+    void* VMT;
+    std::array<Bank*, (unsigned)ResourceBankType::Sentinel> Banks;
+};
+
+struct [[bg3::hidden]] ResourcePackage;
+
+struct [[bg3::hidden]] ResourceBank
+{
+    void* VMT;
+    ResourceContainer Container;
+    LegacyMap<FixedString, ResourcePackage*> Packages;
+    void* LoadHelper;
+    FixedString ModName;
+
+    resource::Resource* GetResource(ResourceBankType type, FixedString const& resource);
+};
+
+struct [[bg3::hidden]] ResourcePackage
+{
+    void* VMT;
+    ResourceContainer Container;
+    ResourceBank* Bank;
+    FixedString PackageName;
+    STDString Path;
+    bool field_38;
+};
+
+struct [[bg3::hidden]] ResourceManager
+{
+    void* VMT;
+    LegacyMap<FixedString, resource::Resource*> PreviewResources;
+    std::array<ResourceBank*, 2> ResourceBanks;
+    void* VisualFactory;
+    void* EffectDependenciesVMT;
+    Array<FixedString> EffectDependencies;
+    void* EffectManager;
+    void* VisualTemplateManager;
+    void* ModelManager;
+    void* ModelProxyManager;
+    void* ModelProxyTemplateManager;
+    TextureManager* TextureManager;
+    void* ShaderManager;
+    WwiseManager* SoundManager;
+    void* VideoManager;
+    void* VideoManager2;
+    void* GameAnalytics;
+    VirtualTextureManager* VirtualTextureManager;
+    CRITICAL_SECTION CriticalSection;
+    LegacyRefMap<STDString, void*> ResourceDependencies;
+    LegacyMap<FixedString, Path*> Sources;
+    Array<void*> VisualLoaders;
+    LegacyMap<FixedString, void*> GenomeAnimationManagers;
+    gn::GenomeTypeManager* GenomeTypeManager;
+    ui::GameUI* UI;
+    ui::GameUI* UISwap;
+};
+
+END_SE()
+
+BEGIN_NS(resource)
+
+struct Resource : public ProtectedGameObject<Resource>
+{
+    virtual ~Resource() = 0;
+    virtual void* GetLogInfo(void*) = 0;
+    virtual STDString* ToLogString(STDString&) = 0;
+    virtual void SetUUID(FixedString const&) = 0;
+    virtual void VMT18(FixedString const&) = 0;
+    virtual void ForceUnload(ResourceManager* mgr) = 0;
+    virtual bool AcquireRef(ResourceManager* mgr) = 0;
+    virtual bool ReleaseRef(ResourceManager* mgr) = 0;
+    virtual bool IsLoaded() = 0;
+    virtual bool IsLoadFailed() = 0;
+    virtual uint32_t GetType() = 0;
+    virtual Resource* Clone() = 0;
+    virtual bool Visit(ObjectVisitor& visitor) = 0;
+
+    Path SourceFile;
+    [[bg3::readonly]] FixedString Guid;
+    [[bg3::readonly]] bool IsModded;
+};
+
+struct TwoStepLoadableResource : public Resource
+{
+    [[bg3::hidden]] void* TwoStepLoadableResource_VMT;
+    __int64 field_30;
+    [[bg3::hidden]] SRWLOCK lock;
+    [[bg3::hidden]] void* LoadJob;
+};
+
+struct LoadableResource : public Resource
+{
+    using LoadProc = bool (LoadableResource* self, ResourceManager* mgr);
+    using UnloadProc = bool (LoadableResource* self, ResourceManager* mgr);
+    using TranscodeProc = __int64 (void* self, void* transcodeData, void* source, __int64 sourceSize, int width, int height, void* pSaveMip, void* paramBlock, int a9, void* destination, int expectedBCFormat);
+
+    struct [[bg3::hidden]] VMT
+    {
+        void* Dtor;
+        void* GetMetadata;
+        void* DebugDump;
+        void* SetGuid;
+        void* VMT18;
+        void* ForceUnload;
+        void* IncRef;
+        void* DecRef;
+        void* IsInState2;
+        void* IsInState3;
+        void* GetType;
+        void* Clone;
+        void* Visit;
+        LoadProc* Load;
+        UnloadProc* Unload;
+    };
+
+    virtual bool Load(ResourceManager* mgr) = 0;
+    virtual bool Unload(ResourceManager* mgr) = 0;
+
+    [[bg3::readonly]] uint16_t RefCount;
+    [[bg3::readonly]] uint8_t State;
+};
+
+struct PresetData
+{
+    struct Mapped
+    {
+        FixedString GroupName;
+        FixedString MaterialPresetResource;
+        bool ForcePresetValues;
+        [[bg3::hidden]] int8_t field_9;
+        [[bg3::hidden]] int16_t field_a;
+    };
+
+    Array<material::ScalarParameterPreset> ScalarParameters;
+    Array<material::Vector2ParameterPreset> Vector2Parameters;
+    Array<material::Vector3ParameterPreset> Vector3Parameters;
+    Array<material::VectorParameterPreset> VectorParameters;
+    Array<material::Texture2DParameterPreset> Texture2DParameters;
+    Array<material::VirtualTextureParameterPreset> VirtualTextureParameters;
+    FixedString MaterialResource;
+    [[bg3::hidden]] __int32 field_64;
+
+    HashMap<FixedString, Mapped> MaterialPresets;
+};
+
+struct AnimationResource : public TwoStepLoadableResource
+{
+    struct Event
+    {
+        FixedString ID;
+        float Time;
+        float Length;
+        uint8_t Track;
+
+        TextKeyTypeProperties* Properties;
+    };
+
+    Array<Event*> Events;
+    FixedString Template;
+    FixedString AdditiveLoopingAnimationID;
+    FixedString LeftTransitionAnimation;
+    FixedString RightTransitionAnimation;
+    // FixedString PreviewVisualResource;
+    FixedString SkeletonResource;
+    float TimeStep;
+    float Duration;
+    float Offset;
+    bool Looping;
+    // bool IsPoseBank;
+    uint8_t AnchorHand;
+    uint8_t SupportingLeg;
+};
+
+struct AnimationBlueprintResource : public TwoStepLoadableResource
+{
+    [[bg3::hidden]] void* VMT3;
+    Array<gn::GenomeBlueprint*> Blueprints;
+    LegacyRefMap<bg3se::Guid, gn::GenomeVariant> Params;
+    // Editor only
+    // Guid PreviewVisualResourceID;
+};
+
+struct AnimationDesc
+{
+    FixedString ID;
+    AnimationSetAnimationFlags flags;
+};
+
+struct AnimationSubSet
+{
+    LegacyRefMap<FixedString, AnimationDesc> Animation;
+    FixedString FallBackSubSet;
+};
+
+struct AnimationSet
+{
+    LegacyRefMap<FixedString, AnimationSubSet> AnimationSubSets;
+};
+
+struct AnimationSetResource : public LoadableResource
+{
+    AnimationSet* AnimationBank;
+};
+
+struct Atmosphere
+{
+    [[bg3::hidden]] void* VMT;
+    FixedString GUID;
+    uint32_t InheritanceFlags;
+    PostProcessSetting PostProcess;
+    float WindDirection;
+    float WindSpeed;
+    float ClothWindSpeed;
+    float ClothWindVariance;
+    float ClothMainWindSpeed;
+    float ClothMainWindFrequency;
+    float ClothWindDirectionOffsetFrequency;
+    float ClothMaxWindDirectionOffset;
+    float NearPlane;
+    float FarPlane;
+    bool EnvironmentEffectGlobalEnabled;
+    std::array<bool, 4> EnvironmentEffectEnabled;
+    std::array<bool, 4> EnvironmentEffectEnabledForTimeline;
+    std::array<FixedString, 4> EnvironmentEffect;
+    std::array<float, 4> EnvironmentEffectOffset;
+    bool LocalLightSourceEnabled;
+    bool LocalLightSourceOverrideSettings;
+    glm::fvec3 LocalLightSourceColor;
+    float LocalLightSourceIntensity;
+    Guid TimelineAutomaticLightingDefaultSetup;
+    bool TimelineAutomaticLightingDisableFlip;
+    Guid Atmosphere;
+};
+
+struct AtmosphereResource : public LoadableResource
+{
+    Atmosphere* Atmosphere;
+    Array<FixedString> Labels;
+};
+
+struct BlendSpaceResource : public TwoStepLoadableResource
+{
+    struct [[bg3::hidden]] BlendSpaceInternals;
+
+    struct Input
+    {
+        glm::vec2 Position;
+        FixedString AnimationID;
+        FixedString ShortNameID;
+    };
+
+    struct InputInfo
+    {
+        [[bg3::hidden]] void* ContainingInternals; // Points to XAxisName
+        glm::vec2 Position;
+        FixedString AnimationID;
+        FixedString ShortNameID;
+    };
+
+    STDString XAxisName;
+    STDString YAxisName;
+    int32_t XElements;
+    int32_t YElements;
+    float MinXValue;
+    float MaxXValue;
+    float MinYValue;
+    float MaxYValue;
+
+    struct Adjustment
+    {
+        glm::fvec3 Adjustment;
+        std::array<uint16_t, 3> indexes;
+        uint16_t index;
+    };
+
+    struct FieldB8Entry
+    {
+        glm::fvec2 field_0;
+        glm::fvec2 field_8;
+        glm::fvec2 field_10;
+        glm::fvec2 field_18;
+        __int32 field_20;
+        __int32 field_24;
+        __int32 field_28;
+        glm::fvec2 field_2c;
+        __int32 field_34;
+        __int32 field_38;
+        __int32 field_3c;
+        glm::fvec2 field_40;
+        __int32 field_48;
+        __int32 field_4c;
+        __int32 field_50;
+        glm::fvec2 field_54;
+        __int32 field_5c;
+    };
+
+    Array<Adjustment> Adjustments;
+
+    Array<InputInfo*> Inputs;
+    bool NeedsAdjustmentCalculation;
+    [[bg3::hidden]] __int8 field_b1;
+    [[bg3::hidden]] __int16 field_b2;
+    [[bg3::hidden]] __int32 field_b4;
+    Array<FieldB8Entry> field_b8;
+};
+
+struct VisualSet
+{
+    struct Slot
+    {
+        FixedString Slot;
+        FixedString VisualResource;
+        FixedString Bone;
+    };
+
+    struct LocatorAttachment
+    {
+        FixedString LocatorId;
+        FixedString VisualResource;
+    };
+
+    FixedString BodySetVisual;
+    Array<Slot> Slots;
+    Array<LocatorAttachment> LocatorAttachments;
+    PresetData MaterialOverrides;
+    LegacyMap<FixedString, PresetData> Materials;
+    HashMap<FixedString, FixedString> RealMaterialOverrides;
+    [[bg3::legacy(field_158)]] HashMap<FixedString, FixedString> MaterialRemaps;
+    FixedString ID;
+    bool ShowEquipmentVisuals;
+};
+
+struct CharacterVisualResource : public LoadableResource
+{
+    VisualSet VisualSet;
+    FixedString BaseVisual;
+};
+
+struct ClothColliderResource : public LoadableResource
+{
+    struct Sphere
+    {
+        glm::fvec3 Position;
+        float Radius;
+        FixedString Name;
+        [[bg3::hidden]] __int32 field_14;
+        Array<FixedString> Links;
+        FixedString AttachedName;
+        [[bg3::hidden]] __int32 field_2c;
+    };
+
+    Array<Sphere> Spheres;
+};
+
+struct ColorListResource : public LoadableResource
+{
+    [[bg3::hidden]] __int64 field_30; // Dynamic array vtable
+    Array<uint32_t> Colors;
+    [[bg3::hidden]] __int64 field_48; // Dynamic array other info
+
+    [[bg3::hidden]] __int64 field_50; // Dynamic array vtable
+    Array<int32_t> Ids;
+    [[bg3::hidden]] __int64 field_68; // Dynamic array other info
+
+    int32_t IdGenerator;
+    [[bg3::hidden]] __int32 field_74;
+};
+
+struct DialogResource : public LoadableResource
+{
+    Array<bg3se::Guid> ChildResources;
+    Array<uint8_t> SpeakerSlotsWithLines;
+    STDString Name;
+    uint8_t TimelineSplitScreenPriority;
+    uint8_t Flags;
+    uint8_t Flags2;
+};
+
+struct DiffusionProfileResource : public LoadableResource
+{
+    glm::fvec3 ScatterColor;
+    float ScatterDistance;
+    glm::fvec3 TransmissionTint;
+    float ThicknessRemapMin;
+    float ThicknessRemapMax;
+    uint8_t ThickObjectTransmission; // Sometimes filled with junk values, unknown why
+    float DualSpecularRoughnessA;
+    float DualSpecularRoughnessB;
+    float DualSpecularMix;
+};
+
+struct TimelineConstructor
+{
+    aspk::TimelineHeader Header;
+    Array<aspk::Input*> Inputs;
+    Array<aspk::Component*> EffectComponents;
+    bool Loaded;
+    FixedString EffectName;
+};
+
+struct EffectResource : public TwoStepLoadableResource
+{
+    FixedString EffectName;
+    Array<aspk::Component*> EffectComponents;
+    Array<FixedString> Dependencies;
+    TimelineConstructor* Constructor;
+    [[bg3::hidden]] void* TimelineContent;
+    glm::fvec3 BoundsMin;
+    glm::fvec3 BoundsMax;
+    float CullingDistance;
+    float Duration;
+    bool Looping;
+    bool UseSoundOcclusion;
+    uint32_t InterruptionMode;
+    // Editor only
+    // bool PreRollMode;
+    // [[bg3::hidden]] Array<void*> TimelineDependencies;
+};
+
+struct FCurveResource : public TwoStepLoadableResource
+{
+    struct CurveKey
+    {
+        [[bg3::hidden]] void* ContainingInternals; // Pointer to the CurveKeys of containing FCurveResource
+        glm::fvec2 CurveKeyPosition;
+        float CurveKeyLeftTangent;
+        float CurveKeyRightTangent;
+        int32_t CurveKeyInterpolationType;
+        int32_t CurveKeyConstraintType;
+    };
+
+    struct CurveLimit
+    {
+        float MinX;
+        float MinY;
+        float MaxX;
+        float MaxY;
+    };
+
+    Array<CurveKey*> CurveKeys;
+
+    CurveLimit CurveLimits;
+
+    struct ProcessedCurveKey
+    {
+        glm::fvec2 CurveKeyPosition;
+        float Tan_CurveKeyLeftTangent;
+        float Tan_CurveKeyRightTangent;
+        int32_t CurveKeyInterpolationType;
+    };
+
+    Array<ProcessedCurveKey> ProcessedCurveKeys;
+};
+
+struct IKRigResource : public LoadableResource
+{
+    struct BoneProperty
+    {
+        bool Enabled;
+        bool DoFIncludesX;
+        bool DoFIncludesY;
+        bool DoFIncludesZ;
+        bool LimitEnabled;
+        uint8_t LimitAxis;
+        [[bg3::hidden]] __int16 field_6;
+        glm::fvec3 Weight;
+        glm::fvec3 Min;
+        glm::fvec3 Max;
+    };
+
+    struct IKTask
+    {
+        FixedString field_0;
+        FixedString Bone;
+        int32_t IKBoneType;
+        FixedString IKBoneName;
+        FixedString IKBoneCachedName;
+        bool PositionEnabled;
+        bool RotationEnabled; // RotationEnabled?
+        bool PositionDoFIncludesX;
+        bool PositionDoFIncludesY;
+        bool PositionDoFIncludesZ;
+        bool RotationDoFIncludesX;
+        bool RotationDoFIncludesY;
+        bool RotationDoFIncludesZ;
+        int32_t PositionDepth;
+        int32_t RotationDepth;
+        float PositionWeight;
+        float RotationWeight;
+        glm::fvec3 LookAtAxis;
+        bool IsPoleObject;
+        __int8 field_39;
+        bool IsParentTask;
+        bool LookAtLocalSpace;
+        bool LookAt;
+        [[bg3::hidden]] __int8 field_3d;
+        [[bg3::hidden]] __int16 field_3e;
+    };
+
+    LegacyRefMap<FixedString, BoneProperty> BoneProperties;
+
+    [[bg3::hidden]] void* field_40; // DynamicArray VMT
+    Array<IKTask> IKTasks;
+    [[bg3::hidden]] __int64 field_58; // DynamicArray extra data
+
+    bool SolverRoot;
+    [[bg3::hidden]] __int8 field_61;
+    [[bg3::hidden]] __int16 field_62;
+    [[bg3::hidden]] __int32 field_64;
+    HashMap<bg3se::Guid, FixedString> BoneCategories;
+};
+
+struct LightCookieResource : public TwoStepLoadableResource
+{
+    BitArray<uint32_t, 0x80> Data;
+};
+
+struct LightingResource : public LoadableResource
+{
+    Lighting* Lighting;
+};
+
+struct MaterialResource : public TwoStepLoadableResource
+{
+    Material* Instance;
+    TrackedCompactSet<material::ScalarResourceParameter> ScalarParameters;
+    TrackedCompactSet<material::Vector2ResourceParameter> Vector2Parameters;
+    TrackedCompactSet<material::Vector3ResourceParameter> Vector3Parameters;
+    TrackedCompactSet<material::Vector4ResourceParameter> VectorParameters;
+    TrackedCompactSet<material::Texture2DResourceParameter> Texture2DParameters;
+    TrackedCompactSet<material::VirtualTextureResourceParameter> VirtualTextureParameters;
+    FixedString DiffusionProfileUUID;
+    MaterialType MaterialType;
+    RenderChannel RenderChannel;
+};
+
+struct MaterialPresetResource : public LoadableResource
+{
+    PresetData Presets;
+};
+
+// I think this is unimplemented and std::terminates on construction
+struct MaterialSetResource : public TwoStepLoadableResource
+{
+};
+
+struct MeshProxyResource : public TwoStepLoadableResource
+{
+    __int64 field_48; // Size 0x30
+    FixedString Template;
+    [[bg3::hidden]] __int32 field_54;
+};
+
+struct PhysicsResource : public LoadableResource
+{
+    struct ObjectTemplate
+    {
+        struct PhysicsObject
+        {
+            virtual ~PhysicsObject() = 0;
+            virtual const FixedString& GetType() = 0;
+        };
+
+        struct PhysicsBox : public PhysicsObject
+        {
+            [[bg3::hidden]] void* VMT;
+            bool Kinematic;
+            [[bg3::hidden]] __int8 field_9;
+            [[bg3::hidden]] __int16 field_a;
+            float Mass;
+            FixedString UUID;
+            [[bg3::hidden]] __int32 field_14;
+            glm::fvec3 Extends;
+            [[bg3::hidden]] __int32 field_24;
+        };
+
+        struct PhysicsCapsule : public PhysicsObject
+        {
+            [[bg3::hidden]] void* VMT;
+            bool Kinematic;
+            [[bg3::hidden]] __int8 field_9;
+            [[bg3::hidden]] __int16 field_a;
+            float Mass;
+            FixedString UUID;
+            [[bg3::hidden]] __int32 field_14;
+            float Height;
+            float Radius;
+        };
+
+        FixedString UUID;
+        [[bg3::hidden]] __int32 field_4;
+        Array<PhysicsObject*> PhysicsObjects;
+    };
+
+    Array<ObjectTemplate*> ObjectTemplates;
+    Array<FixedString> IgnoreColliderList;
+    FixedString Template;
+    bool field_54;
+    [[bg3::hidden]] __int8 field_55;
+    [[bg3::hidden]] __int16 field_56;
+};
+
+struct ScriptResource : public LoadableResource
+{
+    struct Parameter
+    {
+        int32_t Type;
+        [[bg3::hidden]] __int32 field_4;
+        STDString Value;
+    };
+
+    LegacyMap<FixedString, Parameter*> Parameters;
+};
+
+struct SkeletonResource : public TwoStepLoadableResource
+{
+    struct Socket
+    {
+        FixedString Name;
+        FixedString Bone;
+        FixedString BoneConstraint;
+        uint16_t ConstraintsPos;
+        uint16_t ConstraintsRot;
+        glm::fvec4 Rotation;
+        glm::fvec3 Position;
+    };
+
+    struct Bone
+    {
+        struct BoneGroup
+        {
+            int32_t IKBoneType;
+            FixedString IKBoneName;
+            FixedString IKBoneCachedName;
+        };
+        Array<BoneGroup> BoneGroups;
+        glm::fvec3 Position;
+        glm::fvec4 Rotation;
+        float SoundObjectActivationRange;
+        uint8_t SoundObjectIndex;
+        bool ShouldLOD;
+        [[bg3::hidden]] __int16 field_32;
+        [[bg3::hidden]] __int32 field_34;
+    };
+
+    LegacyRefMap<FixedString, Bone> Bones;
+    [[bg3::hidden]] void* field_58; // DynamicArray VMT
+    Array<Socket> Sockets;
+    [[bg3::hidden]] __int64 field_70; // DynamicArray extra data
+    FixedString RagdollResourceID;
+    FixedString SpringResourceID;
+    FixedString DynamicPhysicsResourceID;
+    FixedString SoftbodyResourceID;
+    FixedString Template;
+    FixedString IKRigResourceID;
+    FixedString ClothColliderResourceID;
+    FixedString MirrorTableResourceID;
+    // Editor build only
+    // uint64_t field_98;
+    // FixedString PreviewVisualResource;
+    // FixedString PreviewAnimationResource;
+};
+
+struct SkeletonMirrorTableResource : public TwoStepLoadableResource
+{
+    struct Entry
+    {
+        FixedString LeftBone;
+        FixedString RightBone;
+    };
+
+    Array<Entry> Entries;
+};
+
+struct SkinPresetResource : public LoadableResource
+{
+    PresetData Presets;
+};
+
+struct SoundResource : public Resource
+{
+    FixedString SoundEvent;
+    uint32_t SoundEventID;
+    float Duration;
+    float MaxDistance;
+    AudioCodec SoundCodec;
+    uint8_t Flags;
+};
+
+struct TerrainBrushResource : public LoadableResource
+{
+    FixedString BaseColorMap;
+    FixedString NormalMap;
+    FixedString PhysicalMap;
+    FixedString DetailNormalMap;
+    float HeightScale;
+    float HeightOffset;
+    float HeightContrast;
+    float AlphaThreshold_maybe;
+    float Tiling;
+    float DetailNormalScale;
+    float DetailNormalTiling;
+    float GradientHeightBottom;
+    float GradientHeightMidPoint;
+    float GradientHeightTop;
+    float GradientRoughnessReach;
+    float GradientRoughnessPower;
+    glm::fvec3 GradientBottomHeightColor;
+    glm::fvec3 GradientMidHeightColor;
+    bool UseDetailNormalMap;
+    bool UseHeightGradient_maybe;
+    bool IsBlackBrush;
+    MaterialType MaterialType;
+    [[bg3::hidden]] __int32 field_8c;
+};
+
+struct TextureResource : public LoadableResource
+{
+    [[bg3::hidden]] void* RfTexture;
+    FixedString Template;
+    bool Streaming;
+    bool SRGB;
+    TextureType Type;
+    int32_t Width;
+    int32_t Height;
+    int32_t Depth;
+};
+
+struct TileSetResource : public LoadableResource
+{
+    struct Tile
+    {
+        FixedString VisualGUID;
+        FixedString PhysicsGUID;
+        FixedString InvisibleClimbingHelperPhysicsGUID;
+        [[bg3::hidden]] __int32 field_10;
+    };
+
+    struct ExtendedRefMap
+    {
+        LegacyRefMap<bg3se::Guid, Tile> Tiles;
+        bool IsRoof;
+        [[bg3::hidden]] __int8 field_11;
+        [[bg3::hidden]] __int16 field_12;
+        [[bg3::hidden]] __int32 field_14;
+    };
+
+    ExtendedRefMap* TileSet;
+};
+
+struct TimelineResource : public LoadableResource
+{
+    bg3se::Guid DialogResourceId;
+    bool FadeOutOnEnd;
+    [[bg3::hidden]] __int8 field_41;
+    [[bg3::hidden]] __int16 field_42;
+    float FadeOutDuration;
+    int32_t BodyPartMocap;
+    [[bg3::hidden]] __int32 field_4c;
+};
+
+struct TimelineSceneResource : public LoadableResource
+{
+    Array<FixedString> Labels;
+    uint8_t SceneType;
+    [[bg3::hidden]] __int8 field_41;
+    [[bg3::hidden]] __int16 field_42;
+    int32_t AdditionalSpeakerCount;
+};
+
+struct VirtualTextureResource : public LoadableResource
+{
+    [[bg3::readonly]] uint8_t GTSIndex;
+    [[bg3::readonly]] uint32_t VirtualTextureLayerConfig;
+    [[bg3::readonly]] uint32_t LoadedVirtualTextureLayerConfig;
+    STDString RootPath;
+    [[bg3::hidden]] SRWLOCK Lock;
+    FixedString TileSetFileName;
+    FixedString GTexFileName;
+    [[bg3::hidden]] void* GraphineTextureData;
+    bool Prefetch;
+    int8_t PrefetchMipLevel;
+    [[bg3::readonly]] uint8_t IsEditor;
+    [[bg3::readonly]] uint8_t IsValid;
+    uint32_t ReferencedColorSpaces;
+};
+
+struct VisualResource : public TwoStepLoadableResource
+{
+    struct Object
+    {
+        FixedString ObjectID;
+        FixedString MaterialID;
+        uint8_t LOD;
+        [[bg3::hidden]] __int8 field_9;
+        [[bg3::hidden]] __int16 field_10;
+    };
+
+    struct Attachment
+    {
+        FixedString UUID;
+        FixedString Name;
+    };
+
+    struct ClothParam
+    {
+        FixedString UUID;
+        float LinearStiffness;
+        float BendingStiffness;
+        float CompressionLimit;
+        float StretchLimit;
+        float StiffnessMultiplier;
+        glm::fvec3 LinearDrag;
+        glm::fvec3 AngularDrag;
+        glm::fvec3 LinearInertia;
+        glm::fvec3 AngularInertia;
+        glm::fvec3 CentrifugalInertia;
+        glm::fvec3 Damping;
+        float CollisionMassScale;
+        float DragCoefficient;
+        float FluidDensity;
+        float Friction;
+        float LiftCoefficient;
+        float TetherConstraintScale;
+        float TetherConstraintStiffness;
+        float SolverFrequency;
+        float StiffnessFrequency;
+        float FrontalWindSpeed;
+        float FrontalWindVariance;
+        float AnimDriveSpringForce;
+        float AnimDriveDampingForce;
+        float ClothWindSpeed;
+        float ClothMainWindVariance;
+        float ClothMainWindSpeed;
+        float ClothMainWindFrequency;
+        float ClothWindDirectionOffsetFrequency;
+        float ClothMaxWindDirectionOffset;
+        float SelfCollisionDistance;
+        float SelfCollisionStiffness;
+        bool EnableVirtualParticles;
+        bool EnableCCD;
+        bool AtmosphericWindEnabled;
+        bool OverrideAtmosphericWind;
+        float AnimInfluenceMultiplier;
+    };
+
+    struct AnimationSetOverride
+    {
+        bg3se::Guid PairElement1;
+        FixedString PairElement2;
+        int32_t strAnimationSetOverrideType;
+    };
+
+    struct Bone
+    {
+        glm::fvec3 Position;
+        glm::fvec4 Rotation;
+    };
+
+    struct ClothHighResInfo
+    {
+        FixedString Name;
+        [[bg3::hidden]] Array<uint16_t> ClosestVertices;
+        [[bg3::hidden]] void* CompressedVertices;
+        [[bg3::hidden]] uint32_t CompressedSize;
+        [[bg3::hidden]] uint32_t NbClosestVertices;
+    };
+
+    struct ClothData
+    {
+        HashMap<FixedString, Array<ClothHighResInfo>> Mappings;
+        TrackedCompactSet<ClothParam> Params;
+        FixedString ClothColliderResourceID;
+    };
+
+    [[bg3::hidden]] void* field_48; // DynamicArray VMT
+    TrackedCompactSet<FixedString> Tags;
+    [[bg3::hidden]] __int64 field_60; // DynamicArray extra data
+    TrackedCompactSet<Object> Objects;
+    TrackedCompactSet<Attachment> Attachments;
+    ClothData* Cloth;
+    Array<AnimationSetOverride> AnimationSetOverrides;
+    Array<FixedString> AnimationWaterfall;
+    LegacyRefMap<FixedString, Bone> Bones;
+    [[bg3::hidden]] void* field_c8; // DynamicArray VMT
+    TrackedCompactSet<FixedString> VertexColorMaskSlots;
+    [[bg3::hidden]] __int64 field_e0; // DynamicArray extra data
+    FixedString SkeletonResource;
+    FixedString Template;
+    FixedString SkeletonSlot;
+    FixedString SoftbodyResourceID;
+    FixedString HairPresetResourceId;
+    FixedString ScalpMaterialId;
+    FixedString Slot;
+    FixedString RemapperSlotId;
+    FixedString AttachBone;
+    FixedString BlueprintInstanceResourceID;
+
+    glm::fvec3 BoundsMin;
+    glm::fvec3 BoundsMax;
+    bool NeedsSkeletonRemap;
+    bool SupportsVertexColorMask;
+    MaterialType MaterialType;
+    uint8_t HairType;
+    // Editor only
+    // bool ExcludeFromHLOD;
+};
+
+struct VisualSetResource : public LoadableResource
+{
+};
+
+struct VoiceBarkResource : public LoadableResource
+{
+};
+
+END_NS()
+
+BEGIN_NS(lua)
+
+LUA_POLYMORPHIC(resource::PhysicsResource::ObjectTemplate::PhysicsObject);
+
+END_NS()
