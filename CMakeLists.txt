@@ -198,7 +198,9 @@ target_compile_options(bg3se_vendor PRIVATE -w)
 # tools/fetch-externals.sh. The distribution packages are libstdc++ and export
 # std::__cxx11 symbols; bg3se's generated message code is part of the extender
 # core, so mixing the two std::string ABIs in one process is not an option.
-# TBB is fine from the distribution -- it exports no std::string in its ABI.
+# TBB is deliberately absent: it is not in the Steam runtime container, so
+# vendor/compat implements the two concurrent containers over the standard
+# library instead.
 set(PROTOBUF_LITE ${EXTERNAL}/protobuf/build/libprotobuf-lite.a)
 set(ABSL_PREFIX ${EXTERNAL}/abseil/install)
 if(NOT EXISTS ${PROTOBUF_LITE})
@@ -217,7 +219,7 @@ target_include_directories(bg3se_vendor PRIVATE
 target_link_libraries(bg3se_vendor PUBLIC
     lua_static imgui ${PROTOBUF_LITE}
     -Wl,--start-group ${ABSL_LIBS} -Wl,--end-group
-    optick tbb)
+    optick)
 
 # ---------------------------------------------------------------------------
 # bg3le

@@ -8,8 +8,10 @@
 # MIT + Commons Clause. With thanks to them.
 #
 # Detours is deliberately absent: bg3le hooks via PLT interposition, vtable
-# slot patching and call-site patching. protobuf, SDL2 and oneTBB come from
-# the distro.
+# slot patching and call-site patching. SDL2 and Vulkan come from the Steam
+# runtime container at run time. oneTBB is deliberately not used at all --
+# vendor/compat implements the two concurrent containers bg3se needs over the
+# standard library, because libtbb is not in that container.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
