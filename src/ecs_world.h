@@ -5,12 +5,14 @@
 namespace bg3le {
 namespace ecs {
 
-// Patches the call sites of the component lookup so the first call records the
-// object it goes through. Returns false if no site could be patched.
-bool install_storage_capture();
+// Patches the call sites of EntityStorageContainer::GetEntityStorage so the
+// first call records the container it goes through. Returns false if no site
+// could be patched.
+bool install_container_capture();
 
-// The captured pointer, or nullptr if nothing has called the lookup yet.
-void* storage();
+// The captured EntityStorageContainer, or nullptr if no entity lookup has
+// happened yet.
+void* container();
 
 }  // namespace ecs
 }  // namespace bg3le

@@ -230,7 +230,7 @@ void ensure_symbols() {
                                      kSpinBeforeYield);
         }
         install_tick_hook();
-        ecs::install_storage_capture();
+        ecs::install_container_capture();
         fast_alloc_install();
     });
 }

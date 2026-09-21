@@ -13,18 +13,22 @@
 //   and  edx,  0x7fff        ; index masked to 15 bits
 //   call <lookup>            ; (object, entity, index)
 //
-// Reading the whole function shows what its first argument is:
+// That lookup led to the one we actually want, called just after it:
 //
-//   and r10d, 0x7fc0      ; index & ~63
-//   shr r10d, 6           ; word = index / 64
-//   mov rax, [rdi+r10*8]  ; a bitmask word at offset 0 of rdi
-//   shl rbx, cl           ; bit = 1 << (index & 63)
-//   test rax, rbx         ; presence test
+//   cmp   [rcx+rax*8], esi          ; salt check
+//   movzx eax, WORD [rcx+rax*8+4]   ; -> 16-bit storage index
+//   mov   rsi, [rdi]                ; [rdi] is an array of storage pointers
+//   mov   rax, [rsi+rax*8]          ; storages[index]
+//   ret
 //
-// So rdi begins with a component-presence bitmask, and the pointer at +0x110
-// puts that mask at 0x110 bytes -- 34 qwords, 2176 bits. bg3se independently
-// has ComponentMapSize = 0x880, which is the same 2176, so its reverse
-// engineered layout describes this build too.
+// So it is EntityStorageContainer::GetEntityStorage(EntityHandle), and its
+// first argument is the container. bg3se agrees: EntityStorageContainer begins
+// with Array<EntityStorageData*> Storages, and its Array is {T* buf; uint32
+// size}, so the buffer pointer sits at offset 0 exactly as the code expects.
+//
+// The container is what maps an EntityHandle to its storage, which is the
+// entry point for reaching a component. It is reachable without the
+// EntityWorld, which has no symbol and no obvious capture point.
 //
 // Rather than guess the prototype, the hook is a naked thunk: it records rdi
 // and jumps to the original with every register untouched, so the real
@@ -39,9 +43,10 @@ namespace bg3le {
 namespace ecs {
 namespace {
 
-// Offset of the component lookup in 4.8.400.7143220, from the disassembly
-// above. hook_call_sites verifies each site really calls it before patching.
-constexpr std::uintptr_t kLookupFunc = 0x218e050;
+// EntityStorageContainer::GetEntityStorage(EntityHandle), from the
+// disassembly above. hook_call_sites verifies each site really calls it before
+// patching.
+constexpr std::uintptr_t kEntityStorageLookup = 0x218dc90;
 
 }  // namespace
 
@@ -67,9 +72,7 @@ __asm__(
     "  mov bg3le_ecs_storage(%rip), %rax\n"
     "  test %rax, %rax\n"
     "  jne 1f\n"
-    // Only record an object whose component mask has something in it. The
-    // first call comes early, while the mask is still all zeroes, and an empty
-    // one tells us nothing.
+    // Only record a container whose Storages buffer has been allocated.
     "  mov (%rdi), %rax\n"
     "  test %rax, %rax\n"
     "  je 1f\n"
@@ -79,22 +82,23 @@ __asm__(
 
 }  // namespace
 
-bool install_storage_capture() {
+bool install_container_capture() {
     void* original = nullptr;
     const std::size_t patched = hook_call_sites(
-        kLookupFunc, reinterpret_cast<void*>(&bg3le_ecs_capture_thunk), &original);
+        kEntityStorageLookup, reinterpret_cast<void*>(&bg3le_ecs_capture_thunk),
+        &original);
     if (patched == 0) {
-        logf("ecs: no call sites patched for the component lookup at %#lx; "
-             "the storage pointer will stay unknown",
-             (unsigned long)kLookupFunc);
+        logf("ecs: no call sites patched for the entity storage lookup at "
+             "%#lx; the container pointer will stay unknown",
+             (unsigned long)kEntityStorageLookup);
         return false;
     }
     bg3le_ecs_lookup_original = original;
-    logf("ecs: watching %zu call sites of the component lookup", patched);
+    logf("ecs: watching %zu call sites of the entity storage lookup", patched);
     return true;
 }
 
-void* storage() { return bg3le_ecs_storage; }
+void* container() { return bg3le_ecs_storage; }
 
 }  // namespace ecs
 }  // namespace bg3le

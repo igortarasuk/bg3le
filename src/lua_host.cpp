@@ -324,15 +324,61 @@ int l_component_index(lua_State* L) {
     return 1;
 }
 
-// The captured ECS storage pointer, for verifying the capture works before
-// anything is built on it.
+// The captured EntityStorageContainer, for verifying the capture works
+// before anything is built on it.
 int l_ecs_storage(lua_State* L) {
-    void* p = ecs::storage();
+    void* p = ecs::container();
     if (p == nullptr) {
         lua_pushnil(L);
         return 1;
     }
     lua_pushinteger(L, static_cast<lua_Integer>(reinterpret_cast<std::uintptr_t>(p)));
+    return 1;
+}
+
+// Reads the captured container's Storages array, which bg3se says is its
+// first member: Array<EntityStorageData*> = {buf, size}. One call is enough to
+// tell whether the capture is a real container or a coincidence.
+int l_ecs_dump(lua_State* L) {
+    void* c = ecs::container();
+    if (c == nullptr) {
+        lua_pushnil(L);
+        lua_pushstring(L, "no entity lookup has happened yet");
+        return 2;
+    }
+
+    std::uintptr_t buf = 0;
+    std::uint32_t size = 0;
+    const auto base = reinterpret_cast<const char*>(c);
+    if (!safe_read(base, &buf, sizeof(buf)) ||
+        !safe_read(base + sizeof(buf), &size, sizeof(size))) {
+        lua_pushnil(L);
+        lua_pushstring(L, "container is not readable");
+        return 2;
+    }
+
+    lua_newtable(L);
+    lua_pushinteger(L, (lua_Integer)reinterpret_cast<std::uintptr_t>(c));
+    lua_setfield(L, -2, "Container");
+    lua_pushinteger(L, (lua_Integer)buf);
+    lua_setfield(L, -2, "StoragesBuf");
+    lua_pushinteger(L, (lua_Integer)size);
+    lua_setfield(L, -2, "StoragesCount");
+
+    // A handful of storage pointers, to show the array holds pointers rather
+    // than noise.
+    lua_newtable(L);
+    const std::uint32_t show = size < 6 ? size : 6;
+    for (std::uint32_t i = 0; i < show; ++i) {
+        std::uintptr_t entry = 0;
+        if (!safe_read(reinterpret_cast<const char*>(buf) + i * sizeof(entry),
+                       &entry, sizeof(entry))) {
+            break;
+        }
+        lua_pushinteger(L, (lua_Integer)entry);
+        lua_rawseti(L, -2, (int)i + 1);
+    }
+    lua_setfield(L, -2, "Storages");
     return 1;
 }
 
@@ -411,6 +457,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "SymbolAddr");
     lua_pushcfunction(g_lua, l_ecs_storage);
     lua_setfield(g_lua, -2, "EcsStorage");
+    lua_pushcfunction(g_lua, l_ecs_dump);
+    lua_setfield(g_lua, -2, "EcsDump");
     lua_setfield(g_lua, -2, "_Internal");
 
     lua_setglobal(g_lua, "Ext");
