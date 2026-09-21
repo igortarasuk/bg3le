@@ -3,10 +3,10 @@
 #include <GameDefinitions/Base/Base.h>
 #include <CoreLib/Utils.h>
 
-namespace std
-{
-    class thread;
-}
+// Upstream forward-declares std::thread here. libc++ declares it in an
+// inline namespace, so a second declaration is a distinct type and every use
+// becomes ambiguous; include the real header instead.
+#include <thread>
 
 BEGIN_SE()
 

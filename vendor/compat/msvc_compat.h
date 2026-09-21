@@ -126,3 +126,104 @@ inline unsigned char bsr64(TIndex* index, unsigned long long mask) {
 #define _BitScanForward64(Index, Mask) ::bg3le_compat::bsf64((Index), (Mask))
 #define _BitScanForward(Index, Mask)   ::bg3le_compat::bsf32((Index), (Mask))
 #define _BitScanReverse64(Index, Mask) ::bg3le_compat::bsr64((Index), (Mask))
+
+typedef void* LPSECURITY_ATTRIBUTES;
+
+// Win32 spellings the upstream sources use directly.
+#include <strings.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+inline int _stricmp(const char* a, const char* b) { return ::strcasecmp(a, b); }
+inline unsigned long GetCurrentThreadId() {
+    return static_cast<unsigned long>(::syscall(SYS_gettid));
+}
+
+// Win32 generic function pointer, used by the Osiris DLL wrappers.
+typedef void (*FARPROC)();
+
+// Win32 memory protection, used by the PE symbol mapper. bg3le does not use
+// that mapper -- it reads the ELF symbol table instead -- but the header still
+// has to compile.
+#include <sys/mman.h>
+typedef void* LPVOID;
+#define PAGE_NOACCESS          0x01
+#define PAGE_READONLY          0x02
+#define PAGE_READWRITE         0x04
+#define PAGE_EXECUTE           0x10
+#define PAGE_EXECUTE_READ      0x20
+#define PAGE_EXECUTE_READWRITE 0x40
+
+inline int bg3le_page_prot(unsigned long win) {
+    switch (win) {
+        case PAGE_READONLY:          return PROT_READ;
+        case PAGE_READWRITE:         return PROT_READ | PROT_WRITE;
+        case PAGE_EXECUTE:           return PROT_EXEC;
+        case PAGE_EXECUTE_READ:      return PROT_READ | PROT_EXEC;
+        case PAGE_EXECUTE_READWRITE: return PROT_READ | PROT_WRITE | PROT_EXEC;
+        default:                     return PROT_NONE;
+    }
+}
+
+inline BOOL VirtualProtect(LPVOID addr, std::size_t size,
+                           DWORD newProtect, DWORD* oldProtect) {
+    const long page = 4096;
+    auto start = reinterpret_cast<unsigned long long>(addr) & ~(unsigned long long)(page - 1);
+    const unsigned long long span =
+        (reinterpret_cast<unsigned long long>(addr) + size) - start;
+    if (oldProtect != nullptr) *oldProtect = PAGE_EXECUTE_READ;  // not queryable
+    return ::mprotect(reinterpret_cast<void*>(start), span,
+                      bg3le_page_prot(newProtect)) == 0;
+}
+
+// MSVC secure-CRT string formatting. Upstream uses the array-reference
+// overloads, where the bound is deduced. _snprintf_s takes a maximum
+// character count excluding the terminator; snprintf takes a buffer size
+// including it.
+#include <cstdio>
+#include <cstddef>
+
+template <std::size_t N, class... Args>
+int _snprintf_s(char (&buf)[N], std::size_t count, const char* fmt, Args... args) {
+    const std::size_t size = (count + 1 < N) ? count + 1 : N;
+    return std::snprintf(buf, size, fmt, args...);
+}
+
+template <std::size_t N, class... Args>
+int sprintf_s(char (&buf)[N], const char* fmt, Args... args) {
+    return std::snprintf(buf, N, fmt, args...);
+}
+
+template <std::size_t N>
+int strcpy_s(char (&buf)[N], const char* src) {
+    std::snprintf(buf, N, "%s", src);
+    return 0;
+}
+
+typedef unsigned long long ULONGLONG;
+
+// Win32 high-resolution timing, used by Ext.Timer. CLOCK_MONOTONIC with a
+// fixed 1 GHz frequency gives the nanosecond resolution the callers expect.
+#include <ctime>
+
+typedef union _LARGE_INTEGER {
+    struct { DWORD LowPart; LONG HighPart; };
+    long long QuadPart;
+} LARGE_INTEGER;
+
+inline BOOL QueryPerformanceCounter(LARGE_INTEGER* count) {
+    timespec ts{};
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    count->QuadPart = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    return 1;
+}
+
+inline BOOL QueryPerformanceFrequency(LARGE_INTEGER* freq) {
+    freq->QuadPart = 1000000000LL;
+    return 1;
+}
+
+inline ULONGLONG GetTickCount64() {
+    timespec ts{};
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (ULONGLONG)ts.tv_sec * 1000ULL + (ULONGLONG)(ts.tv_nsec / 1000000);
+}

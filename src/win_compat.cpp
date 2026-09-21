@@ -27,3 +27,17 @@ extern "C" int IsBadReadPtr(void const* p, unsigned long long size) {
     auto const last = static_cast<unsigned char const*>(p) + (size - 1);
     return readable(last) ? 0 : 1;
 }
+
+// Declared by vendor/compat/detours.h. See that header for why these refuse
+// rather than hook: the only upstream user is CoreLib/Wrappers.h, whose
+// callers bg3le replaces with PLT interposition, and Wrap() already treats a
+// non-zero return as "not wrapped".
+extern "C" long DetourAttachEx(void** /*ppPointer*/, void* /*pDetour*/,
+                               void** /*ppRealTrampoline*/, void** /*ppRealTarget*/,
+                               void** /*ppRealDetour*/) {
+    return 50;  // ERROR_NOT_SUPPORTED
+}
+
+extern "C" long DetourDetach(void** /*ppPointer*/, void* /*pDetour*/) {
+    return 50;
+}

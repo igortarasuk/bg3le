@@ -548,4 +548,19 @@ namespace std
         }
         return out;
     }
+
+    // FixedStringUnhashed is a sibling of FixedString, not a FixedString, so
+    // the overload above does not apply to it. Without an exact match, every
+    // stream insertion is ambiguous between the base class conversions to
+    // char const* and to StringView.
+    inline ostream& operator << (ostream& out, bg3se::FixedStringUnhashed const& str)
+    {
+        if (str) {
+            out << str.GetString();
+        }
+        else {
+            out << "(null)";
+        }
+        return out;
+    }
 }

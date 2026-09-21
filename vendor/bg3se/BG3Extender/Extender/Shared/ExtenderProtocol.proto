@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package bg3se.net;
+
+option cc_enable_arenas = true;
+option optimize_for = LITE_RUNTIME;
+
+enum SerializerType {
+  SERIALIZER_JSON = 0;
+  SERIALIZER_BINARY = 1;
+}
+
+// Notifies the Lua runtime that a message was sent from a remote Lua script
+message MsgPostLuaMessage {
+  string channel_name = 1;
+  bytes payload = 2;
+  string module = 3;
+  uint32 request_id = 4;
+  uint32 reply_id = 5;
+  SerializerType serializer = 6;
+}
+
+// Notifies the Lua runtime to reload client-side state
+message MsgS2CResetLuaMessage {
+  bool bootstrap_scripts = 1;
+}
+
+// Notifies the server that the client supports extender messages
+message MsgC2SExtenderHello {
+  uint32 version = 1;
+}
+
+message StatRequirement {
+    int32 requirement = 1;
+    int32 int_param = 2;
+    string string_param = 3;
+    bool negate = 4;
+}
+
+message StatProperty {
+    uint32 property_context = 1;
+    uint32 type = 2;
+    string conditions = 3;
+    repeated string string_params = 4;
+    repeated int32 int_params = 5;
+    repeated float float_params = 6;
+    repeated bool bool_params = 7;
+    repeated int32 surface_boosts = 8;
+    string name = 9;
+}
+
+message StatPropertyList {
+    string name = 1;
+    repeated StatProperty properties = 2;
+}
+
+message StatIndexedProperty {
+    int32 intval = 1;
+    string stringval = 2;
+}
+
+// Disconnects a client with a server-defined message
+message MsgS2CKick {
+  string message = 1;
+}
+
+enum UserVarType {
+  ENTITY_VAR = 0;
+  MODULE_VAR = 1;
+}
+
+message UserVar {
+  // Entity UUID split into two qwords
+  uint64 uuid1 = 1;
+  uint64 uuid2 = 2;
+  string key = 3;
+  oneof val {
+    int64 intval = 4;
+    double dblval = 5;
+    string strval = 6;
+    bytes luaval = 7;
+    bool boolval = 9;
+    bytes binaryval = 10;
+  };
+  UserVarType type = 8;
+}
+
+// Synchronizes user variables between server and client
+message MsgUserVars {
+  repeated UserVar vars = 1;
+}
+
+message MessageWrapper {
+  oneof msg {
+    MsgPostLuaMessage post_lua = 1;
+    MsgS2CResetLuaMessage s2c_reset_lua = 2;
+    MsgC2SExtenderHello c2s_extender_hello = 5;
+    MsgS2CKick s2c_kick = 7;
+    MsgUserVars user_vars = 8;
+  }
+}

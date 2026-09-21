@@ -1,15 +1,19 @@
 #!/bin/bash
 #
-# Compiles the vendored bg3se headers and reports what fails. Run
+# Compiles the vendored bg3se sources and reports what fails. Run
 # tools/fetch-externals.sh first.
 #
 # The code under test is by Norbyte and the bg3se contributors
 # (https://github.com/Norbyte/bg3se), MIT + Commons Clause. See vendor/NOTICE.md
 # for what was changed to build it with clang. With thanks to them.
 #
+# With no argument, compiles the module registration TU, which reaches almost
+# everything. Pass a path to compile some other file instead.
+#
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")" && pwd)/.."
+ROOT="$(cd "$ROOT" && pwd)"
 V="$ROOT/vendor/bg3se"
 E="$ROOT/external/third_party"
 N="$E/Noesis/NoesisGUI-NativeSDK-win-3.1.7-Indie/Include"
@@ -19,14 +23,7 @@ if [ ! -d "$N" ]; then
     exit 1
 fi
 
-TU=$(mktemp /tmp/bg3le-vendorcheck-XXXXXX.cpp)
-# Utils.h must precede LuaBinding.h: upstream relies on its own translation
-# units pulling the logging macros in first.
-cat > "$TU" <<'EOF'
-#include <GameDefinitions/Components/Components.h>
-#include <Extender/Shared/Utils.h>
-#include <Lua/LuaBinding.h>
-EOF
+TU="${1:-$V/BG3Extender/Lua/Libs/LuaSharedLibs.cpp}"
 
 # -fdeclspec/-fms-extensions: __declspec and MSVC struct extensions.
 # -fdelayed-template-parsing: MSVC resolves dependent names at instantiation.
@@ -37,16 +34,15 @@ EOF
 # Not -fms-compatibility: it de-keywords char16_t/char32_t and breaks libc++.
 clang++ -std=gnu++23 -stdlib=libc++ -fsyntax-only \
     -fdeclspec -fms-extensions -fdelayed-template-parsing \
-    -Wno-delayed-template-parsing-in-cxx20 \
+    -Wno-delayed-template-parsing-in-cxx20 -ferror-limit=60 \
     -DOSI_EOCAPP -DOSI_EXTENSION_BUILD -DNS_STATIC_LIBRARY -DNDEBUG \
     -DGLM_FORCE_INTRINSICS -DGOOGLE_PROTOBUF_NO_RTTI -D_ITERATOR_DEBUG_LEVEL=0 \
     -include "$ROOT/vendor/compat/msvc_compat.h" \
     -I"$ROOT/vendor/compat" -I"$V" -I"$V/BG3Extender" -I"$N" \
-    -I"$E/glm" -I"$E/imgui" -I"$E/rapidjson/include" -I"$E/lua/src" \
-    -I/usr/include/SDL2 \
+    -I"$E/glm" -I"$E/imgui" -I"$E/rapidjson/include" -I"$ROOT/external/lua" \
+    -I"$E/optick/src" -I/usr/include/SDL2 \
     "$TU"
 rc=$?
-rm -f "$TU"
 
-if [ $rc -eq 0 ]; then echo "vendor/bg3se: compiles clean"; fi
+if [ $rc -eq 0 ]; then echo "$(basename "$TU"): compiles clean"; fi
 exit $rc

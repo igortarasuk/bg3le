@@ -42,6 +42,7 @@ clone lua       https://github.com/Norbyte/lua-dos
 clone rapidjson https://github.com/tencent/rapidjson
 clone tinycrypt https://github.com/intel/tinycrypt
 clone Vulkan    https://github.com/KhronosGroup/Vulkan-Headers vulkan-sdk-1.4.357
+clone optick    https://github.com/Norbyte/optick
 
 echo "== patch Noesis for clang =="
 # NsCore/TypePropertyImpl.h marks void Get(const void*, void*) const as

@@ -1,7 +1,7 @@
 #pragma once
 
 #include <Lua/LuaHelpers.h>
-#include <lua/LuaBinding.h>
+#include <Lua/LuaBinding.h>
 #include <GameDefinitions/Stats/Functors.h>
 
 #include <mutex>

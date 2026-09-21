@@ -6,14 +6,19 @@
 Extender](https://github.com/Norbyte/bg3se) by **Norbyte** and the bg3se
 contributors, licensed MIT with the Commons Clause (see `vendor/bg3se/LICENSE`).
 
-**Thank you.** The 640 component definitions, the Lua binding framework and the
-code generators in this directory represent an enormous amount of reverse
-engineering. bg3le reuses them rather than rediscovering them, and would not be
-a realistic project otherwise.
+**Thank you.** The 640 component definitions, the Lua binding framework, the
+extender core and the code generators in this directory represent an enormous
+amount of reverse engineering. bg3le reuses them rather than rediscovering
+them, and would not be a realistic project otherwise.
 
 Copied subsystems: `CoreLib/`, `BG3Extender/GameDefinitions/`,
-`BG3Extender/Lua/`, plus the handful of files from `BG3Extender/Extender/` and
-`BG3Extender/GameHooks/` those depend on.
+`BG3Extender/Lua/`, `BG3Extender/Extender/`, `BG3Extender/GameHooks/`,
+`BG3Extender/Osiris/`, plus `stdafx.h`, `resource.h` and
+`BG3Updater/ExtenderAPI.h`.
+
+`external/lua` is Norbyte's Lua fork; see
+[external/lua/README.bg3le](../external/lua/README.bg3le) for why that one is
+not optional.
 
 ### Changes made
 
@@ -21,6 +26,9 @@ The upstream build is MSVC-only. Every change below exists solely to compile
 the same code with clang, and each is a construct MSVC would also accept, so
 they are candidates for an upstream conformance PR. Nothing was changed for
 behaviour.
+
+Run `tools/check-vendor-patches.py` to confirm they are all still applied —
+re-copying files from an upstream checkout silently reverts them.
 
 **A requires-clause cannot begin with `!` on a primary expression** — wrapped
 the constraint in parentheses:
@@ -43,12 +51,40 @@ the constraint in parentheses:
 
 - `CoreLib/Base/BaseFunction.h:186`
 
+**A variadic macro leaves a trailing comma when given no variadic argument.**
+MSVC drops it; standard C++ needs `__VA_OPT__`. Applied to `DEBUG`, `INFO`,
+`WARN`, `ERR`, their `_LOCAL` variants and `WARN_ONCE`:
+
+- `CoreLib/Utils.h:10-21`
+
 **`__FUNCTION__` is a variable under clang, not a string literal**, so it
-cannot be concatenated at compile time. The stringstream macros now stream it
-and the `...S` macros build the string at runtime:
+cannot be concatenated at compile time. The stringstream macros stream it and
+the `...S` macros build the string at runtime:
 
 - `BG3Extender/Extender/Shared/Utils.h` (`LuaError`, `OsiError`, `OsiWarn`,
   `OsiErrorS`, `OsiWarnS`, `OsiMsgS`)
+
+**`std::thread` was forward-declared.** libc++ declares it in an inline
+namespace, so a second declaration is a distinct type and every use becomes
+ambiguous. Replaced with `#include <thread>`:
+
+- `BG3Extender/Extender/Shared/Utils.h:6`
+
+**A static data member of a class template specialisation needs `template<>`**:
+
+- `BG3Extender/Extender/Client/SDLManager.h:15` (the `SDL_HOOK` macro)
+
+**`FixedStringUnhashed` had no stream operator.** It is a sibling of
+`FixedString`, not a `FixedString`, so the existing overload did not apply and
+insertion was ambiguous between the base class conversions to `char const*`
+and to `StringView`. Added the matching overload:
+
+- `CoreLib/Base/BaseString.h`
+
+**An include used the wrong directory case**, which resolves on Windows and
+not on Linux:
+
+- `BG3Extender/Lua/Shared/LuaStats.h:4` — `lua/LuaBinding.h` → `Lua/LuaBinding.h`
 
 **UTF-16 sources** — MSVC accepts them, clang does not. Transcoded to UTF-8:
 
@@ -59,11 +95,32 @@ and the `...S` macros build the string at runtime:
 
 Upstream gitignores these; they are committed here so the tree builds without
 a generation step. Regenerate with the upstream scripts, which run unchanged
-under python3:
+under python3, and with protoc:
 
     python3 vendor/bg3se/BG3Extender/make_enumerations.py
     python3 vendor/bg3se/BG3Extender/make_property_map.py
-    protoc --cpp_out=vendor/bg3se/BG3Extender Extender/Shared/ExtenderProtocol.proto
+    cd vendor/bg3se/BG3Extender
+    protoc --cpp_out=. Extender/Shared/ExtenderProtocol.proto
+    protoc --cpp_out=. Osiris/Debugger/osidebug.proto
+    protoc --cpp_out=. Lua/Debugger/LuaDebug.proto
+
+## vendor/compat — bg3le's own code
+
+Shims that let the upstream sources compile unmodified. They are force-included
+or sit ahead of the vendored tree on the include path.
+
+- `msvc_compat.h` — SAL annotations, Win32 typedefs (`DWORD` and `LONG` are
+  32-bit on Windows, so they are `unsigned int` and `int`, not `long`), the
+  MSVC bit-scan intrinsics, the secure-CRT `sprintf_s` family, `VirtualProtect`
+  over `mprotect`, and `QueryPerformanceCounter` over `CLOCK_MONOTONIC`
+- `concurrent_vector.h`, `concurrent_queue.h`, `ppl.h` — MSVC's
+  `concurrency::` containers mapped onto [oneTBB](https://github.com/uxlfoundation/oneTBB)
+  (Apache-2.0)
+- `WinSock2.h` — the Osiris debugger interface is written against Winsock;
+  Berkeley sockets map directly
+- `detours.h` — declarations only. The sole upstream user is
+  `CoreLib/Wrappers.h`, whose callers bg3le replaces with PLT interposition, so
+  these refuse rather than hook; `Wrap()` already handles a non-zero return
 
 ## Not vendored
 
@@ -71,9 +128,6 @@ under python3:
   also drops a stray `override` in `NsCore/TypePropertyImpl.h` that clang
   rejects (the base declares `GetCopy`, not that overload, so it never
   overrode anything).
-- **oneTBB** (Apache-2.0) — `vendor/compat/concurrent_{vector,queue}.h` map
-  MSVC's `concurrency::` containers onto it.
-- **glm, imgui, lua, rapidjson, tinycrypt, Vulkan-Headers** — fetched, each
+- **glm, imgui, rapidjson, tinycrypt, optick, Vulkan-Headers** — fetched, each
   under its own license.
-
-`vendor/compat/` is bg3le's own code.
+- **protobuf, SDL2, oneTBB** — from the distribution.
