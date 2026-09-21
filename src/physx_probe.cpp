@@ -164,13 +164,21 @@ void physx_probe_install() {
         g_real_convert_class = reinterpret_cast<ConvertClassProc>(original);
     }
 
-    if (hook_call_sites(kTempAlloc, reinterpret_cast<void*>(&temp_alloc_hook),
-                        &original) > 0) {
-        g_real_temp_alloc = reinterpret_cast<TempAllocProc>(original);
-    }
-    if (hook_call_sites(kTempFree, reinterpret_cast<void*>(&temp_free_hook),
-                        &original) > 0) {
-        g_real_temp_free = reinterpret_cast<TempFreeProc>(original);
+    // The replacement allocator patches the same call sites, and whichever
+    // installs second finds none left to patch. When it is enabled, leave the
+    // allocator alone and let it do its own accounting.
+    const char* fast = std::getenv("BG3LE_FAST_ALLOC");
+    if (fast != nullptr && fast[0] == '1') {
+        statusf("physx: skipping allocator timing (fast alloc owns those sites)");
+    } else {
+        if (hook_call_sites(kTempAlloc, reinterpret_cast<void*>(&temp_alloc_hook),
+                            &original) > 0) {
+            g_real_temp_alloc = reinterpret_cast<TempAllocProc>(original);
+        }
+        if (hook_call_sites(kTempFree, reinterpret_cast<void*>(&temp_free_hook),
+                            &original) > 0) {
+            g_real_temp_free = reinterpret_cast<TempFreeProc>(original);
+        }
     }
 
     // Report what this build considers native, for comparison with the tags.

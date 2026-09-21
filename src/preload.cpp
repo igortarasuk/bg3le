@@ -221,8 +221,8 @@ void ensure_symbols() {
                                      kSpinBeforeYield);
         }
         install_tick_hook();
+        fast_alloc_install();  // must claim the allocator sites before the probe
         physx_probe_install();
-        fast_alloc_install();
     });
 }
 
