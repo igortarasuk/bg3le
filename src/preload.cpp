@@ -43,6 +43,28 @@ std::once_flag g_init_struct_once;
 
 void ensure_symbols();
 
+// Defined in src/vendor/platform_linux.cpp.
+extern "C" bool bg3le_install_game_allocator(void* alloc, void* free);
+
+// Points bg3se's GameAllocRaw/GameFree at the engine's own heap, so any bg3se
+// container we grow allocates the way the engine does. Without this the two
+// function pointers are null, because the Windows path that fills them in is a
+// pattern scan we do not have. The mangled names are the engine's static
+// global operator new and operator delete.
+void install_game_allocator() {
+    void* alloc = g_symbols.find("_Znwm");
+    void* free = g_symbols.find("_ZdlPv");
+    if (!bg3le_install_game_allocator(alloc, free)) {
+        logf("game allocator: operator new/delete not found in the symbol "
+             "table (new %p, delete %p); anything that would allocate through "
+             "bg3se will refuse rather than run",
+             alloc, free);
+        return;
+    }
+    logf("game allocator: using the engine heap (new %p, delete %p)", alloc,
+         free);
+}
+
 template <typename Fn>
 Fn next(const char* mangled) {
     return reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, mangled));
@@ -231,6 +253,7 @@ void ensure_symbols() {
         }
         install_tick_hook();
         ecs::install_container_capture();
+        install_game_allocator();
         fast_alloc_install();
     });
 }

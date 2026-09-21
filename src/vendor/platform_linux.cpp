@@ -62,6 +62,47 @@ bool LibraryManager::PostStartupFindLibraries()
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// The game allocator
+//
+// GameAllocRaw/GameFree call through gCoreLibPlatformInterface.Alloc and
+// .Free, and on Windows FindLibraries above is what fills those in, from
+// ls::GlobalAllocator found by pattern scan. Ours reports failure, so both
+// stayed null: any bg3se path that allocated would have called a null
+// function pointer.
+//
+// That matters as soon as we touch an engine-owned container, because growing
+// one has to use the engine's heap -- and the engine's heap is not malloc. Its
+// global operator new runs size-class free lists, and its operator delete
+// recovers an arena base by masking the pointer, so handing either a malloc'd
+// block would corrupt it. bg3se's own malloc fallback is not safe here.
+//
+// The engine's operator new and operator delete are the right allocator by
+// construction, and unlike ls::GlobalAllocator they are nameable: they are
+// static, but static symbols still appear in .symtab. bg3le looks them up by
+// mangled name and installs them here.
+// ---------------------------------------------------------------------------
+
+// Takes the two as void* so bg3le can call this without bg3se's headers.
+extern "C" bool bg3le_install_game_allocator(void* alloc, void* free)
+{
+    if (alloc == nullptr || free == nullptr) return false;
+    gCoreLibPlatformInterface.Alloc =
+        reinterpret_cast<CoreLibPlatformInterface::AllocProc*>(alloc);
+    gCoreLibPlatformInterface.Free =
+        reinterpret_cast<CoreLibPlatformInterface::FreeProc*>(free);
+    return true;
+}
+
+// Whether an allocation would land on a real allocator rather than a null
+// function pointer. Everything that can grow an engine container checks this
+// first, so a failed lookup is a refusal rather than a crash.
+extern "C" bool bg3le_game_allocator_ready()
+{
+    return gCoreLibPlatformInterface.Alloc != nullptr
+        && gCoreLibPlatformInterface.Free != nullptr;
+}
+
 void LibraryManager::ApplyCodePatches()
 {
     // The upstream patches are byte edits keyed to Windows builds.

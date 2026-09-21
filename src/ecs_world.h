@@ -6,13 +6,20 @@ namespace bg3le {
 namespace ecs {
 
 // Patches the call sites of EntityStorageContainer::GetEntityStorage so the
-// first call records the container it goes through. Returns false if no site
-// could be patched.
+// calls record the containers they go through. Returns false if no site could
+// be patched.
 bool install_container_capture();
 
-// The captured EntityStorageContainer, or nullptr if no entity lookup has
-// happened yet.
+// The captured EntityStorageContainers, or nullptr if nothing has gone through
+// that slot yet.
+//
+// There are two, because BG3 runs a client EntityWorld and a server
+// EntityWorld with a container each, and which one the engine touches first is
+// not ours to choose. Only the server world has replication buffers, so the
+// two are told apart by that rather than by capture order -- see
+// server_container() in lua_host.cpp.
 void* container();
+void* container_alt();
 
 // The most recent EntityHandle passed to the lookup. A real, live handle to
 // test component access against while UUID -> handle is unimplemented.

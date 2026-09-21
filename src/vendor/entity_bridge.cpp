@@ -169,11 +169,9 @@ extern "C" std::uint64_t bg3le_uuid_to_handle(void* container,
 // bitset -- and EntityWorld::Storage *is* the container we captured. So it
 // needs no world either.
 //
-// This is MarkComponentAsChanged, not bg3se's full Replicate: that one also
-// goes through ReplicateComponent to set per-field replication flags. Marking
-// the component dirty is what makes the server-side change take effect; if a
-// field turns out not to reach the client, that difference is the first place
-// to look.
+// This is MarkComponentAsChanged on its own, which makes the server act on
+// the new value. Getting it to the client as well takes the replication flags
+// too -- see bg3le_replicate_component below.
 extern "C" bool bg3le_mark_component_changed(void* container,
                                              std::uint64_t handle,
                                              std::uint16_t componentIndex) {
@@ -208,6 +206,134 @@ extern "C" bool bg3le_set_health(void* container, std::uint64_t handle,
     component->Hp = hp;
     if (setMax) component->MaxHp = hp;
     return true;
+}
+
+
+// Recovers the EntityWorld from the captured container.
+//
+// EntityWorld has no symbol and no capture point, but it turns out not to need
+// one: EntityStorageContainer::ComponentRegistry points at EntityWorld's
+// ComponentRegistry_, which is a by-value member sitting immediately after
+// Replication. So the world is that registry pointer less the member's offset.
+//
+// Two independent pointers confirm it: world->Storage has to come back out as
+// the container we started from, and &world->Queries has to equal the
+// container's own Queries pointer. bg3le_world_probe reports both, so a layout
+// drift shows up as a failed check rather than as a wild pointer.
+namespace {
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Winvalid-offsetof"
+constexpr std::size_t kComponentRegistryOffset =
+    offsetof(bg3se::ecs::EntityWorld, ComponentRegistry_);
+#pragma clang diagnostic pop
+
+// Replication is the first member, so the registry is one pointer in.
+static_assert(kComponentRegistryOffset == sizeof(void*),
+              "EntityWorld::Replication is expected to precede ComponentRegistry_");
+
+bg3se::ecs::EntityWorld* world_from_container(void* container) {
+    if (container == nullptr) return nullptr;
+
+    auto* storages = reinterpret_cast<bg3se::ecs::EntityStorageContainer*>(container);
+    auto* registry = storages->ComponentRegistry;
+    if (registry == nullptr) return nullptr;
+
+    return reinterpret_cast<bg3se::ecs::EntityWorld*>(
+        reinterpret_cast<char*>(registry) - kComponentRegistryOffset);
+}
+
+}  // namespace
+
+// Reports everything needed to judge whether the recovered world is real: the
+// pointer itself, its Replication buffers, the size of the replication pool
+// array -- which should be close to the number of ReplicatedTypeContext
+// indices in the symbol table -- and whether Storage and Queries round-trip.
+extern "C" void bg3le_world_probe(void* container, void** world,
+                                  void** replication, std::int32_t* poolCount,
+                                  bool* storageMatches, bool* queriesMatch) {
+    *world = nullptr;
+    *replication = nullptr;
+    *poolCount = -1;
+    *storageMatches = false;
+    *queriesMatch = false;
+
+    auto* w = world_from_container(container);
+    if (w == nullptr) return;
+    *world = w;
+
+    auto* storages = reinterpret_cast<bg3se::ecs::EntityStorageContainer*>(container);
+    *storageMatches = (w->Storage == storages);
+    *queriesMatch = (&w->Queries == storages->Queries);
+
+    if (w->Replication == nullptr) return;
+    *replication = w->Replication;
+    *poolCount = (std::int32_t)w->Replication->ComponentPools.Size();
+}
+
+// Whether this container belongs to the server world.
+//
+// The client and server each have an EntityWorld, and replication buffers are
+// only allocated on the server's -- which is how bg3se's ReplicateComponent
+// decides it is being called from the wrong side. So the same test identifies
+// which of the two captured containers is which, without depending on the
+// order the engine happened to touch them in.
+extern "C" bool bg3le_container_is_server(void* container) {
+    auto* world = world_from_container(container);
+    return world != nullptr && world->Replication != nullptr;
+}
+
+// bg3se's ReplicateComponent, reached through the recovered world.
+//
+// Marking a component changed makes the server act on the new value;
+// replication is what sends it to the client, and without it anything reading
+// the replicated copy -- the UI included -- never sees it. Whole-component
+// replication is qword 0 with every flag set, as EntityProxyMetatable::
+// Replicate passes.
+//
+// Status: 0 ok, 1 no container, 2 no world, 3 no replication buffers (a
+// client-side world; only the server replicates), 4 replication type index out
+// of range, 5 could not add the entity to the pool, 6 the engine allocator is
+// not installed and this call would have had to allocate.
+extern "C" bool bg3le_game_allocator_ready();
+
+extern "C" std::int32_t bg3le_replicate_component(void* container,
+                                                  std::uint64_t handle,
+                                                  std::uint16_t replicationTypeIndex,
+                                                  std::uint32_t qword,
+                                                  std::uint64_t flags) {
+    if (container == nullptr) return 1;
+
+    auto* world = world_from_container(container);
+    if (world == nullptr) return 2;
+    if (world->Replication == nullptr) return 3;
+
+    auto& pools = world->Replication->ComponentPools;
+    if (replicationTypeIndex >= pools.Size()) return 4;
+
+    const auto entity = bg3se::EntityHandle(handle);
+    auto& pool = pools[replicationTypeIndex];
+
+    // add_key and EnsureSize both grow engine-owned memory, so they need the
+    // engine's allocator to be installed. Refuse rather than call a null
+    // Alloc, and refuse rather than mix a foreign heap into an engine
+    // container.
+    auto* syncFlags = pool.try_get(entity);
+    if (syncFlags == nullptr) {
+        if (!bg3le_game_allocator_ready()) return 6;
+        syncFlags = pool.add_key(entity);
+    }
+    if (syncFlags == nullptr) return 5;
+
+    if (syncFlags->NumQwords() <= qword && !bg3le_game_allocator_ready()) {
+        return 6;
+    }
+    syncFlags->EnsureSize((qword + 1) * 64);
+    const bool changed = (syncFlags->GetBuf()[qword] & flags) != flags;
+    syncFlags->GetBuf()[qword] |= flags;
+    if (changed) world->Replication->Dirty = true;
+
+    return 0;
 }
 
 }  // namespace bg3le

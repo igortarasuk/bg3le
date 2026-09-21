@@ -397,6 +397,34 @@ extern "C" bool bg3le_mark_component_changed(void* container, std::uint64_t hand
 extern "C" bool bg3le_set_health(void* container, std::uint64_t handle,
                                  std::uint16_t componentIndex, std::int32_t hp,
                                  bool setMax);
+extern "C" void bg3le_world_probe(void* container, void** world,
+                                  void** replication, std::int32_t* poolCount,
+                                  bool* storageMatches, bool* queriesMatch);
+extern "C" std::int32_t bg3le_replicate_component(void* container,
+                                                  std::uint64_t handle,
+                                                  std::uint16_t replicationTypeIndex,
+                                                  std::uint32_t qword,
+                                                  std::uint64_t flags);
+
+extern "C" bool bg3le_container_is_server(void* container);
+extern "C" bool bg3le_game_allocator_ready();
+
+// The container belonging to the server world.
+//
+// Both worlds come through the capture thunk and the order is not ours to
+// choose, so the slots are sorted out here by asking which one has replication
+// buffers. Server-side script runs against server state: reading the client's
+// copy of a component gives a value that looks right but is a replica, and
+// writing it is overwritten on the next update.
+//
+// Falls back to whatever was captured first if neither slot identifies as the
+// server yet, so nothing that used to work stops working before the second
+// container has been seen.
+void* server_container() {
+    if (bg3le_container_is_server(ecs::container())) return ecs::container();
+    if (bg3le_container_is_server(ecs::container_alt())) return ecs::container_alt();
+    return ecs::container();
+}
 
 // Resolves a component name to its engine index, trying the one-frame registry
 // as a fallback.
@@ -414,7 +442,7 @@ int l_entity_get_health(lua_State* L) {
 
     std::int32_t hp = 0;
     std::int32_t maxHp = 0;
-    if (!bg3le_entity_health(ecs::container(), handle,
+    if (!bg3le_entity_health(server_container(), handle,
                              static_cast<std::uint16_t>(*index), &hp, &maxHp)) {
         return 0;
     }
@@ -432,7 +460,7 @@ int l_entity_set_health(lua_State* L) {
         lua_pushboolean(L, 0);
         return 1;
     }
-    lua_pushboolean(L, bg3le_set_health(ecs::container(), handle,
+    lua_pushboolean(L, bg3le_set_health(server_container(), handle,
                                         static_cast<std::uint16_t>(*index), hp,
                                         setMax));
     return 1;
@@ -448,7 +476,93 @@ int l_entity_mark_changed(lua_State* L) {
         return 2;
     }
     lua_pushboolean(L, bg3le_mark_component_changed(
-        ecs::container(), handle, static_cast<std::uint16_t>(*index)));
+        server_container(), handle, static_cast<std::uint16_t>(*index)));
+    return 1;
+}
+
+// Marking a component changed only tells the server. Replication is a second,
+// separate registry: a component has a ReplicatedTypeContext index alongside
+// its ComponentTypeIdContext one, and setting that entity's flags in the
+// matching pool is what sends the value to the client.
+int l_entity_replicate(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
+    const char* name = luaL_checkstring(L, 2);
+
+    const auto index = ecs::index_of(ecs::Context::Replication, name);
+    if (!index.has_value()) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s is not a replicated component", name);
+        return 2;
+    }
+
+    // Whole-component replication: qword 0, every flag set.
+    const auto status = bg3le_replicate_component(
+        server_container(), handle, static_cast<std::uint16_t>(*index), 0,
+        ~static_cast<std::uint64_t>(0));
+    if (status == 0) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+
+    static const char* const messages[] = {
+        "",
+        "the entity storage container has not been captured yet",
+        "could not recover the entity world from the container",
+        "this world has no replication buffers; only the server replicates",
+        "the replication type index is outside the replication pool array",
+        "could not add the entity to the replication pool",
+        "the engine allocator is not installed, and this would have allocated",
+    };
+    static_assert(sizeof(messages) / sizeof(messages[0]) == 7,
+                  "keep in step with bg3le_replicate_component status codes");
+    lua_pushnil(L);
+    lua_pushfstring(L, "could not replicate %s: %s", name,
+                    (status >= 1 && status <= 5) ? messages[status] : "unknown error");
+    return 2;
+}
+
+// Diagnostic for the world recovery: reports the derived pointers and whether
+// the two independent cross-checks hold.
+// Pushes one captured slot as a table. Both are reported, because which of
+// them is the server is the whole question.
+void push_world_probe(lua_State* L, void* container) {
+    void* world = nullptr;
+    void* replication = nullptr;
+    std::int32_t poolCount = -1;
+    bool storageMatches = false;
+    bool queriesMatch = false;
+    bg3le_world_probe(container, &world, &replication, &poolCount,
+                      &storageMatches, &queriesMatch);
+
+    lua_newtable(L);
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)container);
+    lua_setfield(L, -2, "Container");
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)world);
+    lua_setfield(L, -2, "World");
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)replication);
+    lua_setfield(L, -2, "Replication");
+    lua_pushinteger(L, poolCount);
+    lua_setfield(L, -2, "ReplicationPools");
+    lua_pushboolean(L, storageMatches);
+    lua_setfield(L, -2, "StorageMatches");
+    lua_pushboolean(L, queriesMatch);
+    lua_setfield(L, -2, "QueriesMatch");
+    lua_pushboolean(L, bg3le_container_is_server(container));
+    lua_setfield(L, -2, "IsServer");
+}
+
+int l_world_probe(lua_State* L) {
+    lua_newtable(L);
+    push_world_probe(L, ecs::container());
+    lua_setfield(L, -2, "Slot1");
+    push_world_probe(L, ecs::container_alt());
+    lua_setfield(L, -2, "Slot2");
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)server_container());
+    lua_setfield(L, -2, "ServerContainer");
+    lua_pushinteger(L, (lua_Integer)ecs::count(ecs::Context::Replication));
+    lua_setfield(L, -2, "ReplicatedTypes");
+    lua_pushboolean(L, bg3le_game_allocator_ready());
+    lua_setfield(L, -2, "AllocatorReady");
     return 1;
 }
 
@@ -465,7 +579,7 @@ int l_entity_has_component(lua_State* L) {
     std::int32_t storageIndex = -1;
     void* storage = nullptr;
     void* component = nullptr;
-    bg3le_entity_probe(ecs::container(), handle,
+    bg3le_entity_probe(server_container(), handle,
                        static_cast<std::uint16_t>(*index), &storageIndex,
                        &storage, &component);
     lua_pushboolean(L, component != nullptr);
@@ -489,7 +603,7 @@ int l_uuid_to_handle(lua_State* L) {
     }
 
     const std::uint64_t handle = bg3le_uuid_to_handle(
-        ecs::container(), static_cast<std::uint16_t>(*index), uuid);
+        server_container(), static_cast<std::uint16_t>(*index), uuid);
     if (handle == 0) {
         lua_pushnil(L);
         lua_pushstring(L, "UUID not found in the mapping");
@@ -519,7 +633,7 @@ int l_entity_probe(lua_State* L) {
     auto handle = static_cast<std::uint64_t>(luaL_optinteger(L, 1, 0));
     bool found = false;
     if (handle == 0) {
-        handle = bg3le_find_entity_with(ecs::container(),
+        handle = bg3le_find_entity_with(server_container(),
                                         static_cast<std::uint16_t>(*index), &seen);
         found = true;
     }
@@ -527,7 +641,7 @@ int l_entity_probe(lua_State* L) {
     std::int32_t storageIndex = -1;
     void* storage = nullptr;
     void* component = nullptr;
-    bg3le_entity_probe(ecs::container(), handle,
+    bg3le_entity_probe(server_container(), handle,
                        static_cast<std::uint16_t>(*index), &storageIndex,
                        &storage, &component);
 
@@ -550,7 +664,7 @@ int l_entity_probe(lua_State* L) {
     if (component != nullptr) {
         std::int32_t hp = 0;
         std::int32_t maxHp = 0;
-        if (bg3le_entity_health(ecs::container(), handle,
+        if (bg3le_entity_health(server_container(), handle,
                                 static_cast<std::uint16_t>(*index), &hp, &maxHp)) {
             lua_pushinteger(L, hp);
             lua_setfield(L, -2, "Hp");
@@ -594,7 +708,7 @@ int l_entity_health(lua_State* L) {
 
     std::int32_t hp = 0;
     std::int32_t maxHp = 0;
-    if (!bg3le_entity_health(ecs::container(), handle,
+    if (!bg3le_entity_health(server_container(), handle,
                              static_cast<std::uint16_t>(*index), &hp, &maxHp)) {
         lua_pushnil(L);
         lua_pushstring(L, "entity has no Health component");
@@ -700,6 +814,10 @@ void lua_init() {
     lua_setfield(g_lua, -2, "SetHealth");
     lua_pushcfunction(g_lua, l_entity_mark_changed);
     lua_setfield(g_lua, -2, "MarkChanged");
+    lua_pushcfunction(g_lua, l_entity_replicate);
+    lua_setfield(g_lua, -2, "Replicate");
+    lua_pushcfunction(g_lua, l_world_probe);
+    lua_setfield(g_lua, -2, "WorldProbe");
     lua_pushcfunction(g_lua, l_entity_has_component);
     lua_setfield(g_lua, -2, "HasComponent");
     lua_setfield(g_lua, -2, "_Internal");
@@ -946,13 +1064,21 @@ function entity_methods:GetComponent(name)
   return make_component(self.Handle, name, proxy)
 end
 
+-- Marking the component changed is what the server acts on; setting the
+-- replication flags is what reaches the client. Both are needed for a write
+-- to show up in the UI.
 function entity_methods:Replicate(name)
   local mapped = ({Health = "eoc::HealthComponent"})[name]
   if mapped == nil then
     error("bg3le: Replicate does not know the " .. tostring(name)
           .. " component yet", 0)
   end
-  return Ext._Internal.MarkChanged(self.Handle, mapped)
+  if not Ext._Internal.MarkChanged(self.Handle, mapped) then
+    error("bg3le: could not mark " .. name .. " as changed", 0)
+  end
+  local ok, err = Ext._Internal.Replicate(self.Handle, mapped)
+  if not ok then error("bg3le: " .. tostring(err), 0) end
+  return true
 end
 
 local entity_meta = {

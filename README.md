@@ -28,6 +28,12 @@ none of it behavioural.
   optional
 - Loose-file mod loading: `Mods.<ModTable>`, `Config.json`, `BootstrapServer.lua`
   and `Ext.Require`, discovered via `BG3LE_MOD_PATH`
+- `Ext.Entity` against the live ECS: `Ext.Entity.Get(uuid)`, component reads
+  and writes, and `entity:Replicate(name)` that reaches the client. The engine
+  names every ECS type index in its symbol table, so the component and
+  replication registries come straight out of `.symtab` — the Windows extender
+  has to recover the same mapping by scanning the image for byte patterns.
+  Typed for `Health` so far; see [What is left](#what-is-left)
 - A Lua debugger server compatible with the
   [bg3lua](https://github.com/lenonk/bg3lua) client (`client/` submodule),
   plus `CreateConsole` parity that opens a terminal on startup
@@ -37,16 +43,28 @@ none of it behavioural.
   lock-free thread-local pool. See
   [reference/SLOW-LOAD-DIAGNOSIS.md](reference/SLOW-LOAD-DIAGNOSIS.md).
 
-## Not implemented
+## What is left
 
-`Ext.Entity` and the other engine-reflection modules, mod loading, and the
-client-side modules. The vendored definitions compile, but nothing is wired to
-the ECS yet.
+- **Most of `Ext.*`.** Around 265 functions bg3se exposes have no equivalent
+  here yet. The ECS plumbing they need is done, so most are now a component
+  index plus a vendored struct
+- **Typed components beyond `Health`.** Field access still goes through a
+  hardcoded name map, which will not scale; a generic path driven by bg3se's
+  own property metadata is the obvious next step
+- **The client-side modules.** `Ext.ClientUI` in particular is blocked on the
+  placeholder Noesis RTTI — the native game ships no Noesis typeinfo at all,
+  so `src/vendor/noesis_rtti_linux.cpp` aliases 19 of them to one real
+  placeholder type. That is safe only while no Noesis `dynamic_cast` runs. The
+  real fix is keeping Noesis types out of the generated property maps
+- **Launching.** See [Running](#running)
 
 ## Building
 
-Needs clang, libc++ (including the static archives), CMake, oneTBB, protobuf
-and SDL2.
+Needs clang, libc++ (including the static archives), CMake, SDL2 and the
+Vulkan loader. protobuf and abseil are built from source by
+`tools/fetch-externals.sh` rather than taken from the distribution, because the
+packaged builds are compiled against libstdc++ and export `std::__cxx11`
+symbols that cannot link into a libc++ library.
 
     tools/fetch-externals.sh    # Noesis, glm, imgui, lua, rapidjson, Vulkan
     cmake -S . -B build && cmake --build build
@@ -69,7 +87,12 @@ loaded inside the Steam runtime container cannot rely on host libraries.
 
 ## Running
 
-    ./run-native.sh
+**There is no install or launch story yet.** bg3le is a shared library that
+has to be loaded into `bin/bg3` before the engine starts, and arranging that
+is an unsolved problem, not a documented step. It needs to work for both Steam
+and non-Steam installs, and ideally without the player editing launch options
+by hand. Until that exists, running it means knowing how to preload a library
+into a process inside the Steam runtime container.
 
 Offsets are pinned to game version `4.8.400.7143220`. `tools/find_slots.py` and
 `tools/recover_symbols.py` regenerate them for a new build.

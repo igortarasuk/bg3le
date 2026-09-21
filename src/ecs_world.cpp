@@ -56,29 +56,44 @@ constexpr std::uintptr_t kEntityStorageLookup = 0x218dc90;
 extern "C" {
 __attribute__((visibility("hidden"))) void* bg3le_ecs_lookup_original = nullptr;
 __attribute__((visibility("hidden"))) void* bg3le_ecs_storage = nullptr;
+__attribute__((visibility("hidden"))) void* bg3le_ecs_storage_alt = nullptr;
 __attribute__((visibility("hidden"))) unsigned long long bg3le_ecs_last_entity = 0;
 }
 
 namespace {
 
-// Records the first argument once, then jumps to the original. No prologue, no
-// clobbers, nothing touched but rax -- which is caller-saved and about to hold
-// the return value anyway.
+// Records the first argument into the first free of two slots, then jumps to
+// the original. No prologue, no clobbers, nothing touched but rax -- which is
+// caller-saved and about to hold the return value anyway.
+//
+// Two slots rather than one because the client and server worlds have a
+// container each and both come through here; keeping only the first meant
+// whichever the engine touched first was the only one we could ever reach.
 extern "C" void bg3le_ecs_capture_thunk();
 __asm__(
     ".text\n"
     ".globl bg3le_ecs_capture_thunk\n"
     ".hidden bg3le_ecs_capture_thunk\n"
     "bg3le_ecs_capture_thunk:\n"
-    "  mov bg3le_ecs_storage(%rip), %rax\n"
-    "  test %rax, %rax\n"
-    "  jne 1f\n"
     // Only record a container whose Storages buffer has been allocated.
     "  mov (%rdi), %rax\n"
     "  test %rax, %rax\n"
+    "  je 9f\n"
+    "  mov bg3le_ecs_storage(%rip), %rax\n"
+    "  test %rax, %rax\n"
     "  je 1f\n"
-    "  mov %rdi, bg3le_ecs_storage(%rip)\n"
+    // Slot one is taken. If it is this same container there is nothing to do,
+    // otherwise this is the other world and belongs in slot two.
+    "  cmp %rdi, %rax\n"
+    "  je 9f\n"
+    "  mov bg3le_ecs_storage_alt(%rip), %rax\n"
+    "  test %rax, %rax\n"
+    "  jne 9f\n"
+    "  mov %rdi, bg3le_ecs_storage_alt(%rip)\n"
+    "  jmp 9f\n"
     "1:\n"
+    "  mov %rdi, bg3le_ecs_storage(%rip)\n"
+    "9:\n"
     // Record the handle every time, so there is always a live entity to test
     // against while UUID -> handle is still missing.
     "  mov %rsi, bg3le_ecs_last_entity(%rip)\n"
@@ -103,6 +118,8 @@ bool install_container_capture() {
 }
 
 void* container() { return bg3le_ecs_storage; }
+
+void* container_alt() { return bg3le_ecs_storage_alt; }
 
 unsigned long long last_entity() { return bg3le_ecs_last_entity; }
 
