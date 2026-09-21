@@ -56,9 +56,12 @@ void start_stall_profile() {
     char pid[32];
     std::snprintf(pid, sizeof(pid), "%d", (int)::getpid());
 
-    const char* argv[] = {"perf",  "record", "-F",    "299", "-g",
-                          "-p",    pid,      "-o",    "/tmp/bg3-stall.perf.data",
-                          "--",    "sleep",  "75",    nullptr};
+    // No call graph and a low rate: with ~35 threads, stack-walking at a few
+    // hundred hertz costs more than the stall being measured. Self time at
+    // 99Hz is enough to name the hot function.
+    const char* argv[] = {"perf", "record", "-F", "99",
+                          "-p",   pid,      "-o", "/tmp/bg3-stall.perf.data",
+                          "--",   "sleep",  "70", nullptr};
 
     pid_t child = 0;
     posix_spawnattr_t attr;
@@ -72,7 +75,7 @@ void start_stall_profile() {
         return;
     }
     std::thread([child] { int st = 0; ::waitpid(child, &st, 0); }).detach();
-    statusf("perf: recording the load stall to /tmp/bg3-stall.perf.data");
+    statusf("perf: flat-sampling the load stall at 99Hz");
 }
 
 // ---- clock diagnostics ----
