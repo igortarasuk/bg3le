@@ -432,6 +432,10 @@ extern "C" bool bg3le_meta_array_length(void const* handle, const char* path,
                                         void* component, std::size_t* count,
                                         std::uint16_t* elemSize,
                                         std::uint8_t* elemKind);
+extern "C" bool bg3le_meta_map_key(void const* handle, const char* path,
+                                   void* component, std::size_t index,
+                                   void** address, std::uint8_t* kind,
+                                   std::uint16_t* size);
 extern "C" std::size_t bg3le_meta_class_count();
 extern "C" std::size_t bg3le_meta_component_count();
 extern "C" const char* bg3le_meta_engine_class(void const* handle);
@@ -488,7 +492,7 @@ std::optional<std::int32_t> component_index(const char* name) {
 enum class FieldKind : std::uint8_t {
     Unsupported = 0, Bool, Float, Double, Int8, Uint8, Int16, Uint16,
     Int32, Uint32, Int64, Uint64, Guid, Entity, ScalarArray, Struct,
-    DynArray, Inherit,
+    DynArray, Map, Inherit,
 };
 
 const char* field_kind_name(FieldKind kind) {
@@ -509,6 +513,7 @@ const char* field_kind_name(FieldKind kind) {
         case FieldKind::ScalarArray: return "array";
         case FieldKind::Struct: return "struct";
         case FieldKind::DynArray: return "array";
+        case FieldKind::Map: return "map";
         default: return "unsupported";
     }
 }
@@ -879,6 +884,46 @@ int l_array_info(lua_State* L) {
                           ? "struct"
                           : field_kind_name((FieldKind)elemKind));
     return 2;
+}
+
+// Ext._Internal.MapKey(handle, component, path, index) -> key
+//
+// index is zero-based, matching the slot the value at the same index occupies,
+// so walking the slots pairs keys with values.
+int l_map_key(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
+    const char* name = luaL_checkstring(L, 2);
+    const char* path = luaL_checkstring(L, 3);
+    const auto index = (std::size_t)luaL_checkinteger(L, 4);
+
+    void const* meta = nullptr;
+    void* component = component_pointer(handle, name, &meta);
+    if (meta == nullptr || component == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s is not available on this entity", name);
+        return 2;
+    }
+
+    void* address = nullptr;
+    std::uint8_t kind = 0;
+    std::uint16_t size = 0;
+    if (!bg3le_meta_map_key(meta, path, component, index, &address, &kind,
+                            &size)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s has no key at slot %d", name, path,
+                        (int)index);
+        return 2;
+    }
+
+    if (!push_field(L, address, (FieldKind)kind)) {
+        lua_pushnil(L);
+        lua_pushfstring(L,
+            "the keys of %s.%s are of an unsupported kind (%s); the values are "
+            "still reachable by slot", name, path,
+            field_kind_name((FieldKind)kind));
+        return 2;
+    }
+    return 1;
 }
 
 // Ext._Internal.ComponentFields(name [, path]) -> { field = kind, ... }, size
@@ -1309,6 +1354,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "FieldInfo");
     lua_pushcfunction(g_lua, l_array_info);
     lua_setfield(g_lua, -2, "ArrayInfo");
+    lua_pushcfunction(g_lua, l_map_key);
+    lua_setfield(g_lua, -2, "MapKey");
     lua_pushcfunction(g_lua, l_entity_has_component);
     lua_setfield(g_lua, -2, "HasComponent");
     lua_setfield(g_lua, -2, "_Internal");
@@ -1545,6 +1592,7 @@ end
 -- __len and __pairs are defined because Ext.Json.Stringify uses # and pairs,
 -- and both honour metamethods -- so a view still dumps like an array.
 local make_fields
+local make_map
 
 local function make_array(handle, comp, path)
   local function length()
@@ -1591,6 +1639,95 @@ local function make_array(handle, comp, path)
   })
 end
 
+-- A map field is a view too, keyed the way the engine keys it.
+--
+-- The engine keeps a hash map's keys and values in two parallel runs, so slot
+-- i holds key i alongside value i. That is what makes this presentable without
+-- hashing anything from Lua: iterating is a walk over both runs, and a lookup
+-- is that walk plus a comparison. Lookup is therefore linear rather than
+-- hashed, which is fine for the maps on a component -- they hold a handful of
+-- entries -- and it avoids needing the engine's own hash for every key type.
+--
+-- Keys of a kind bg3le cannot convert -- a FixedString, which would need the
+-- engine's global string table -- leave the key side unavailable while the
+-- values stay reachable by slot, which is what Entries() is for.
+make_map = function(handle, comp, path)
+  local function count()
+    local n = Ext._Internal.ArrayInfo(handle, comp, path)
+    return n or 0
+  end
+
+  local function key_at(i)
+    return Ext._Internal.MapKey(handle, comp, path, i)
+  end
+
+  local function value_at(i)
+    local vpath = path .. "[" .. i .. "]"
+    local kind = Ext._Internal.FieldInfo(comp, vpath)
+    if kind == "struct" then
+      local inner, err = Ext._Internal.ComponentFields(comp, vpath)
+      if inner == nil then error("bg3le: " .. tostring(err), 0) end
+      return make_fields(handle, comp, vpath, inner)
+    end
+    if kind == "array" then return make_array(handle, comp, vpath) end
+    if kind == "map" then return make_map(handle, comp, vpath) end
+    local value, err = Ext._Internal.GetField(handle, comp, vpath)
+    if value == nil and err ~= nil then error("bg3le: " .. err, 0) end
+    return value
+  end
+
+  -- Slot of a key, or nil. Linear, as above.
+  local function slot_of(key)
+    for i = 0, count() - 1 do
+      if key_at(i) == key then return i end
+    end
+    return nil
+  end
+
+  return setmetatable({}, {
+    __index = function(_, key)
+      -- A method rather than a field, so a map whose keys cannot be converted
+      -- is still walkable.
+      if key == "Entries" then
+        return function()
+          local out = {}
+          for i = 0, count() - 1 do
+            out[i + 1] = {Key = key_at(i), Value = value_at(i)}
+          end
+          return out
+        end
+      end
+      local i = slot_of(key)
+      if i == nil then return nil end
+      return value_at(i)
+    end,
+    __newindex = function(_, key, value)
+      local i = slot_of(key)
+      if i == nil then
+        error("bg3le: " .. comp .. "." .. path .. " has no key "
+              .. tostring(key) .. "; adding one is not supported", 0)
+      end
+      local ok, err = Ext._Internal.SetField(
+        handle, comp, path .. "[" .. i .. "]", value)
+      if not ok then error("bg3le: " .. tostring(err), 0) end
+    end,
+    __len = count,
+    -- Iterating yields key, value. A key that cannot be converted ends the
+    -- iteration rather than yielding nil, which would read as a shorter map;
+    -- Entries() is the way round that.
+    __pairs = function(self)
+      local i = -1
+      return function()
+        i = i + 1
+        if i >= count() then return nil end
+        local k = key_at(i)
+        if k == nil then return nil end
+        return k, value_at(i)
+      end, self, nil
+    end,
+  })
+end
+
 -- A view over a set of fields, used for a component, for a struct nested
 -- inside one, and for a struct that is an array element; the only difference
 -- is the path prefix.
@@ -1610,6 +1747,9 @@ make_fields = function(handle, comp, prefix, fields)
       local path = path_to(key)
       if kind == "array" then
         return make_array(handle, comp, path)
+      end
+      if kind == "map" then
+        return make_map(handle, comp, path)
       end
       if kind == "struct" then
         local inner, err = Ext._Internal.ComponentFields(comp, path)

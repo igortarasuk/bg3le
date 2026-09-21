@@ -41,11 +41,17 @@ enum class FieldKind : std::uint8_t {
     // Count and Data below rather than through guessed member offsets.
     // ElemKind, ElemSize and ElemTypeName describe the elements.
     DynArray,
+    // A hash map. Its keys and values are two parallel contiguous runs, so
+    // slot i holds key i and value i; KeyData and Data reach them. The
+    // element fields describe the values, the key fields the keys.
+    Map,
     // Not a field: records that the class also has the fields of the class
     // named in Name. Classes are declared in dependency-free order, so bases
     // are resolved by name at load rather than by pointer.
     Inherit,
 };
+
+struct FieldDesc;
 
 struct FieldDesc {
     char const* Name;       // a string literal from the generated metadata
@@ -68,10 +74,22 @@ struct FieldDesc {
     // correct by construction, the same way offsetof does for a plain field.
     std::size_t (*Count)(void const* container);
     void* (*Data)(void const* container);
+    // Map only: the key run, described in parallel with the value run above.
+    FieldKind KeyKind;
+    std::uint16_t KeySize;
+    void* (*KeyData)(void const* container);
     // Set for a view that must not be written through. A hash set's elements
     // are its keys, and writing one in place would leave the table's hashes
     // pointing at the old value, so the set is readable and not writable.
     bool ReadOnly;
+    // A full descriptor for the element type of any of the container kinds.
+    //
+    // The element fields above say enough to read a scalar element, but not to
+    // index one that is itself a container -- a map of arrays needs the inner
+    // array's own accessors, and those belong to the element type rather than
+    // to the field. Indexing a container therefore continues with this
+    // descriptor, which is how "Resources[0][1].Amount" works.
+    FieldDesc const* ElemDesc;
 };
 
 }  // namespace bg3le

@@ -138,6 +138,38 @@ void* set_data_thunk(void const* container) {
     return (void*)static_cast<S const*>(container)->keys().data();
 }
 
+// A hash map keeps its keys and its values in two parallel contiguous runs,
+// so slot i holds key i alongside value i -- which is what makes it
+// presentable without hashing anything: iteration is a walk over both runs.
+template <class T>
+struct MapTraits {
+    static constexpr bool kIsMap = false;
+    using Key = void;
+    using Value = void;
+};
+
+template <class K, class V>
+struct MapTraits<HashMap<K, V>> {
+    static constexpr bool kIsMap = true;
+    using Key = K;
+    using Value = V;
+};
+
+template <class M>
+std::size_t map_count_thunk(void const* container) {
+    return (std::size_t)static_cast<M const*>(container)->size();
+}
+
+template <class M>
+void* map_values_thunk(void const* container) {
+    return (void*)static_cast<M const*>(container)->raw_values().data();
+}
+
+template <class M>
+void* map_keys_thunk(void const* container) {
+    return (void*)static_cast<M const*>(container)->keys().data();
+}
+
 // The field kinds bg3le can read and write without interpretation. Enums
 // resolve to their underlying integer, which is how the engine stores them and
 // how a script wants to see them.
@@ -179,6 +211,8 @@ constexpr FieldKind kind_of() {
     } else if constexpr (VectorTraits<T>::kIsVector
                          || SetTraits<T>::kIsSet) {
         return FieldKind::DynArray;
+    } else if constexpr (MapTraits<T>::kIsMap) {
+        return FieldKind::Map;
     } else if constexpr (scalar_kind_of<T>() != FieldKind::Unsupported) {
         return scalar_kind_of<T>();
     } else if constexpr (std::is_class_v<T>) {
@@ -198,6 +232,14 @@ constexpr FieldDesc inherit_field(char const* baseName) {
     f.ElemKind = FieldKind::Unsupported;
     return f;
 }
+
+template <class T>
+constexpr FieldDesc make_field(char const* name, std::size_t offset);
+
+// A descriptor for a container's element type, so indexing a container can
+// continue with the element's own accessors rather than with the field's.
+template <class T>
+inline constexpr FieldDesc kElementDesc = make_field<T>("(element)", 0);
 
 // Builds a field descriptor from its type. Having every kind decision here
 // rather than spelled out in each macro means adding a kind is one edit.
@@ -221,6 +263,7 @@ constexpr FieldDesc make_field(char const* name, std::size_t offset) {
     auto describe_elements = [&f]<class E>() {
         f.ElemKind = scalar_kind_of<E>();
         f.ElemSize = (std::uint16_t)sizeof(E);
+        f.ElemDesc = &kElementDesc<E>;
         if constexpr (std::is_class_v<E>) {
             f.ElemTypeName = type_name<E>().data();
             f.ElemTypeNameLength = (std::uint16_t)type_name<E>().size();
@@ -242,6 +285,16 @@ constexpr FieldDesc make_field(char const* name, std::size_t offset) {
         f.Count = &set_count_thunk<T>;
         f.Data = &set_data_thunk<T>;
         f.ReadOnly = true;
+    } else if constexpr (MapTraits<T>::kIsMap) {
+        using K = typename MapTraits<T>::Key;
+        using V = typename MapTraits<T>::Value;
+        // The values are the elements; the keys are described separately.
+        describe_elements.template operator()<V>();
+        f.Count = &map_count_thunk<T>;
+        f.Data = &map_values_thunk<T>;
+        f.KeyData = &map_keys_thunk<T>;
+        f.KeyKind = scalar_kind_of<K>();
+        f.KeySize = (std::uint16_t)sizeof(K);
     } else if constexpr (std::is_class_v<T>) {
         f.TypeName = type_name<T>().data();
         f.TypeNameLength = (std::uint16_t)type_name<T>().size();
@@ -527,19 +580,13 @@ Resolved resolve_path(ClassFields const* cls, char const* path, void* base) {
             dot == std::string_view::npos ? rest : rest.substr(0, dot);
         if (segment.empty()) return out;
 
-        bool indexed = false;
-        long long index = 0;
+        // A segment may carry more than one subscript, because indexing a
+        // container can yield another one: a map of arrays reads as
+        // "Resources[0][1]".
+        std::string_view subscripts;
         if (const auto open = segment.find('['); open != std::string_view::npos) {
             if (segment.back() != ']') return out;
-            const auto digits = segment.substr(open + 1, segment.size() - open - 2);
-            if (digits.empty()) return out;
-            index = 0;
-            for (const char c : digits) {
-                if (c < '0' || c > '9') return out;
-                index = index * 10 + (c - '0');
-                if (index > 0xffffff) return out;  // absurd; refuse
-            }
-            indexed = true;
+            subscripts = segment.substr(open);
             segment = segment.substr(0, open);
             if (segment.empty()) return out;
         }
@@ -554,43 +601,61 @@ Resolved resolve_path(ClassFields const* cls, char const* path, void* base) {
             address = (char*)address + field->Offset;
         }
 
-        if (indexed) {
-            if (current.Kind != FieldKind::ScalarArray
-                && current.Kind != FieldKind::DynArray) {
-                return out;
-            }
-            if (current.ElemSize == 0) return out;
+        // Apply each subscript in turn, the element descriptor of one becoming
+        // the container of the next.
+        while (!subscripts.empty()) {
+            if (subscripts.front() != '[') return out;
+            const auto close = subscripts.find(']');
+            if (close == std::string_view::npos) return out;
 
-            if (current.Kind == FieldKind::DynArray) {
+            const auto digits = subscripts.substr(1, close - 1);
+            if (digits.empty()) return out;
+            std::size_t index = 0;
+            for (const char c : digits) {
+                if (c < '0' || c > '9') return out;
+                index = index * 10 + (std::size_t)(c - '0');
+                if (index > 0xffffff) return out;  // absurd; refuse
+            }
+            subscripts = subscripts.substr(close + 1);
+
+            if (current.ElemSize == 0 || current.ElemDesc == nullptr) return out;
+
+            switch (current.Kind) {
+            case FieldKind::ScalarArray:
+                if (index >= current.ElemCount) return out;
+                if (address != nullptr) {
+                    address = (char*)address + index * current.ElemSize;
+                }
+                break;
+
+            // A map indexes to its value, which is what makes the value side
+            // reachable by slot; the key side is read separately, because a
+            // path has no way to say "the key of this slot".
+            case FieldKind::DynArray:
+            case FieldKind::Map: {
                 if (current.Count == nullptr || current.Data == nullptr) return out;
                 if (address != nullptr) {
-                    if ((std::size_t)index >= current.Count(address)) return out;
+                    if (index >= current.Count(address)) return out;
                     void* data = current.Data(address);
                     if (data == nullptr) return out;
-                    address = (char*)data + (std::size_t)index * current.ElemSize;
+                    address = (char*)data + index * current.ElemSize;
                 }
-            } else {
-                if ((std::size_t)index >= current.ElemCount) return out;
-                if (address != nullptr) {
-                    address = (char*)address + (std::size_t)index * current.ElemSize;
-                }
+                break;
             }
 
-            // The element takes the place of the field. A struct element keeps
-            // its type name so the path can carry on into it.
-            FieldDesc elem{};
-            elem.Name = current.Name;
-            elem.Size = current.ElemSize;
-            elem.Kind = current.ElemKind != FieldKind::Unsupported
-                            ? current.ElemKind
-                            : FieldKind::Struct;
-            elem.ElemKind = FieldKind::Unsupported;
-            elem.TypeName = current.ElemTypeName;
-            elem.TypeNameLength = current.ElemTypeNameLength;
-            // An element of a read-only view is itself read-only: writing a
-            // hash set's key in place is exactly what must not happen.
-            elem.ReadOnly = current.ReadOnly;
-            current = elem;
+            default:
+                return out;  // not a container; nothing to index
+            }
+
+            // Continue with the element's own descriptor, which carries its
+            // accessors if it is itself a container. Read-only propagates: an
+            // element of a hash set is one of the keys its hashes were
+            // computed from.
+            const bool readOnly = current.ReadOnly;
+            char const* fieldName = current.Name;
+            current = *current.ElemDesc;
+            current.Name = fieldName;
+            current.ReadOnly = current.ReadOnly || readOnly;
         }
 
         if (dot == std::string_view::npos) {
@@ -634,15 +699,35 @@ namespace {
 // The kind to report for a resolved field. A struct with no table behind it,
 // and an array whose elements are structs with no table, cannot be acted on,
 // so they are reported as unsupported rather than as something traversable.
-std::uint8_t reportable_kind(FieldDesc const& field) {
+std::uint8_t reportable_kind(FieldDesc const& field, unsigned depth = 0) {
+    if (depth > 4) return (std::uint8_t)FieldKind::Unsupported;
+
     if (field.Kind == FieldKind::Struct && struct_type_of(&field) == nullptr) {
         return (std::uint8_t)FieldKind::Unsupported;
     }
-    if ((field.Kind == FieldKind::ScalarArray || field.Kind == FieldKind::DynArray)
-        && field.ElemKind == FieldKind::Unsupported
-        && elem_type_of(&field) == nullptr) {
+
+    if (field.Kind == FieldKind::ScalarArray || field.Kind == FieldKind::DynArray
+        || field.Kind == FieldKind::Map) {
+        // A container is usable if its elements are: a scalar, a struct bg3se
+        // describes, or another container. That last case is why this
+        // recurses rather than testing the element fields directly -- a
+        // HashMap<Guid, Array<Entry>> has no scalar element kind and no
+        // element struct, but indexing it twice reaches an Entry, so reporting
+        // it unsupported would hide a field that works.
+        if (field.ElemKind != FieldKind::Unsupported) {
+            return (std::uint8_t)field.Kind;
+        }
+        if (elem_type_of(&field) != nullptr) {
+            return (std::uint8_t)field.Kind;
+        }
+        if (field.ElemDesc != nullptr
+            && reportable_kind(*field.ElemDesc, depth + 1)
+                   != (std::uint8_t)FieldKind::Unsupported) {
+            return (std::uint8_t)field.Kind;
+        }
         return (std::uint8_t)FieldKind::Unsupported;
     }
+
     return (std::uint8_t)field.Kind;
 }
 
@@ -710,11 +795,43 @@ extern "C" bool bg3le_meta_array_length(void const* handle, char const* path,
         *count = r.Field.ElemCount;
         return true;
     }
-    if (r.Field.Kind == FieldKind::DynArray && r.Field.Count != nullptr) {
+    if ((r.Field.Kind == FieldKind::DynArray || r.Field.Kind == FieldKind::Map)
+        && r.Field.Count != nullptr) {
         *count = r.Field.Count(r.Address);
         return true;
     }
     return false;
+}
+
+// The key of one slot of a map.
+//
+// Keys are read by slot rather than looked up, because a lookup would mean
+// hashing a key built from Lua -- for every key type, with the engine's own
+// hash. Slot i holds the key belonging to the value at the same index, so
+// walking the slots pairs them up, and these maps are small enough for a
+// caller to walk.
+extern "C" bool bg3le_meta_map_key(void const* handle, char const* path,
+                                   void* component, std::size_t index,
+                                   void** address, std::uint8_t* kind,
+                                   std::uint16_t* size) {
+    *address = nullptr;
+    if (handle == nullptr || path == nullptr || component == nullptr) return false;
+
+    const auto r = resolve_path(static_cast<ClassFields const*>(handle), path,
+                                component);
+    if (!r.Ok || r.Address == nullptr) return false;
+    if (r.Field.Kind != FieldKind::Map) return false;
+    if (r.Field.Count == nullptr || r.Field.KeyData == nullptr) return false;
+    if (r.Field.KeySize == 0) return false;
+    if (index >= r.Field.Count(r.Address)) return false;
+
+    void* keys = r.Field.KeyData(r.Address);
+    if (keys == nullptr) return false;
+
+    *address = (char*)keys + index * r.Field.KeySize;
+    *kind = (std::uint8_t)r.Field.KeyKind;
+    *size = r.Field.KeySize;
+    return true;
 }
 
 // Enumerates a component's own fields, base classes included, for listing a
@@ -907,6 +1024,96 @@ extern "C" int bg3le_meta_selftest() {
         }
     }
 
+    // A map, which is the deepest walk: a HashMap<Guid, Array<...>> means
+    // indexing the map to a value that is itself an array, indexing that, and
+    // then descending into the element struct. That is the whole chain
+    // "Resources[0][1].Amount" exercised on real memory, and it is also the
+    // shape LenonTweaks needs.
+    ActionResourcesComponent resources;
+    const auto key = Guid{0x1122334455667788ull, 0x99aabbccddeeff00ull};
+    Array<ActionResourceEntry> entries;
+    ActionResourceEntry e0{};
+    e0.Amount = 3.5;
+    e0.MaxAmount = 4.0;
+    ActionResourceEntry e1{};
+    e1.Amount = 7.25;
+    e1.MaxAmount = 8.0;
+    entries.push_back(e0);
+    entries.push_back(e1);
+    resources.Resources.set(key, entries);
+
+    auto const* resMeta = static_cast<ClassFields const*>(
+        bg3le_meta_component("eoc::ActionResourcesComponent"));
+    if (resMeta == nullptr) {
+        fail("no metadata for the action resources component");
+    } else {
+        std::size_t mapCount = 0;
+        std::uint16_t mapElemSize = 0;
+        std::uint8_t mapElemKind = 0;
+        if (!bg3le_meta_array_length(resMeta, "Resources", &resources,
+                                     &mapCount, &mapElemSize, &mapElemKind)) {
+            fail("Resources has no length");
+        } else if (mapCount != 1) {
+            fail("Resources length is not 1");
+        }
+
+        // The key run, read by slot.
+        if (!bg3le_meta_map_key(resMeta, "Resources", &resources, 0, &address,
+                                &kind, &size)) {
+            fail("Resources has no key at slot 0");
+        } else {
+            if (kind != (std::uint8_t)FieldKind::Guid) {
+                fail("the Resources key is not reported as a Guid");
+            }
+            if (*(Guid*)address != key) fail("the Resources key does not match");
+        }
+
+        // A key past the end has to fail rather than run off the run.
+        if (bg3le_meta_map_key(resMeta, "Resources", &resources, 1, &address,
+                               &kind, &size)) {
+            fail("Resources returned a key at slot 1 of a one-entry map");
+        }
+
+        // Map -> value array -> element -> field, in one path.
+        if (!bg3le_meta_resolve(resMeta, "Resources[0][1].Amount", &resources,
+                                &address, &kind, &size, &readOnly)) {
+            fail("Resources[0][1].Amount does not resolve");
+        } else if (address != &resources.Resources.values()[0][1].Amount) {
+            fail("Resources[0][1].Amount resolved to the wrong address");
+        } else if (*(double*)address != 7.25) {
+            fail("Resources[0][1].Amount does not read back what was written");
+        }
+
+        if (!bg3le_meta_resolve(resMeta, "Resources[0][0].MaxAmount",
+                                &resources, &address, &kind, &size,
+                                &readOnly)) {
+            fail("Resources[0][0].MaxAmount does not resolve");
+        } else if (*(double*)address != 4.0) {
+            fail("Resources[0][0].MaxAmount does not read back");
+        }
+
+        // Indexing past the end of the inner array, and past the map.
+        if (bg3le_meta_resolve(resMeta, "Resources[0][2].Amount", &resources,
+                               &address, &kind, &size, &readOnly)) {
+            fail("the inner array indexed past its two entries");
+        }
+        if (bg3le_meta_resolve(resMeta, "Resources[1][0].Amount", &resources,
+                               &address, &kind, &size, &readOnly)) {
+            fail("the map indexed past its one entry");
+        }
+
+        // The write the mod actually wants: top an entry up to its maximum.
+        if (bg3le_meta_resolve(resMeta, "Resources[0][0].Amount", &resources,
+                               &address, &kind, &size, &readOnly)) {
+            *(double*)address = 4.0;
+            if (resources.Resources.values()[0][0].Amount != 4.0) {
+                fail("a write into a map's array element did not land");
+            }
+        } else {
+            fail("Resources[0][0].Amount does not resolve");
+        }
+    }
+
     if (failures == 0) {
         bg3le::logf("meta selftest: the container walks behave");
     }
@@ -914,6 +1121,13 @@ extern "C" int bg3le_meta_selftest() {
 }
 
 extern "C" std::size_t bg3le_meta_class_count() { return std::size(kAllClasses); }
+
+// The i'th class, for sweeping the whole set -- listing the components a
+// script can reach, or measuring how much of them converts.
+extern "C" void const* bg3le_meta_class_at(std::size_t index) {
+    if (index >= std::size(kAllClasses)) return nullptr;
+    return kAllClasses[index];
+}
 
 extern "C" std::size_t bg3le_meta_component_count() {
     std::size_t n = 0;

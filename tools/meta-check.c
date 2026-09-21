@@ -27,6 +27,8 @@ static size_t (*meta_class_count)(void);
 static size_t (*meta_component_count)(void);
 static int (*meta_selftest)(void);
 static int (*install_game_allocator)(void*, void*);
+static void const* (*meta_class_at)(size_t);
+static char const* (*meta_engine_class)(void const*);
 
 static int failures = 0;
 
@@ -193,6 +195,8 @@ int main(int argc, char** argv) {
     BIND(meta_component_count, "bg3le_meta_component_count")
     BIND(meta_selftest, "bg3le_meta_selftest")
     BIND(install_game_allocator, "bg3le_install_game_allocator")
+    BIND(meta_class_at, "bg3le_meta_class_at")
+    BIND(meta_engine_class, "bg3le_meta_engine_class")
 #undef BIND
 
     // The self-test builds a real dynamic array, which allocates through
@@ -249,11 +253,14 @@ int main(int argc, char** argv) {
     expect_path_adds("ls::TransformComponent", "Transform", "Translate");
     expect_path_adds("ls::TransformComponent", "Transform", NULL);
 
-    // A path through a type bg3se does not describe has to fail rather than
-    // resolving to the outer offset, which would read the wrong bytes
-    // entirely. Resources is a HashMap, which is not traversable yet.
+    // A map has to be indexed before it can be descended into: naming a field
+    // of the map itself must fail rather than reading the container's own
+    // bytes as a struct.
     expect_absent("eoc::ActionResourcesComponent", "Resources.Amount");
-    expect_kind("eoc::ActionResourcesComponent", "Resources", 0);
+    expect_kind("eoc::ActionResourcesComponent", "Resources", 17);  // Map
+
+    // Hash sets read as arrays of their keys.
+    expect_kind("eoc::summon::ContainerComponent", "Characters", 16);  // DynArray
 
     void const* health = meta_component("eoc::HealthComponent");
     printf("  eoc::HealthComponent is %zu bytes\n", meta_component_size(health));
@@ -264,6 +271,37 @@ int main(int argc, char** argv) {
     printf("  eoc::HealthComponent fields (%zu):", n);
     for (size_t i = 0; i < n; i++) printf(" %s", names[i]);
     printf("\n");
+
+    // How much of the component surface actually converts. Not a pass/fail --
+    // it is the number to watch when a field kind is added, and the quickest
+    // way to see whether a change moved the needle or only looked like it.
+    {
+        size_t components = 0, fields = 0, usable = 0;
+        size_t byKind[32] = {0};
+        for (size_t i = 0; i < meta_class_count(); i++) {
+            void const* cls = meta_class_at(i);
+            if (cls == NULL || meta_engine_class(cls) == NULL) continue;
+            components++;
+            size_t fn = meta_fields(cls, names, kinds, 256);
+            for (size_t j = 0; j < fn; j++) {
+                fields++;
+                if (kinds[j] < 32) byKind[kinds[j]]++;
+                if (kinds[j] != 0) usable++;
+            }
+        }
+        printf("\ncoverage: %zu of %zu fields convert across %zu components"
+               " (%.1f%%)\n", usable, fields, components,
+               fields ? 100.0 * (double)usable / (double)fields : 0.0);
+        static char const* const kindNames[] = {
+            "unsupported", "bool", "float", "double", "int8", "uint8", "int16",
+            "uint16", "int32", "uint32", "int64", "uint64", "guid", "entity",
+            "fixed array", "struct", "array", "map"};
+        for (size_t k = 0; k < sizeof(kindNames) / sizeof(kindNames[0]); k++) {
+            if (byKind[k] != 0) {
+                printf("  %-12s %zu\n", kindNames[k], byKind[k]);
+            }
+        }
+    }
 
     // Any further arguments are components to dump, by either name, which is
     // how to find out what a component actually offers before writing script

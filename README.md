@@ -48,13 +48,16 @@ none of it behavioural.
 - **Most of `Ext.*`.** Around 265 functions bg3se exposes have no equivalent
   here yet. The ECS plumbing they need is done, so most are now a component
   index plus a vendored struct
-- **`HashMap` fields.** Scalars, enums, nested structs, fixed-extent arrays,
-  dynamic arrays and hash sets are converted; maps are not, so
-  `ActionResources.Resources` and `SummonContainer.ByTag` read as unsupported.
-  Naming an unsupported field raises rather than returning nil, so a mod
-  cannot mistake a missing conversion for a missing value. Hash sets read as
-  arrays of their keys and are read-only, because writing a key in place would
-  leave the table's hashes stale
+- **The last fifth of the field kinds.** 2,189 of 2,708 component fields
+  convert (80.8%, from `tools/meta-check.c`): scalars, enums, nested structs,
+  fixed and dynamic arrays, hash sets and hash maps. What is left is mostly
+  `FixedString`, which is a 32-bit index into the engine's global string
+  table — and that table has no symbol and no entry point, since
+  `ls::FixedString`'s methods are all inlined in the native build. Until it is
+  found, a `FixedString` field is unreadable and a map keyed by one has
+  reachable values but unreadable keys. Naming an unsupported field raises
+  rather than returning nil, so a mod cannot mistake a missing conversion for
+  a missing value
 - **The client-side modules.** `Ext.ClientUI` in particular is blocked on the
   placeholder Noesis RTTI — the native game ships no Noesis typeinfo at all,
   so `src/vendor/noesis_rtti_linux.cpp` aliases 19 of them to one real
@@ -78,9 +81,10 @@ Optional checks:
     tools/check-vendor-all.sh      # per-file error counts for vendor/bg3se
     tools/check-vendor-patches.py  # confirms the clang fixes are still applied
     tools/check-prelude.sh         # parses the Lua embedded in lua_host.cpp
-    tools/check-array-view.py      # runs the prelude's array view against a stub
+    tools/check-views.py           # runs the array and map views against stubs
     cc -o /tmp/mc tools/meta-check.c -ldl && /tmp/mc build/libbg3le.so
-                                   # component field offsets, no game needed
+                                   # field offsets, the container walks, and
+                                   # how much of the surface converts
 
 The first four need no game and no built library (`meta-check` needs the
 library but not the game). The Lua prelude is a raw string literal, so a syntax
