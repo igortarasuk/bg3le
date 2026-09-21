@@ -1,8 +1,18 @@
-Vendored Lua 5.4.9, unmodified, from https://www.lua.org/ftp/lua-5.4.9.tar.gz
-sha256 2335b6c582a52654f94612bf10d2f4672805d05329aa6568b1d8cd9e5c6fb8e6
+Vendored from https://github.com/Norbyte/lua-dos at commit
+4fff4e19954f927a0478055306dadaf71bba02b2 (Lua 5.3.6 plus Norbyte's changes).
+
+This is the same Lua the Baldur's Gate 3 Script Extender builds against, and
+using it is not optional if bg3se's Lua binding layer is to be reused: that
+layer depends on additions this fork makes to the interpreter itself, not just
+on its own code. Specifically it needs the LUA_TCPPOBJECT value type, the
+CMetatable hook in ltm.h, and LUA_EXTRASPACE widened to two pointers.
+
+It also means mods see the Lua version bg3se mods are written against. bg3le
+previously vendored stock Lua 5.4.9, which cannot host that layer.
 
 Statically linked: an LD_PRELOAD shim loaded inside the Steam runtime
 container cannot rely on host libraries being present. lua.c and luac.c (the
 standalone interpreter and compiler mains) are omitted.
 
-Lua is MIT licensed; see the copyright notice at the end of lua.h.
+Lua is MIT licensed; see the copyright notice at the end of lua.h. The fork is
+by Norbyte, to whom thanks are owed for this and for bg3se generally.

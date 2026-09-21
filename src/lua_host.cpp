@@ -1,6 +1,7 @@
 #include "lua_host.h"
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <dirent.h>
@@ -12,11 +13,11 @@
 #include "mem.h"
 #include "log.h"
 
-extern "C" {
+// Norbyte's Lua fork is compiled as C++, as bg3se compiles it, so these must
+// not be wrapped in extern "C" or the symbols will not match.
 #include "lauxlib.h"
 #include "lua.h"
 #include "lualib.h"
-}
 
 namespace bg3le {
 namespace {
@@ -266,6 +267,21 @@ int l_list_dir(lua_State* L) {
     return 1;
 }
 
+// Norbyte's Lua fork expects the host to install these before anything can
+// allocate, because its GC calls them unconditionally; luaL_newstate alone
+// leaves them null and the first sweep jumps through a null pointer. bg3se
+// installs its own in LuaStateWrapper. bg3le creates no LUA_TCPPOBJECT
+// values, so only the allocator and the string-cache pair ever run.
+void* cpp_alloc(lua_State*, std::size_t size) { return std::malloc(size); }
+void cpp_free(lua_State*, void* block, std::size_t) { std::free(block); }
+void cpp_finalize(lua_State*, void*) {}
+void* cpp_canonicalize(lua_State*, void* val) { return val; }
+CMetatable* cpp_get_metatable(lua_State*, void*, unsigned long long) { return nullptr; }
+CMetatable* cpp_get_light_metatable(lua_State*, unsigned long long,
+                                    unsigned long long) { return nullptr; }
+void cache_string(lua_State*, TString*) {}
+void release_string(lua_State*, TString*) {}
+
 void register_log(lua_State* L, const char* name, int severity) {
     lua_pushinteger(L, severity);
     lua_pushcclosure(L, l_log, 1);
@@ -282,6 +298,9 @@ void lua_init() {
         logf("lua: luaL_newstate failed");
         return;
     }
+    lua_setup_cppobjects(g_lua, &cpp_alloc, &cpp_free, &cpp_get_light_metatable,
+                         &cpp_get_metatable, &cpp_finalize, &cpp_canonicalize);
+    lua_setup_strcache(g_lua, &cache_string, &release_string);
     luaL_openlibs(g_lua);
     // Ext.Log and Ext.Json are pure Lua/C and need no engine reflection, so
     // the helpers mods actually use every day can be compatible now. Shapes
@@ -738,3 +757,15 @@ void lua_run(const char* code) {
 }
 
 }  // namespace bg3le
+
+// Norbyte's Lua fork calls this from luaG_errormsg whenever an error is raised
+// while an error handler is installed, so a debugger can see errors that pcall
+// would otherwise swallow. The host has to supply it or the fork does not link.
+//
+// It fires for every handled error, including the deliberate ones in our timer
+// and mod-loading paths, so this goes to the log rather than the console.
+void nse_lua_report_handled_error(lua_State* L) {
+    const char* err = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1)
+                                                     : "(not a string)";
+    bg3le::logf("lua: handled error: %s", err);
+}

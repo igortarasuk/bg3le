@@ -21,8 +21,13 @@ none of it behavioural.
 
 - Osiris is live: `Osi.*` and the bare-global helpers, callable from an
   interactive prompt while the game runs
-- Lua 5.4 host with `Ext.Log`, `Ext.Json`, `Ext.Math` (scalar), `Ext.Table`,
-  `Ext.Timer`, `Ext.Utils`, and `_D`/`_P`/`_PW`/`_PE`
+- Lua host with `Ext.Log`, `Ext.Json`, `Ext.Math` (scalar), `Ext.Table`,
+  `Ext.Timer`, `Ext.Utils`, and `_D`/`_P`/`_PW`/`_PE`. The interpreter is
+  Norbyte's Lua fork, the same one bg3se uses — see
+  [external/lua/README.bg3le](external/lua/README.bg3le) for why that is not
+  optional
+- Loose-file mod loading: `Mods.<ModTable>`, `Config.json`, `BootstrapServer.lua`
+  and `Ext.Require`, discovered via `BG3LE_MOD_PATH`
 - A Lua debugger server compatible with the
   [bg3lua](https://github.com/lenonk/bg3lua) client (`client/` submodule),
   plus `CreateConsole` parity that opens a terminal on startup

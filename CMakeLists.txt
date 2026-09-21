@@ -8,9 +8,16 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Lua is vendored and statically linked: an LD_PRELOAD shim running inside the
 # Steam runtime container cannot rely on host libraries being present.
 file(GLOB LUA_SOURCES external/lua/*.c)
+# bg3se builds this fork as C++ (LuaLib.vcxproj sets CompileAsCpp), and its
+# own headers rely on that: lua.h names CMetatable and TString without a
+# struct tag, which is only legal in C++.
+set_source_files_properties(${LUA_SOURCES} PROPERTIES LANGUAGE CXX)
 add_library(lua_static STATIC ${LUA_SOURCES})
 target_include_directories(lua_static PUBLIC external/lua)
 target_compile_definitions(lua_static PRIVATE LUA_USE_LINUX)
+# ltable.c uses uintptr_t, which MSVC's headers supply transitively and
+# libstdc++/libc++ do not.
+target_compile_options(lua_static PRIVATE -include cstdint)
 set_target_properties(lua_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(bg3le SHARED
