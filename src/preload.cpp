@@ -40,6 +40,53 @@ Fn next(const char* mangled) {
     return reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, mangled));
 }
 
+// ---- clock diagnostics ----
+//
+// Profiling the native build shows ~12% of all cycles in clock_gettime plus
+// ~7% in the kernel, which is far too much for timekeeping and looks like a
+// hot loop. Clock ids matter here: CLOCK_MONOTONIC and CLOCK_REALTIME are
+// served by the vDSO in ~20ns, but CLOCK_*_CPUTIME_ID always enters the
+// kernel and costs ~1us. Count calls per id to see which is being used.
+// Enable with BG3LE_CLOCK_STATS=1.
+
+std::atomic<unsigned long> g_clock_calls[16];
+std::atomic<bool> g_clock_stats{false};
+
+const char* clock_name(int id) {
+    switch (id) {
+        case CLOCK_REALTIME: return "REALTIME";
+        case CLOCK_MONOTONIC: return "MONOTONIC";
+        case CLOCK_PROCESS_CPUTIME_ID: return "PROCESS_CPUTIME (syscall)";
+        case CLOCK_THREAD_CPUTIME_ID: return "THREAD_CPUTIME (syscall)";
+        case CLOCK_MONOTONIC_RAW: return "MONOTONIC_RAW (syscall)";
+        case CLOCK_REALTIME_COARSE: return "REALTIME_COARSE";
+        case CLOCK_MONOTONIC_COARSE: return "MONOTONIC_COARSE";
+        case CLOCK_BOOTTIME: return "BOOTTIME";
+        default: return "other";
+    }
+}
+
+extern "C" int clock_gettime(clockid_t clk, struct timespec* ts) {
+    static auto real = next<int (*)(clockid_t, struct timespec*)>("clock_gettime");
+    if (real == nullptr) return -1;
+
+    if (g_clock_stats.load(std::memory_order_relaxed)) {
+        const unsigned idx = static_cast<unsigned>(clk) < 16u
+                                 ? static_cast<unsigned>(clk) : 15u;
+        const unsigned long n =
+            g_clock_calls[idx].fetch_add(1, std::memory_order_relaxed);
+
+        // Report from one id only, so the log is not flooded.
+        if (idx == 1 && (n % 20000000UL) == 0 && n > 0) {
+            for (unsigned i = 0; i < 16; ++i) {
+                const unsigned long c = g_clock_calls[i].load(std::memory_order_relaxed);
+                if (c > 0) logf("clock: id=%u %-26s %lu calls", i, clock_name((int)i), c);
+            }
+        }
+    }
+    return real(clk, ts);
+}
+
 // ---- tick ----
 //
 // esv::GameServer::UpdateMessagesToSend flushes outbound network messages
@@ -89,6 +136,9 @@ void ensure_symbols() {
         logf("  sentinel esv TagComponentTypeContext::m_State -> %p", p);
         lua_init();
         debug_server_start();
+        if (const char* e = std::getenv("BG3LE_CLOCK_STATS")) {
+            g_clock_stats.store(e[0] == '1');
+        }
         install_tick_hook();
     });
 }

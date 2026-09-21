@@ -14,6 +14,7 @@ GAME=/home/lenon/bg3mods/bg3-linux-native
 SNIPER="$HOME/.local/share/Steam/steamapps/common/SteamLinuxRuntime_sniper"
 
 export MANGOHUD="${MANGOHUD:-1}"
+export BG3LE_DUMP_DB="${BG3LE_DUMP_DB:-1}"  # temporary: structural dump
 
 cd "$GAME"
 LD_PRELOAD="$HERE/build/libbg3le.so" \

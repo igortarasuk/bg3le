@@ -1,9 +1,12 @@
 #include "lua_host.h"
 
+#include <cstring>
 #include <ctime>
+#include <link.h>
 #include <string>
 
 #include "debug_server.h"
+#include "mem.h"
 #include "log.h"
 
 extern "C" {
@@ -123,6 +126,65 @@ int l_log(lua_State* L) {
     return 0;
 }
 
+// Raw memory access, so structure walks can be prototyped from the live
+// console instead of rebuilding and reloading a save for every guess.
+// Reads are fault-tolerant: a wrong address returns nil, it does not crash
+// the game.
+int l_module_base(lua_State* L) {
+    const char* want = luaL_checkstring(L, 1);
+    struct Ctx { const char* want; std::uintptr_t base; } ctx{want, 0};
+    ::dl_iterate_phdr(
+        [](struct dl_phdr_info* info, std::size_t, void* data) {
+            auto* c = static_cast<Ctx*>(data);
+            const char* name = info->dlpi_name;
+            if (c->want[0] == '\0') {
+                if (name == nullptr || name[0] == '\0') {
+                    c->base = info->dlpi_addr;
+                    return 1;
+                }
+                return 0;
+            }
+            if (name != nullptr && std::strstr(name, c->want) != nullptr) {
+                c->base = info->dlpi_addr;
+                return 1;
+            }
+            return 0;
+        },
+        &ctx);
+    if (ctx.base == 0) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushinteger(L, static_cast<lua_Integer>(ctx.base));
+    return 1;
+}
+
+int l_peek(lua_State* L) {
+    const auto addr = static_cast<std::uintptr_t>(luaL_checkinteger(L, 1));
+    const int width = static_cast<int>(luaL_optinteger(L, 2, 8));
+    std::uint64_t value = 0;
+    if (width != 1 && width != 2 && width != 4 && width != 8) {
+        return luaL_error(L, "Peek width must be 1, 2, 4 or 8");
+    }
+    if (!safe_read(reinterpret_cast<const void*>(addr), &value, width)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushinteger(L, static_cast<lua_Integer>(value));
+    return 1;
+}
+
+int l_peek_string(lua_State* L) {
+    const auto addr = static_cast<std::uintptr_t>(luaL_checkinteger(L, 1));
+    char buf[512];
+    if (!safe_cstr(reinterpret_cast<const void*>(addr), buf, sizeof(buf))) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushstring(L, buf);
+    return 1;
+}
+
 int l_monotonic_ms(lua_State* L) {
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -179,6 +241,15 @@ void lua_init() {
     lua_pushcfunction(g_lua, l_clock_time);
     lua_setfield(g_lua, -2, "ClockTime");
     lua_setfield(g_lua, -2, "Timer");
+
+    lua_newtable(g_lua);                       // Ext._Internal
+    lua_pushcfunction(g_lua, l_module_base);
+    lua_setfield(g_lua, -2, "ModuleBase");
+    lua_pushcfunction(g_lua, l_peek);
+    lua_setfield(g_lua, -2, "Peek");
+    lua_pushcfunction(g_lua, l_peek_string);
+    lua_setfield(g_lua, -2, "PeekString");
+    lua_setfield(g_lua, -2, "_Internal");
 
     lua_setglobal(g_lua, "Ext");
 

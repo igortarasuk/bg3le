@@ -4,7 +4,9 @@
 
 #include <cstring>
 #include <link.h>
+#include <cstdlib>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "log.h"
 #include "mem.h"
@@ -122,7 +124,8 @@ namespace {
 //
 //   [libOsiris + kFunctionDbHolder] -> holder
 //   holder + 0x10                   -> TypeDb::HashSlot[1023], stride 0x18
-//   HashSlot + 0x00                 -> TMap::Root  (tree header)
+//   HashSlot + 0x00                 -> item count (NOT a pointer)
+//   HashSlot + 0x08                 -> TMap root node
 //   TMapNode: Left +00, Parent +08, Right +10, Color +18, IsRoot +19,
 //             Key(OsiString) +20, Value +38
 //   OsiFunctionDef + 0x18           -> FunctionSignature*
@@ -164,9 +167,37 @@ int count_out_params(std::uintptr_t signature) {
     return total;
 }
 
+// libc++ std::string. Short form keeps the data inline with the length in
+// the final byte; long form is {pointer, size, capacity|MSB}.
+bool read_osi_string(std::uintptr_t str, std::string* out) {
+    std::uint8_t last = 0;
+    if (!peek(str + 23, &last)) return false;
+
+    if ((last & 0x80) == 0) {
+        const std::size_t len = last;
+        if (len > 22) return false;
+        char buf[24] = {};
+        if (!safe_read(reinterpret_cast<const void*>(str), buf, 23)) return false;
+        out->assign(buf, len);
+        return true;
+    }
+
+    std::uintptr_t data = 0;
+    std::uint64_t size = 0;
+    if (!peek(str + 0x00, &data) || !peek(str + 0x08, &size)) return false;
+    if (data < 0x1000 || size == 0 || size > 512) return false;
+    std::vector<char> buf(size + 1, 0);
+    if (!safe_read(reinterpret_cast<const void*>(data), buf.data(), size)) return false;
+    out->assign(buf.data(), size);
+    return true;
+}
+
 void visit_tree(std::uintptr_t node, std::unordered_map<std::string, int>* out,
-                int depth) {
-    if (node < 0x1000 || depth > 64) return;
+                int depth, std::unordered_set<std::uintptr_t>* seen) {
+    // Guard against cycles as well as depth: if a link turns out to be a
+    // parent pointer rather than a child, this must not spin.
+    if (node < 0x1000 || depth > 128) return;
+    if (!seen->insert(node).second) return;
 
     std::uint8_t is_root = 0;
     if (!peek(node + 0x19, &is_root) || is_root) return;
@@ -177,21 +208,20 @@ void visit_tree(std::uintptr_t node, std::unordered_map<std::string, int>* out,
         return;
     }
 
+    // Key on the tree's own key ("Name/Arity"), not the bare signature name:
+    // Osiris overloads by arity, so 1303 functions collapse onto far fewer
+    // names and most matches are lost.
     std::uintptr_t signature = 0;
     if (def >= 0x1000 && peek(def + 0x18, &signature) && signature >= 0x1000) {
-        std::uintptr_t name_ptr = 0;
-        if (peek(signature + 0x08, &name_ptr) && name_ptr >= 0x1000) {
-            const int outs = count_out_params(signature);
-            char name[256];
-            if (outs >= 0 && safe_cstr(reinterpret_cast<const void*>(name_ptr), name,
-                                       sizeof(name))) {
-                (*out)[name] = outs;
-            }
+        const int outs = count_out_params(signature);
+        std::string key;
+        if (outs >= 0 && read_osi_string(node + 0x20, &key) && !key.empty()) {
+            (*out)[key] = outs;
         }
     }
 
-    visit_tree(left, out, depth + 1);
-    visit_tree(right, out, depth + 1);
+    visit_tree(left, out, depth + 1, seen);
+    visit_tree(right, out, depth + 1, seen);
 }
 
 }  // namespace
@@ -210,18 +240,60 @@ std::size_t load_out_param_counts(std::vector<Function>* functions) {
         return 0;
     }
 
+    // One-shot structural dump: the walk found nothing, so look at what is
+    // actually there instead of guessing another offset.
+    if (std::getenv("BG3LE_DUMP_DB") != nullptr) {
+        logf("db: libOsiris base 0x%lx, holder 0x%lx", (unsigned long)base,
+             (unsigned long)holder);
+
+        std::uint32_t a = 0, b = 0;
+        peek(holder + 0x5fe8, &a);
+        peek(holder + 0xc018, &b);
+        logf("db: counts at +0x5fe8=%u +0xc018=%u (1303 would confirm the holder)",
+             a, b);
+
+        int shown = 0;
+        for (std::size_t i = 0; i < kBuckets && shown < 4; ++i) {
+            std::uintptr_t w[3] = {};
+            const std::uintptr_t slot = holder + 0x10 + i * kSlotStride;
+            if (!peek(slot + 0x00, &w[0]) || w[0] == 0) continue;
+            peek(slot + 0x08, &w[1]);
+            peek(slot + 0x10, &w[2]);
+            logf("db: bucket[%zu] @0x%lx = %016lx %016lx %016lx", i,
+                 (unsigned long)slot, (unsigned long)w[0], (unsigned long)w[1],
+                 (unsigned long)w[2]);
+
+            for (int which = 0; which < 2; ++which) {
+                const std::uintptr_t node = which == 0 ? w[0] : w[1];
+                if (node < 0x1000) continue;
+                std::uintptr_t q[10] = {};
+                for (int k = 0; k < 10; ++k) peek(node + k * 8, &q[k]);
+                logf("db:   node%d @0x%lx", which, (unsigned long)node);
+                for (int k = 0; k < 10; ++k) {
+                    char text[96];
+                    const bool str = q[k] >= 0x1000 &&
+                        safe_cstr(reinterpret_cast<const void*>(q[k]), text,
+                                  sizeof(text)) && text[0] >= 0x20 && text[0] < 0x7f;
+                    logf("db:     +%02d = %016lx%s%s", k * 8, (unsigned long)q[k],
+                         str ? "  -> " : "", str ? text : "");
+                }
+            }
+            ++shown;
+        }
+    }
+
     std::unordered_map<std::string, int> by_name;
     for (std::size_t i = 0; i < kBuckets; ++i) {
-        std::uintptr_t header = 0;
-        if (!peek(holder + 0x10 + i * kSlotStride, &header) || header < 0x1000) continue;
         std::uintptr_t root = 0;
-        if (!peek(header + 0x08, &root)) continue;  // header->Root is the real root
-        visit_tree(root, &by_name, 0);
+        if (!peek(holder + 0x10 + i * kSlotStride + 0x08, &root)) continue;
+        std::unordered_set<std::uintptr_t> seen;
+        visit_tree(root, &by_name, 0, &seen);
     }
 
     std::size_t applied = 0;
     for (Function& fn : *functions) {
-        auto it = by_name.find(fn.name);
+        const std::string key = fn.name + "/" + std::to_string(fn.params.size());
+        auto it = by_name.find(key);
         if (it != by_name.end()) {
             fn.out_params = it->second;
             ++applied;
