@@ -1121,7 +1121,7 @@ namespace bg3se::lua::dbg
 
     bool ProtectedRunC(lua_State* L, void (* fun)(lua_State*, void*), void* context, char const*& error)
     {
-        return ProtectedCallC(L, &ProtectedRunCFunc, fun, context, nullptr, error);
+        return ProtectedCallC(L, &ProtectedRunCFunc, (void*)fun, context, nullptr, error);
     }
 
     struct ContextDebuggerGetVarCtx

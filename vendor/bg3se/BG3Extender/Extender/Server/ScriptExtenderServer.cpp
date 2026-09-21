@@ -4,7 +4,11 @@
 
 #include <Extender/Shared/SavegameSerializer.inl>
 
-#define STATIC_HOOK(name) decltype(bg3se::esv::ScriptExtender::name) * decltype(bg3se::esv::ScriptExtender::name)::gHook;
+// A decltype specifier cannot appear in a declarative nested name
+// specifier, but an alias naming the same type can.
+#define STATIC_HOOK(name) \
+    using name##HookType = decltype(bg3se::esv::ScriptExtender::name); \
+    template<> name##HookType* name##HookType::gHook;
 STATIC_HOOK(gameStateWorkerStart_)
 STATIC_HOOK(gameStateMachineUpdate_)
 
@@ -48,11 +52,11 @@ void ScriptExtender::Initialize()
         DetourUpdateThread(GetCurrentThread());
 
         if (lib.esv__GameStateThreaded__GameStateWorker__DoWork != nullptr) {
-            gameStateWorkerStart_.Wrap(lib.esv__GameStateThreaded__GameStateWorker__DoWork);
+            gameStateWorkerStart_.Wrap((void*)lib.esv__GameStateThreaded__GameStateWorker__DoWork);
         }
 
         if (lib.esv__GameStateMachine__Update != nullptr) {
-            gameStateMachineUpdate_.Wrap(lib.esv__GameStateMachine__Update);
+            gameStateMachineUpdate_.Wrap((void*)lib.esv__GameStateMachine__Update);
         }
 
         DetourTransactionCommit();

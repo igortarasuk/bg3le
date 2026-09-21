@@ -504,7 +504,11 @@ inline constexpr RawPropertyAccessors::Serializer* PickPropertySerializer()
 
 #define BEGIN_CLS_TN(cls, typeName, id) template <> struct PropertyMapRegistrations<cls> { \
     using ObjectType = cls; \
-    static constexpr PropertyMapRegistrationEntry Definitions[] = { \
+    /* inline const, not constexpr: the fallback entries type-erase
+       function pointers into void*, and that cast is not a constant
+       expression. AllClassDefns only stores the addresses of these
+       arrays, which remains constant, and they are walked at runtime. */ \
+    static inline const PropertyMapRegistrationEntry Definitions[] = { \
         { .Type = PropertyMapEntryType::Class, .Cls = { \
             .Name = #cls, \
             .TypeName = #typeName, \

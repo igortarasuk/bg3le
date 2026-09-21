@@ -8,7 +8,7 @@ BEGIN_SE()
 // A decltype specifier cannot appear in a declarative nested name specifier,
 // so the type has to be named. MSVC accepts the decltype spelling.
 using ClientConnectMessageSerializeHook =
-    WrappableFunction<ClientConnectMessageSerializeTag,
+    WrappableFunction<Hooks::ClientConnectMessageSerializeTag,
                       void(net::Message*, net::BitstreamSerializer*)>;
 template<> ClientConnectMessageSerializeHook*
     ClientConnectMessageSerializeHook::gHook;

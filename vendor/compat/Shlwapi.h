@@ -8,6 +8,7 @@
 // Only PathFileExistsW is used.
 //
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdlib>
@@ -22,4 +23,25 @@ inline int PathFileExistsW(const wchar_t* path) {
     std::wcstombs(narrow.data(), path, narrow.size());
     narrow.resize(needed);
     return ::access(narrow.c_str(), F_OK) == 0 ? 1 : 0;
+}
+
+inline int PathIsDirectoryW(const wchar_t* path) {
+    if (path == nullptr) return 0;
+    const std::size_t needed = std::wcstombs(nullptr, path, 0);
+    if (needed == static_cast<std::size_t>(-1)) return 0;
+    std::string narrow(needed + 1, '\0');
+    std::wcstombs(narrow.data(), path, narrow.size());
+    narrow.resize(needed);
+    struct stat st{};
+    return (::stat(narrow.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
+}
+
+inline int RemoveDirectoryW(const wchar_t* path) {
+    if (path == nullptr) return 0;
+    const std::size_t needed = std::wcstombs(nullptr, path, 0);
+    if (needed == static_cast<std::size_t>(-1)) return 0;
+    std::string narrow(needed + 1, '\0');
+    std::wcstombs(narrow.data(), path, narrow.size());
+    narrow.resize(needed);
+    return ::rmdir(narrow.c_str()) == 0 ? 1 : 0;
 }

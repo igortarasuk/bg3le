@@ -80,6 +80,17 @@ CHECKS = [
              not in text("BG3Extender/Extender/Shared/Hooks.cpp")),
     ("DebugInterface uses POSIX socket spellings",
      lambda: "S_un.S_addr" not in text("BG3Extender/Osiris/Debugger/DebugInterface.cpp")),
+    ("guarded regions use try/catch rather than SEH",
+     lambda: "HandleGuardedCppException"
+             in text("BG3Extender/GameDefinitions/Base/Base.h")),
+    ("push has long long overloads",
+     lambda: "unsigned long long v" in text("BG3Extender/Lua/Helpers/LuaPush.h")),
+    ("property map Definitions is inline const",
+     lambda: "static inline const PropertyMapRegistrationEntry Definitions"
+             in text("BG3Extender/Lua/Shared/Proxies/LuaObjectProxies.cpp")),
+    ("static hook members defined through an alias",
+     lambda: "decltype(ScriptExtender::CoreLibInit)::gHook"
+             not in text("BG3Extender/Extender/ScriptExtender.cpp")),
     ("NsCustomDataContext has a usual operator delete",
      lambda: "static void operator delete(void* ptr) noexcept"
              in text("BG3Extender/Lua/Libs/ClientUI/CustomProperties.inl")),

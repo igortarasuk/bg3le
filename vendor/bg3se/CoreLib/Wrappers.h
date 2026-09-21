@@ -220,9 +220,9 @@ namespace bg3se {
             }
 
             gRegisteredTrampolines.insert(ResolveRealFunctionAddress((void const*)&NoContextHook));
-            gRegisteredTrampolines.insert(ResolveRealFunctionAddress(wrapper));
+            gRegisteredTrampolines.insert(ResolveRealFunctionAddress((void const*)wrapper));
             hook_ = &NoContextHook;
-            func_ = wrapper;
+            func_ = (void*)wrapper;
             func2_ = nullptr;
             context_ = nullptr;
         }
@@ -235,7 +235,7 @@ namespace bg3se {
                 return;
             }
 
-            gRegisteredTrampolines.insert(ResolveRealFunctionAddress(wrapper));
+            gRegisteredTrampolines.insert(ResolveRealFunctionAddress((void const*)wrapper));
             hook_ = reinterpret_cast<HookFuncType*>(wrapper);
             func_ = nullptr;
             func2_ = nullptr;
@@ -352,7 +352,7 @@ namespace bg3se {
 
         static R NoContextHook(void* ctx, BaseFuncType* fun, Params... args)
         {
-            auto hook = static_cast<NoContextHookFuncType*>(gHook->func_);
+            auto hook = reinterpret_cast<NoContextHookFuncType*>(gHook->func_);
             return hook(fun, std::forward<Params>(args)...);
         }
 

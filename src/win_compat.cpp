@@ -155,3 +155,29 @@ extern "C" void ReleaseSRWLockShared(void* lock) {
 extern "C" int TryAcquireSRWLockExclusive(void* lock) {
     return ::pthread_rwlock_trywrlock(srw_resolve(lock)) == 0;
 }
+
+// ---- guarded regions ----
+//
+// vendor/bg3se/BG3Extender/GameDefinitions/Base/Base.h routes BEGIN_GUARDED /
+// END_GUARDED through a C++ try/catch on Linux, because SEH does not exist
+// here and the upstream SEH handler lives in CrashReporter.cpp, which is a
+// Windows component. Called from inside a catch handler, so it can rethrow to
+// inspect the exception.
+
+#include <exception>
+
+#include "log.h"
+
+namespace bg3se {
+
+void HandleGuardedCppException() {
+    try {
+        throw;
+    } catch (const std::exception& e) {
+        bg3le::logf("guarded: exception escaped into engine code: %s", e.what());
+    } catch (...) {
+        bg3le::logf("guarded: unknown exception escaped into engine code");
+    }
+}
+
+}  // namespace bg3se

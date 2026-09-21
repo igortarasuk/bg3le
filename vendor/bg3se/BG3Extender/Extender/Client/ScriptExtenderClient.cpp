@@ -4,7 +4,11 @@
 #include <Extender/Version.h>
 #include <shlwapi.h>
 
-#define STATIC_HOOK(name) decltype(bg3se::ecl::ScriptExtender::name) * decltype(bg3se::ecl::ScriptExtender::name)::gHook;
+// A decltype specifier cannot appear in a declarative nested name
+// specifier, but an alias naming the same type can.
+#define STATIC_HOOK(name) \
+    using name##HookType = decltype(bg3se::ecl::ScriptExtender::name); \
+    template<> name##HookType* name##HookType::gHook;
 STATIC_HOOK(gameStateWorkerStart_)
 STATIC_HOOK(gameStateMachineUpdate_)
 
@@ -74,11 +78,11 @@ void ScriptExtender::Initialize()
     DetourUpdateThread(GetCurrentThread());
 
     if (lib.ecl__GameStateThreaded__GameStateWorker__DoWork != nullptr) {
-        gameStateWorkerStart_.Wrap(lib.ecl__GameStateThreaded__GameStateWorker__DoWork);
+        gameStateWorkerStart_.Wrap((void*)lib.ecl__GameStateThreaded__GameStateWorker__DoWork);
     }
 
     if (lib.ecl__GameStateMachine__Update != nullptr) {
-        gameStateMachineUpdate_.Wrap(lib.ecl__GameStateMachine__Update);
+        gameStateMachineUpdate_.Wrap((void*)lib.ecl__GameStateMachine__Update);
     }
 
     DetourTransactionCommit();

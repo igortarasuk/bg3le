@@ -190,6 +190,41 @@ extension. These convert with upstream's own `ToUTF8`:
 - `BG3Extender/Osiris/Debugger/DebugInterface.cpp` — `in_addr::S_un.S_addr` is
   `s_addr`, and `accept` takes a `socklen_t*` rather than an `int*`
 
+**SEH does not exist on Linux.** `BEGIN_GUARDED`/`END_GUARDED` wrapped engine
+callbacks in `__try`/`__except`, and clang cannot compile that when targeting
+Linux; the handler also lives in `CrashReporter.cpp`, which bg3le does not
+build. They now expand to a C++ `try`/`catch`, which covers the portable half
+of the intent — keeping an exception from escaping into engine code across the
+ABI boundary — but cannot catch a hardware fault. bg3le reports those from a
+signal handler instead:
+
+- `BG3Extender/GameDefinitions/Base/Base.h:13`
+
+**`push` was ambiguous for `long long`.** The overloads cover `int64_t` and
+`uint64_t`, which on LP64 are `long` and `unsigned long`, so a `long long`
+converts equally well to either. On Windows `int64_t` *is* `long long`, so it
+matched exactly; the added overloads are guarded out there to avoid
+redefining:
+
+- `BG3Extender/Lua/Helpers/LuaPush.h`
+
+**A function-pointer cast is not a constant expression.** The property-map
+fallback entries type-erase function pointers into `void*`, so the tables
+cannot be `constexpr`. `AllClassDefns` only stores their addresses, which
+stays constant, and they are walked at runtime, so `inline const` is
+sufficient:
+
+- `BG3Extender/Lua/Shared/Proxies/LuaObjectProxies.cpp` (`Definitions`)
+
+**`Wrap(void*)` will not take a typed function pointer implicitly**, and a
+`decltype` specifier cannot appear in a declarative nested name specifier, so
+the static hook members have to be defined through an alias:
+
+- `BG3Extender/Extender/ScriptExtender.cpp:26`
+- `BG3Extender/Extender/Server/ScriptExtenderServer.cpp:7` (`STATIC_HOOK`)
+- `BG3Extender/Extender/Client/ScriptExtenderClient.cpp:7` (`STATIC_HOOK`)
+- `BG3Extender/Extender/Shared/Hooks.cpp:8`
+
 **An include used the wrong directory case**, which resolves on Windows and
 not on Linux:
 

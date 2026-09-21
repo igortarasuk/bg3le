@@ -39,6 +39,21 @@ inline void push(lua_State* L, uint64_t v)
     lua_pushinteger(L, (lua_Integer)v);
 }
 
+#if !defined(_WIN32)
+// On LP64 int64_t is long, so a long long argument converts equally well to
+// the signed and the unsigned overload and the call is ambiguous. On Windows
+// int64_t is long long and these two would redefine the overloads above.
+inline void push(lua_State* L, long long v)
+{
+    lua_pushinteger(L, (lua_Integer)v);
+}
+
+inline void push(lua_State* L, unsigned long long v)
+{
+    lua_pushinteger(L, (lua_Integer)v);
+}
+#endif
+
 inline void push(lua_State* L, double v)
 {
     lua_pushnumber(L, v);

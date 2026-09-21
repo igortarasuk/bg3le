@@ -587,9 +587,11 @@ inline void* LoadResource(HMODULE, void*) { return nullptr; }
 inline void* LockResource(void*) { return nullptr; }
 inline DWORD SizeofResource(HMODULE, void*) { return 0; }
 
-template <std::size_t N, class... Args>
-int _vsnprintf_s(char (&buf)[N], std::size_t count, const char* fmt, va_list args) {
-    const std::size_t size = (count + 1 < N) ? count + 1 : N;
+// (buffer, buffer size, max characters excluding the terminator, format, args)
+inline int _vsnprintf_s(char* buf, std::size_t bufSize, std::size_t count,
+                        const char* fmt, va_list args) {
+    const std::size_t size =
+        (count == (std::size_t)-1 || count + 1 > bufSize) ? bufSize : count + 1;
     return std::vsnprintf(buf, size, fmt, args);
 }
 

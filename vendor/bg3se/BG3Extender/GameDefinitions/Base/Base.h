@@ -10,11 +10,23 @@
 
 // The game has a jank SEH handler that silently swallows STATUS_CPP_EH_EXCEPTION without passing it
 // to the top-level handler, so we need to have additional checks at the common SE entry points
+#if defined(_WIN32)
 #define BEGIN_GUARDED() __try {
 #define END_GUARDED() } __except (HandleGuardedException(GetExceptionCode(), GetExceptionInformation())) {}
+#else
+// clang cannot compile SEH when targeting Linux, and the SEH handler lives in
+// CrashReporter.cpp, which is a Windows component bg3le does not build. A C++
+// try/catch covers the portable half of what this guards: it still keeps an
+// exception from escaping into engine code across the ABI boundary. It cannot
+// catch a hardware fault -- bg3le reports those from a signal handler
+// instead, see src/stackdump.cpp.
+#define BEGIN_GUARDED() try {
+#define END_GUARDED() } catch (...) { ::bg3se::HandleGuardedCppException(); }
+#endif
 
 BEGIN_SE()
 LONG HandleGuardedException(DWORD code, EXCEPTION_POINTERS* info);
+void HandleGuardedCppException();
 END_SE()
 
 #include <NsCore/Symbol.h>

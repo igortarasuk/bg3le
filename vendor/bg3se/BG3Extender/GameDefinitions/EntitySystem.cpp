@@ -941,7 +941,7 @@ bool EntitySystemHelpersBase::RemoveComponent(EntityHandle entity, ExtComponentT
         return false;
     }
 
-    GetEntityWorld()->Deferred()->RemoveComponent(entity, *meta.ComponentIndex, meta.InlineSize, meta.Properties->ProxyDestroy);
+    GetEntityWorld()->Deferred()->RemoveComponent(entity, *meta.ComponentIndex, meta.InlineSize, (void*)meta.Properties->ProxyDestroy);
     return true;
 }
 

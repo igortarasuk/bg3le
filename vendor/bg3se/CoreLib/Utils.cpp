@@ -114,7 +114,7 @@ bool TryCreateDirectory(std::wstring const& path)
 
 bool SaveFile(std::wstring const& path, std::vector<uint8_t> const& body)
 {
-    std::ofstream f(ToUTF8(path), std::ios::binary | std::ios::out);
+    std::ofstream f(ToUTF8(path).c_str(), std::ios::binary | std::ios::out);
     if (!f.good()) {
         return false;
     }
@@ -125,7 +125,7 @@ bool SaveFile(std::wstring const& path, std::vector<uint8_t> const& body)
 
 bool SaveFile(std::wstring const& path, std::string_view body)
 {
-    std::ofstream f(ToUTF8(path), std::ios::binary | std::ios::out);
+    std::ofstream f(ToUTF8(path).c_str(), std::ios::binary | std::ios::out);
     if (!f.good()) {
         return false;
     }
@@ -136,7 +136,7 @@ bool SaveFile(std::wstring const& path, std::string_view body)
 
 bool LoadFile(std::wstring const& path, std::vector<uint8_t>& body)
 {
-    std::ifstream f(ToUTF8(path), std::ios::in | std::ios::binary);
+    std::ifstream f(ToUTF8(path).c_str(), std::ios::in | std::ios::binary);
     if (f.good()) {
         f.seekg(0, std::ios::end);
         auto size = f.tellg();
@@ -152,7 +152,7 @@ bool LoadFile(std::wstring const& path, std::vector<uint8_t>& body)
 
 bool LoadFile(std::wstring const& path, std::string& body)
 {
-    std::ifstream f(ToUTF8(path), std::ios::in | std::ios::binary);
+    std::ifstream f(ToUTF8(path).c_str(), std::ios::in | std::ios::binary);
     if (f.good()) {
         f.seekg(0, std::ios::end);
         auto size = f.tellg();

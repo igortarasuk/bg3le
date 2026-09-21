@@ -23,9 +23,14 @@ namespace bg3se
 void InitCrashReporting();
 void ShutdownCrashReporting();
 
-decltype(ScriptExtender::CoreLibInit)* decltype(ScriptExtender::CoreLibInit)::gHook;
-decltype(ScriptExtender::AppUpdatePaths)* decltype(ScriptExtender::AppUpdatePaths)::gHook;
-decltype(ScriptExtender::AppLoadGraphicSettings)* decltype(ScriptExtender::AppLoadGraphicSettings)::gHook;
+// A decltype specifier cannot appear in a declarative nested name
+// specifier, but an alias naming the same type can.
+using CoreLibInitHookType = decltype(ScriptExtender::CoreLibInit);
+using AppUpdatePathsHookType = decltype(ScriptExtender::AppUpdatePaths);
+using AppLoadGraphicSettingsHookType = decltype(ScriptExtender::AppLoadGraphicSettings);
+template<> CoreLibInitHookType* CoreLibInitHookType::gHook;
+template<> AppUpdatePathsHookType* AppUpdatePathsHookType::gHook;
+template<> AppLoadGraphicSettingsHookType* AppLoadGraphicSettingsHookType::gHook;
 
 std::unique_ptr<ScriptExtender> gExtender;
 
@@ -107,17 +112,17 @@ void ScriptExtender::Initialize()
     DetourUpdateThread(GetCurrentThread());
 
     if (GetStaticSymbols().App__Ctor != nullptr) {
-        CoreLibInit.Wrap(GetStaticSymbols().App__Ctor);
+        CoreLibInit.Wrap((void*)GetStaticSymbols().App__Ctor);
         CoreLibInit.SetPreHook(&ScriptExtender::OnCoreLibInit, this);
     }
 
     if (GetStaticSymbols().App__UpdatePaths != nullptr) {
-        AppUpdatePaths.Wrap(GetStaticSymbols().App__UpdatePaths);
+        AppUpdatePaths.Wrap((void*)GetStaticSymbols().App__UpdatePaths);
         AppUpdatePaths.SetPostHook(&ScriptExtender::OnAppUpdatePaths, this);
     }
 
     if (GetStaticSymbols().App__LoadGraphicSettings != nullptr) {
-        AppLoadGraphicSettings.Wrap(GetStaticSymbols().App__LoadGraphicSettings);
+        AppLoadGraphicSettings.Wrap((void*)GetStaticSymbols().App__LoadGraphicSettings);
         AppLoadGraphicSettings.SetPostHook(&ScriptExtender::OnAppLoadGraphicSettings, this);
     }
 
