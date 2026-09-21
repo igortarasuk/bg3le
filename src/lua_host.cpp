@@ -382,6 +382,59 @@ int l_ecs_dump(lua_State* L) {
     return 1;
 }
 
+// Implemented in src/vendor/entity_bridge.cpp against bg3se's ECS layout.
+extern "C" bool bg3le_entity_health(void* container, std::uint64_t handle,
+                                    std::uint16_t componentIndex,
+                                    std::int32_t* hp, std::int32_t* maxHp);
+
+// The most recent EntityHandle the engine looked up, so component access can
+// be tested before UUID -> handle exists.
+int l_last_entity(lua_State* L) {
+    const unsigned long long h = ecs::last_entity();
+    if (h == 0) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushinteger(L, static_cast<lua_Integer>(h));
+    return 1;
+}
+
+// End to end: entity handle -> storage -> component -> field. Uses the
+// component index bg3le reads from the symbol table and the container it
+// captured, walked by bg3se's own implementation.
+int l_entity_health(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(
+        luaL_optinteger(L, 1, static_cast<lua_Integer>(ecs::last_entity())));
+    if (handle == 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, "no entity handle available yet");
+        return 2;
+    }
+
+    const auto index = ecs::index_of(ecs::Context::Component, "eoc::HealthComponent");
+    if (!index.has_value()) {
+        lua_pushnil(L);
+        lua_pushstring(L, "eoc::HealthComponent has no index yet");
+        return 2;
+    }
+
+    std::int32_t hp = 0;
+    std::int32_t maxHp = 0;
+    if (!bg3le_entity_health(ecs::container(), handle,
+                             static_cast<std::uint16_t>(*index), &hp, &maxHp)) {
+        lua_pushnil(L);
+        lua_pushstring(L, "entity has no Health component");
+        return 2;
+    }
+
+    lua_newtable(L);
+    lua_pushinteger(L, hp);
+    lua_setfield(L, -2, "Hp");
+    lua_pushinteger(L, maxHp);
+    lua_setfield(L, -2, "MaxHp");
+    return 1;
+}
+
 int l_ecs_counts(lua_State* L) {
     lua_newtable(L);
     const std::pair<ecs::Context, const char*> contexts[] = {
@@ -459,6 +512,10 @@ void lua_init() {
     lua_setfield(g_lua, -2, "EcsStorage");
     lua_pushcfunction(g_lua, l_ecs_dump);
     lua_setfield(g_lua, -2, "EcsDump");
+    lua_pushcfunction(g_lua, l_last_entity);
+    lua_setfield(g_lua, -2, "LastEntity");
+    lua_pushcfunction(g_lua, l_entity_health);
+    lua_setfield(g_lua, -2, "EntityHealth");
     lua_setfield(g_lua, -2, "_Internal");
 
     lua_setglobal(g_lua, "Ext");

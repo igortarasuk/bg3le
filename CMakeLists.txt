@@ -127,7 +127,9 @@ list(APPEND VENDOR_SOURCES
 # -w below; they are listed here because they have to see the vendored headers.
 list(APPEND VENDOR_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/console_linux.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/platform_linux.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/platform_linux.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/noesis_rtti_linux.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/entity_bridge.cpp)
 
 # Kept in step with tools/vendor-exclude.txt.
 set(VENDOR_EXCLUDE
@@ -236,22 +238,14 @@ add_library(bg3le SHARED
     src/fast_alloc.cpp
     src/win_compat.cpp
 )
-# bg3se_vendor is deliberately not linked yet. Everything in it compiles and
-# archives, but the final link is short of eleven symbols: C++ RTTI for
-# Noesis types (typeinfo for Noesis::Panel and friends), which bg3se uses
-# through typeid and dynamic_cast.
-#
-# Those cannot be satisfied on Linux by anything. The Noesis SDK we fetch is
-# headers plus Windows .lib files, and the native game carries no Noesis
-# typeinfo either -- it has 28,992 Noesis symbols in .symtab and not one
-# typeinfo, because Noesis uses its own reflection system rather than C++
-# RTTI. Resolving this means keeping the Noesis types out of the generated
-# property maps, not shimming a symbol.
-#
-# Add bg3se_vendor, vulkan and SDL2 here once that is done; vulkan and SDL2
-# resolve from the host process, which has both loaded before bg3le is.
-target_link_libraries(bg3le PRIVATE dl lua_static)
-target_link_options(bg3le PRIVATE -Wl,--no-undefined)
+# vulkan and SDL2 resolve from the host process, which has both loaded before
+# bg3le is.
+target_link_libraries(bg3le PRIVATE dl lua_static bg3se_vendor vulkan SDL2)
+
+# No --no-undefined: the Noesis typeinfo references are deliberately left
+# unresolved and weak. See src/vendor/noesis_rtti_linux.cpp for why nothing on
+# Linux can satisfy them, and why it is safe while Ext.ClientUI is off.
+target_link_options(bg3le PRIVATE -Wl,--warn-unresolved-symbols)
 target_compile_options(bg3le PRIVATE -Wall -Wextra -fvisibility=default)
 
 add_executable(symdump tools/symdump.cpp src/elf_symbols.cpp src/log.cpp)

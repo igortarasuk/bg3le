@@ -56,6 +56,7 @@ constexpr std::uintptr_t kEntityStorageLookup = 0x218dc90;
 extern "C" {
 __attribute__((visibility("hidden"))) void* bg3le_ecs_lookup_original = nullptr;
 __attribute__((visibility("hidden"))) void* bg3le_ecs_storage = nullptr;
+__attribute__((visibility("hidden"))) unsigned long long bg3le_ecs_last_entity = 0;
 }
 
 namespace {
@@ -78,6 +79,9 @@ __asm__(
     "  je 1f\n"
     "  mov %rdi, bg3le_ecs_storage(%rip)\n"
     "1:\n"
+    // Record the handle every time, so there is always a live entity to test
+    // against while UUID -> handle is still missing.
+    "  mov %rsi, bg3le_ecs_last_entity(%rip)\n"
     "  jmp *bg3le_ecs_lookup_original(%rip)\n");
 
 }  // namespace
@@ -99,6 +103,8 @@ bool install_container_capture() {
 }
 
 void* container() { return bg3le_ecs_storage; }
+
+unsigned long long last_entity() { return bg3le_ecs_last_entity; }
 
 }  // namespace ecs
 }  // namespace bg3le

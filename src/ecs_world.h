@@ -14,5 +14,9 @@ bool install_container_capture();
 // happened yet.
 void* container();
 
+// The most recent EntityHandle passed to the lookup. A real, live handle to
+// test component access against while UUID -> handle is unimplemented.
+unsigned long long last_entity();
+
 }  // namespace ecs
 }  // namespace bg3le
