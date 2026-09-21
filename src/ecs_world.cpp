@@ -13,10 +13,22 @@
 //   and  edx,  0x7fff        ; index masked to 15 bits
 //   call <lookup>            ; (object, entity, index)
 //
-// Its first argument is the object component lookups go through. Rather than
-// guess its prototype, the hook is a naked thunk: it records rdi and jumps to
-// the original with every register untouched, so the real signature does not
-// matter and there is no ABI risk.
+// Reading the whole function shows what its first argument is:
+//
+//   and r10d, 0x7fc0      ; index & ~63
+//   shr r10d, 6           ; word = index / 64
+//   mov rax, [rdi+r10*8]  ; a bitmask word at offset 0 of rdi
+//   shl rbx, cl           ; bit = 1 << (index & 63)
+//   test rax, rbx         ; presence test
+//
+// So rdi begins with a component-presence bitmask, and the pointer at +0x110
+// puts that mask at 0x110 bytes -- 34 qwords, 2176 bits. bg3se independently
+// has ComponentMapSize = 0x880, which is the same 2176, so its reverse
+// engineered layout describes this build too.
+//
+// Rather than guess the prototype, the hook is a naked thunk: it records rdi
+// and jumps to the original with every register untouched, so the real
+// signature does not matter and there is no ABI risk.
 
 #include "ecs_world.h"
 
@@ -55,6 +67,12 @@ __asm__(
     "  mov bg3le_ecs_storage(%rip), %rax\n"
     "  test %rax, %rax\n"
     "  jne 1f\n"
+    // Only record an object whose component mask has something in it. The
+    // first call comes early, while the mask is still all zeroes, and an empty
+    // one tells us nothing.
+    "  mov (%rdi), %rax\n"
+    "  test %rax, %rax\n"
+    "  je 1f\n"
     "  mov %rdi, bg3le_ecs_storage(%rip)\n"
     "1:\n"
     "  jmp *bg3le_ecs_lookup_original(%rip)\n");
