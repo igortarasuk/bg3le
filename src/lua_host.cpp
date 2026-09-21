@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <link.h>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -387,6 +388,90 @@ extern "C" bool bg3le_entity_health(void* container, std::uint64_t handle,
                                     std::uint16_t componentIndex,
                                     std::int32_t* hp, std::int32_t* maxHp);
 
+extern "C" void bg3le_entity_probe(void* container, std::uint64_t handle,
+                                   std::uint16_t componentIndex,
+                                   std::int32_t* storageIndex, void** storage,
+                                   void** component);
+extern "C" bool bg3le_mark_component_changed(void* container, std::uint64_t handle,
+                                             std::uint16_t componentIndex);
+extern "C" bool bg3le_set_health(void* container, std::uint64_t handle,
+                                 std::uint16_t componentIndex, std::int32_t hp,
+                                 bool setMax);
+
+// Resolves a component name to its engine index, trying the one-frame registry
+// as a fallback.
+std::optional<std::int32_t> component_index(const char* name) {
+    if (auto i = ecs::index_of(ecs::Context::Component, name)) return i;
+    return ecs::index_of(ecs::Context::OneFrameComponent, name);
+}
+
+// Ext.Entity primitives. The Lua-visible object model is assembled in the
+// prelude on top of these, so field access and assignment stay in one place.
+int l_entity_get_health(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
+    const auto index = component_index("eoc::HealthComponent");
+    if (!index.has_value()) return 0;
+
+    std::int32_t hp = 0;
+    std::int32_t maxHp = 0;
+    if (!bg3le_entity_health(ecs::container(), handle,
+                             static_cast<std::uint16_t>(*index), &hp, &maxHp)) {
+        return 0;
+    }
+    lua_pushinteger(L, hp);
+    lua_pushinteger(L, maxHp);
+    return 2;
+}
+
+int l_entity_set_health(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
+    const auto hp = static_cast<std::int32_t>(luaL_checkinteger(L, 2));
+    const bool setMax = lua_toboolean(L, 3) != 0;
+    const auto index = component_index("eoc::HealthComponent");
+    if (!index.has_value()) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    lua_pushboolean(L, bg3le_set_health(ecs::container(), handle,
+                                        static_cast<std::uint16_t>(*index), hp,
+                                        setMax));
+    return 1;
+}
+
+int l_entity_mark_changed(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
+    const char* name = luaL_checkstring(L, 2);
+    const auto index = component_index(name);
+    if (!index.has_value()) {
+        lua_pushboolean(L, 0);
+        lua_pushfstring(L, "%s is not a registered component", name);
+        return 2;
+    }
+    lua_pushboolean(L, bg3le_mark_component_changed(
+        ecs::container(), handle, static_cast<std::uint16_t>(*index)));
+    return 1;
+}
+
+// Whether an entity carries a component at all, so the proxy can report a
+// missing component as nil rather than as an error.
+int l_entity_has_component(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
+    const char* name = luaL_checkstring(L, 2);
+    const auto index = component_index(name);
+    if (!index.has_value()) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    std::int32_t storageIndex = -1;
+    void* storage = nullptr;
+    void* component = nullptr;
+    bg3le_entity_probe(ecs::container(), handle,
+                       static_cast<std::uint16_t>(*index), &storageIndex,
+                       &storage, &component);
+    lua_pushboolean(L, component != nullptr);
+    return 1;
+}
+
 extern "C" std::uint64_t bg3le_uuid_to_handle(void* container,
                                               std::uint16_t mappingIndex,
                                               char const* uuid);
@@ -414,10 +499,6 @@ int l_uuid_to_handle(lua_State* L) {
     return 1;
 }
 
-extern "C" void bg3le_entity_probe(void* container, std::uint64_t handle,
-                                   std::uint16_t componentIndex,
-                                   std::int32_t* storageIndex, void** storage,
-                                   void** component);
 extern "C" std::uint64_t bg3le_find_entity_with(void* container,
                                                 std::uint16_t componentIndex,
                                                 std::uint32_t* storagesSeen);
@@ -613,6 +694,14 @@ void lua_init() {
     lua_setfield(g_lua, -2, "EntityProbe");
     lua_pushcfunction(g_lua, l_uuid_to_handle);
     lua_setfield(g_lua, -2, "UuidToHandle");
+    lua_pushcfunction(g_lua, l_entity_get_health);
+    lua_setfield(g_lua, -2, "GetHealth");
+    lua_pushcfunction(g_lua, l_entity_set_health);
+    lua_setfield(g_lua, -2, "SetHealth");
+    lua_pushcfunction(g_lua, l_entity_mark_changed);
+    lua_setfield(g_lua, -2, "MarkChanged");
+    lua_pushcfunction(g_lua, l_entity_has_component);
+    lua_setfield(g_lua, -2, "HasComponent");
     lua_setfield(g_lua, -2, "_Internal");
 
     lua_setglobal(g_lua, "Ext");
@@ -805,6 +894,103 @@ function Ext._Internal.RunTimers()
     end
   end
 end
+
+-- ---- Ext.Entity ----
+--
+-- Property access over the ECS primitives in Ext._Internal. Only the
+-- components bg3le can reach typed accessors for are exposed; anything else
+-- reports itself rather than returning a silently empty table, because a mod
+-- guarding on "if not entity.Foo then return end" would otherwise skip work
+-- and look like it succeeded.
+local component_proxies = {}
+
+component_proxies.Health = {
+  fields = {Hp = true, MaxHp = true},
+  read = function(handle)
+    local hp, maxHp = Ext._Internal.GetHealth(handle)
+    if hp == nil then return nil end
+    return {Hp = hp, MaxHp = maxHp}
+  end,
+  write = function(handle, key, value)
+    if key ~= "Hp" and key ~= "MaxHp" then
+      error("Health." .. tostring(key) .. " is not writable yet", 0)
+    end
+    Ext._Internal.SetHealth(handle, value, key == "MaxHp")
+  end,
+}
+
+local function make_component(handle, name, proxy)
+  local values = proxy.read(handle)
+  if values == nil then return nil end
+  return setmetatable({}, {
+    __index = function(_, key) return values[key] end,
+    __newindex = function(_, key, value)
+      proxy.write(handle, key, value)
+      values[key] = value
+    end,
+    __pairs = function() return pairs(values) end,
+  })
+end
+
+local entity_methods = {}
+
+function entity_methods:GetComponent(name)
+  local proxy = component_proxies[name]
+  if proxy == nil then
+    if Ext._Internal.HasComponent(self.Handle, "eoc::" .. name .. "Component") then
+      error("bg3le: the " .. name .. " component exists on this entity but is "
+            .. "not exposed yet; only Health is", 0)
+    end
+    return nil
+  end
+  return make_component(self.Handle, name, proxy)
+end
+
+function entity_methods:Replicate(name)
+  local mapped = ({Health = "eoc::HealthComponent"})[name]
+  if mapped == nil then
+    error("bg3le: Replicate does not know the " .. tostring(name)
+          .. " component yet", 0)
+  end
+  return Ext._Internal.MarkChanged(self.Handle, mapped)
+end
+
+local entity_meta = {
+  __index = function(entity, key)
+    local method = entity_methods[key]
+    if method ~= nil then return method end
+    if key == "Uuid" then
+      return entity.EntityUuid and {EntityUuid = entity.EntityUuid} or nil
+    end
+    local proxy = component_proxies[key]
+    if proxy ~= nil then
+      return make_component(rawget(entity, "Handle"), key, proxy)
+    end
+    return nil
+  end,
+}
+
+Ext.Entity = {}
+
+-- Accepts a UUID string, as mods do, or a raw EntityHandle.
+function Ext.Entity.Get(id)
+  local handle
+  if type(id) == "string" then
+    handle = Ext._Internal.UuidToHandle(id)
+    if handle == nil then return nil end
+  elseif type(id) == "number" then
+    handle = id
+  else
+    return nil
+  end
+
+  return setmetatable({Handle = handle,
+                       EntityUuid = type(id) == "string" and id or nil},
+                      entity_meta)
+end
+
+function Ext.Entity.HandleToUuid(handle) return nil end
+function Ext.Entity.UuidToHandle(uuid) return Ext._Internal.UuidToHandle(uuid) end
 
 -- ---- mod loading ----
 --

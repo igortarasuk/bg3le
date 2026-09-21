@@ -162,4 +162,52 @@ extern "C" std::uint64_t bg3le_uuid_to_handle(void* container,
     return handle != nullptr ? handle->Handle : 0;
 }
 
+// Marks a component dirty so the change is picked up and replicated.
+//
+// bg3se routes this through EntityWorld::MarkComponentAsChanged, but that
+// function only touches the storage and the container's UsedFrameDataStorages
+// bitset -- and EntityWorld::Storage *is* the container we captured. So it
+// needs no world either.
+//
+// This is MarkComponentAsChanged, not bg3se's full Replicate: that one also
+// goes through ReplicateComponent to set per-field replication flags. Marking
+// the component dirty is what makes the server-side change take effect; if a
+// field turns out not to reach the client, that difference is the first place
+// to look.
+extern "C" bool bg3le_mark_component_changed(void* container,
+                                             std::uint64_t handle,
+                                             std::uint16_t componentIndex) {
+    if (container == nullptr) return false;
+
+    auto* storages = reinterpret_cast<bg3se::ecs::EntityStorageContainer*>(container);
+    const auto entity = bg3se::EntityHandle(handle);
+    const auto type = bg3se::ecs::ComponentTypeIndex(componentIndex);
+
+    const auto index = storages->GetEntityStorageIndex(entity);
+    if (!index.has_value()) return false;
+
+    auto* storage = storages->GetEntityStorage(*index);
+    if (storage == nullptr) return false;
+
+    if (!storage->MarkComponentAsChanged(entity, type)) return false;
+
+    if (!storages->UsedFrameDataStorages[storage->StorageIndex]) {
+        storages->UsedFrameDataStorages.Set(storage->StorageIndex);
+    }
+    return true;
+}
+
+// Health is read and written through typed accessors rather than raw offsets,
+// so the field layout comes from bg3se's struct rather than being restated.
+extern "C" bool bg3le_set_health(void* container, std::uint64_t handle,
+                                 std::uint16_t componentIndex,
+                                 std::int32_t hp, bool setMax) {
+    auto* component = static_cast<bg3se::HealthComponent*>(bg3le_entity_component(
+        container, handle, componentIndex, sizeof(bg3se::HealthComponent)));
+    if (component == nullptr) return false;
+    component->Hp = hp;
+    if (setMax) component->MaxHp = hp;
+    return true;
+}
+
 }  // namespace bg3le
