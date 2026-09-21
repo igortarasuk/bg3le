@@ -14,6 +14,9 @@
 #include <vector>
 #include <atomic>
 #include <sched.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <thread>
 #include <mutex>
 #include <ctime>
 #include <unistd.h>
@@ -39,6 +42,37 @@ void ensure_symbols();
 template <typename Fn>
 Fn next(const char* mangled) {
     return reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, mangled));
+}
+
+// ---- stall profiling ----
+//
+// Every profile so far caught gameplay, not the load. The stall begins
+// immediately after Osiris finishes, and we are the only thing that knows
+// when that is -- so start perf from here and capture exactly that window.
+void start_stall_profile() {
+    const char* opt = std::getenv("BG3LE_PERF");
+    if (opt == nullptr || opt[0] != '1') return;
+
+    char pid[32];
+    std::snprintf(pid, sizeof(pid), "%d", (int)::getpid());
+
+    const char* argv[] = {"perf",  "record", "-F",    "299", "-g",
+                          "-p",    pid,      "-o",    "/tmp/bg3-stall.perf.data",
+                          "--",    "sleep",  "75",    nullptr};
+
+    pid_t child = 0;
+    posix_spawnattr_t attr;
+    ::posix_spawnattr_init(&attr);
+    ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    const int rc = ::posix_spawnp(&child, "perf", nullptr, &attr,
+                                  const_cast<char* const*>(argv), environ);
+    ::posix_spawnattr_destroy(&attr);
+    if (rc != 0) {
+        statusf("perf: could not start (%s)", std::strerror(rc));
+        return;
+    }
+    std::thread([child] { int st = 0; ::waitpid(child, &st, 0); }).detach();
+    statusf("perf: recording the load stall to /tmp/bg3-stall.perf.data");
 }
 
 // ---- clock diagnostics ----
@@ -519,6 +553,8 @@ void dump_osiris_api(void* self) {
 }  // namespace
 }  // namespace bg3le
 
+extern char** environ;
+
 using namespace bg3le;
 
 // ---- Osiris interposition ----
@@ -593,6 +629,7 @@ extern "C" long _ZN7COsiris4LoadER12COsiSmartBuf(void* self, void* buf) {
     long rc = real != nullptr ? real(self, buf) : 0;
     statusf("OnAfterOsirisLoad: story loaded in %.2fs", now_s() - t0);
     g_story_ready_at = now_s();
+    start_stall_profile();
     return rc;
 }
 
