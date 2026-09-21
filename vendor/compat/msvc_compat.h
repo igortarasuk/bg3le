@@ -599,3 +599,20 @@ inline int _vsnprintf_s(char* buf, std::size_t bufSize, std::size_t count,
 #define WSAECONNRESET ECONNRESET
 #define WSAEWOULDBLOCK EWOULDBLOCK
 #define WSAEINPROGRESS EINPROGRESS
+
+// TracerPid is non-zero while a debugger is attached.
+inline BOOL IsDebuggerPresent() {
+    std::FILE* f = std::fopen("/proc/self/status", "r");
+    if (f == nullptr) return 0;
+    char line[256];
+    BOOL traced = 0;
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+        int pid = 0;
+        if (std::sscanf(line, "TracerPid: %d", &pid) == 1) {
+            traced = pid != 0;
+            break;
+        }
+    }
+    std::fclose(f);
+    return traced;
+}

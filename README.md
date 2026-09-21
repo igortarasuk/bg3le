@@ -45,15 +45,27 @@ the ECS yet.
 
 ## Building
 
-Needs clang, libc++, CMake, oneTBB, protobuf and SDL2.
+Needs clang, libc++ (including the static archives), CMake, oneTBB, protobuf
+and SDL2.
 
     tools/fetch-externals.sh    # Noesis, glm, imgui, lua, rapidjson, Vulkan
     cmake -S . -B build && cmake --build build
-    tools/check-vendor.sh       # optional: compiles the vendored headers
 
-`libc++` is required rather than optional: the native game is built against it,
-so `std::string` is 24 bytes there as here. libstdc++ would give 32 and
-silently shift every field after a string in a component.
+Optional checks:
+
+    tools/check-vendor-all.sh      # per-file error counts for vendor/bg3se
+    tools/check-vendor-patches.py  # confirms the clang fixes are still applied
+
+**clang is required, not merely supported.** The vendored bg3se sources need
+`-fdeclspec`, `-fms-extensions` and `-fdelayed-template-parsing`, none of which
+gcc has; CMake fails the configure step with any other compiler.
+
+**libc++ is required too.** The native game is built against it, so
+`std::string` is 24 bytes there as here — libstdc++ would give 32 and silently
+shift every field after a string in a component. Everything in the library has
+to agree on one standard library, so this applies to bg3le's own sources as
+well. It is linked statically, for the same reason Lua is vendored: a shim
+loaded inside the Steam runtime container cannot rely on host libraries.
 
 ## Running
 
