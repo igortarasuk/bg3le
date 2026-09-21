@@ -23,6 +23,29 @@
 #define _Out_
 #define _Inout_
 
+// ---- basic Win32 types ----
+//
+// Declared up front: later shims in this header use them, and the whole file
+// is force-included ahead of everything else.
+//
+// DWORD and LONG are 32-bit on Windows, so they are unsigned int and int --
+// not long, which is 64-bit on LP64.
+typedef int BOOL;
+typedef unsigned int DWORD;
+typedef unsigned short WORD;
+typedef unsigned char BYTE;
+typedef int LONG;
+typedef long long LONG64;
+typedef unsigned long long ULONG64;
+typedef unsigned long long ULONGLONG;
+typedef void* HANDLE;
+typedef void* HMODULE;
+typedef void* LPVOID;
+typedef void* LPSECURITY_ATTRIBUTES;
+typedef wchar_t* LPWSTR;
+typedef const wchar_t* LPCWSTR;
+typedef void (*FARPROC)();
+
 // A slim-reader-writer lock is one pointer wide. This is enough to compile
 // declarations; the Linux engine uses pthread primitives, so any *layout*
 // that embeds one is suspect and must be checked before it is trusted.
@@ -32,16 +55,45 @@ typedef struct _RTL_SRWLOCK { void* Ptr; } SRWLOCK, *PSRWLOCK;
 
 typedef void* HANDLE;
 
-// MSVC layout, for declarations only -- nothing here should end up in a
-// structure whose layout must match the engine.
+// A recursive mutex, since that is what a Win32 critical section is. Nothing
+// here should end up in a structure whose layout must match the engine.
+#include <pthread.h>
 typedef struct _RTL_CRITICAL_SECTION {
-    void* DebugInfo;
-    long LockCount;
-    long RecursionCount;
-    void* OwningThread;
-    void* LockSemaphore;
-    unsigned long long SpinCount;
+    pthread_mutex_t Mutex;
+    bool Initialized;
 } CRITICAL_SECTION, *PCRITICAL_SECTION;
+
+inline void InitializeCriticalSection(PCRITICAL_SECTION cs) {
+    pthread_mutexattr_t attr;
+    ::pthread_mutexattr_init(&attr);
+    ::pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    ::pthread_mutex_init(&cs->Mutex, &attr);
+    ::pthread_mutexattr_destroy(&attr);
+    cs->Initialized = true;
+}
+
+inline void DeleteCriticalSection(PCRITICAL_SECTION cs) {
+    if (cs->Initialized) {
+        ::pthread_mutex_destroy(&cs->Mutex);
+        cs->Initialized = false;
+    }
+}
+
+// Upstream sometimes relies on a zero-initialised section, which Win32 does
+// not allow either; initialise on first use rather than deadlocking.
+inline void EnterCriticalSection(PCRITICAL_SECTION cs) {
+    if (!cs->Initialized) InitializeCriticalSection(cs);
+    ::pthread_mutex_lock(&cs->Mutex);
+}
+
+inline void LeaveCriticalSection(PCRITICAL_SECTION cs) {
+    ::pthread_mutex_unlock(&cs->Mutex);
+}
+
+inline BOOL TryEnterCriticalSection(PCRITICAL_SECTION cs) {
+    if (!cs->Initialized) InitializeCriticalSection(cs);
+    return ::pthread_mutex_trylock(&cs->Mutex) == 0;
+}
 
 // Declared, not defined. These guard state belonging to bg3se rather than to
 // the engine, so a futex-backed one-pointer implementation can stand in; that
@@ -52,6 +104,7 @@ void AcquireSRWLockExclusive(PSRWLOCK);
 void ReleaseSRWLockExclusive(PSRWLOCK);
 void AcquireSRWLockShared(PSRWLOCK);
 void ReleaseSRWLockShared(PSRWLOCK);
+BOOL TryAcquireSRWLockExclusive(PSRWLOCK);
 }
 
 #define _In_z_
@@ -145,6 +198,7 @@ typedef void (*FARPROC)();
 // that mapper -- it reads the ELF symbol table instead -- but the header still
 // has to compile.
 #include <sys/mman.h>
+#include <sys/stat.h>
 typedef void* LPVOID;
 #define PAGE_NOACCESS          0x01
 #define PAGE_READONLY          0x02
@@ -204,6 +258,7 @@ typedef unsigned long long ULONGLONG;
 // Win32 high-resolution timing, used by Ext.Timer. CLOCK_MONOTONIC with a
 // fixed 1 GHz frequency gives the nanosecond resolution the callers expect.
 #include <ctime>
+#include <sched.h>
 
 typedef union _LARGE_INTEGER {
     struct { DWORD LowPart; LONG HighPart; };
@@ -260,4 +315,216 @@ inline const wchar_t* GetCommandLineW() {
         return wide;
     }();
     return cmdline.c_str();
+}
+
+// Win32 Sleep takes milliseconds; Sleep(0) yields.
+inline void Sleep(unsigned long ms) {
+    if (ms == 0) {
+        ::sched_yield();
+        return;
+    }
+    timespec ts{(long)(ms / 1000), (long)((ms % 1000) * 1000000L)};
+    ::nanosleep(&ts, nullptr);
+}
+
+// MSVC pulls <list> in transitively; libc++ does not, and OsiList is a
+// std::list alias used throughout the Osiris definitions.
+#include <list>
+
+#ifndef TRUE
+#define TRUE 1
+#define FALSE 0
+#endif
+
+#define _TRUNCATE ((std::size_t)-1)
+
+template <std::size_t N>
+int strncpy_s(char (&buf)[N], const char* src, std::size_t count) {
+    const std::size_t limit = (count == (std::size_t)-1 || count >= N) ? N - 1 : count;
+    std::snprintf(buf, limit + 1, "%s", src);
+    return 0;
+}
+
+inline int freopen_s(std::FILE** out, const char* path, const char* mode,
+                     std::FILE* stream) {
+    std::FILE* f = std::freopen(path, mode, stream);
+    if (out != nullptr) *out = f;
+    return f == nullptr ? 1 : 0;
+}
+
+// Interlocked intrinsics, over the compiler atomics.
+inline long long InterlockedExchangeAdd64(long long volatile* addend,
+                                          long long value) {
+    return __atomic_fetch_add(addend, value, __ATOMIC_SEQ_CST);
+}
+
+inline long long InterlockedOr64(long long volatile* dest, long long value) {
+    return __atomic_fetch_or(dest, value, __ATOMIC_SEQ_CST);
+}
+
+inline void* GetCurrentThread() { return nullptr; }
+inline void* GetCurrentProcess() { return nullptr; }
+
+inline void DebugBreak() { __builtin_trap(); }
+
+inline void OutputDebugStringA(const char* text) {
+    std::fputs(text, stderr);
+}
+
+// Code page and text conversion. Only CP_UTF8 is ever requested, and the
+// process locale is UTF-8, so the standard multibyte functions do the job.
+#define CP_UTF8 65001
+#define CP_ACP 0
+
+inline int MultiByteToWideChar(unsigned int /*codePage*/, unsigned long /*flags*/,
+                               const char* in, int inLen, wchar_t* out,
+                               int outLen) {
+    std::string src = (inLen < 0) ? std::string(in) : std::string(in, (std::size_t)inLen);
+    const std::size_t needed = std::mbstowcs(nullptr, src.c_str(), 0);
+    if (needed == (std::size_t)-1) return 0;
+    if (outLen == 0 || out == nullptr) return (int)needed;
+    const std::size_t written = std::mbstowcs(out, src.c_str(), (std::size_t)outLen);
+    return written == (std::size_t)-1 ? 0 : (int)written;
+}
+
+inline int WideCharToMultiByte(unsigned int /*codePage*/, unsigned long /*flags*/,
+                               const wchar_t* in, int inLen, char* out,
+                               int outLen, const char* /*defaultChar*/,
+                               BOOL* /*usedDefault*/) {
+    std::wstring src = (inLen < 0) ? std::wstring(in) : std::wstring(in, (std::size_t)inLen);
+    const std::size_t needed = std::wcstombs(nullptr, src.c_str(), 0);
+    if (needed == (std::size_t)-1) return 0;
+    if (outLen == 0 || out == nullptr) return (int)needed;
+    const std::size_t written = std::wcstombs(out, src.c_str(), (std::size_t)outLen);
+    return written == (std::size_t)-1 ? 0 : (int)written;
+}
+
+// Console attributes. There is no Win32 console here, so the colour calls are
+// accepted and ignored rather than translated to ANSI.
+#define STD_INPUT_HANDLE  ((DWORD)-10)
+#define STD_OUTPUT_HANDLE ((DWORD)-11)
+#define STD_ERROR_HANDLE  ((DWORD)-12)
+
+#define FOREGROUND_BLUE      0x0001
+#define FOREGROUND_GREEN     0x0002
+#define FOREGROUND_RED       0x0004
+#define FOREGROUND_INTENSITY 0x0008
+
+#define ENABLE_PROCESSED_OUTPUT            0x0001
+#define ENABLE_WRAP_AT_EOL_OUTPUT          0x0002
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+
+typedef struct _COORD { short X; short Y; } COORD;
+typedef struct _SMALL_RECT { short Left, Top, Right, Bottom; } SMALL_RECT;
+typedef struct _CONSOLE_SCREEN_BUFFER_INFOEX {
+    unsigned long cbSize;
+    COORD dwSize;
+    COORD dwCursorPosition;
+    unsigned short wAttributes;
+    SMALL_RECT srWindow;
+    COORD dwMaximumWindowSize;
+    unsigned short wPopupAttributes;
+    BOOL bFullscreenSupported;
+    unsigned long ColorTable[16];
+} CONSOLE_SCREEN_BUFFER_INFOEX, *PCONSOLE_SCREEN_BUFFER_INFOEX;
+
+inline HANDLE GetStdHandle(DWORD) { return nullptr; }
+inline BOOL SetConsoleTextAttribute(HANDLE, unsigned short) { return 1; }
+inline BOOL SetConsoleOutputCP(unsigned int) { return 1; }
+inline BOOL SetConsoleTitleW(const wchar_t*) { return 1; }
+inline BOOL AllocConsole() { return 1; }
+inline BOOL FreeConsole() { return 1; }
+inline BOOL GetConsoleScreenBufferInfoEx(HANDLE, PCONSOLE_SCREEN_BUFFER_INFOEX) { return 0; }
+inline BOOL SetConsoleScreenBufferInfoEx(HANDLE, PCONSOLE_SCREEN_BUFFER_INFOEX) { return 0; }
+inline BOOL GetConsoleMode(HANDLE, DWORD*) { return 0; }
+inline BOOL SetConsoleMode(HANDLE, DWORD) { return 0; }
+
+// Filesystem entry points, over POSIX.
+#define GENERIC_WRITE 0x40000000
+#define MB_OK 0
+#define MB_ICONERROR 0x10
+#define MAKEINTRESOURCE(x) ((const char*)(unsigned long long)(x))
+
+inline BOOL CreateDirectoryW(const wchar_t* path, void*) {
+    const std::size_t needed = std::wcstombs(nullptr, path, 0);
+    if (needed == (std::size_t)-1) return 0;
+    std::string narrow(needed + 1, '\0');
+    std::wcstombs(narrow.data(), path, narrow.size());
+    narrow.resize(needed);
+    return ::mkdir(narrow.c_str(), 0755) == 0 ? 1 : 0;
+}
+
+inline BOOL DeleteFileW(const wchar_t* path) {
+    const std::size_t needed = std::wcstombs(nullptr, path, 0);
+    if (needed == (std::size_t)-1) return 0;
+    std::string narrow(needed + 1, '\0');
+    std::wcstombs(narrow.data(), path, narrow.size());
+    narrow.resize(needed);
+    return ::unlink(narrow.c_str()) == 0 ? 1 : 0;
+}
+
+inline BOOL ReadConsoleW(HANDLE, void*, DWORD, DWORD* read, void*) {
+    if (read != nullptr) *read = 0;
+    return 0;
+}
+
+// ---- module and process queries ----
+//
+// GetProcAddress maps onto dlsym. GetModuleHandleW is only ever used to test
+// whether a module is loaded or to pass to GetProcAddress, so a dlopen handle
+// with RTLD_NOLOAD answers both.
+#include <dlfcn.h>
+#include <limits.h>
+#include <cerrno>
+#include <cwchar>
+
+inline FARPROC GetProcAddress(HMODULE module, const char* name) {
+    void* sym = ::dlsym(module != nullptr ? module : RTLD_DEFAULT, name);
+    return reinterpret_cast<FARPROC>(sym);
+}
+
+inline HMODULE GetModuleHandleW(const wchar_t* name) {
+    if (name == nullptr) return ::dlopen(nullptr, RTLD_LAZY | RTLD_NOLOAD);
+    const std::size_t needed = std::wcstombs(nullptr, name, 0);
+    if (needed == (std::size_t)-1) return nullptr;
+    std::string narrow(needed + 1, '\0');
+    std::wcstombs(narrow.data(), name, narrow.size());
+    narrow.resize(needed);
+    return ::dlopen(narrow.c_str(), RTLD_LAZY | RTLD_NOLOAD);
+}
+
+inline HMODULE GetModuleHandleA(const char* name) {
+    return ::dlopen(name, RTLD_LAZY | RTLD_NOLOAD);
+}
+
+inline DWORD GetModuleFileNameW(HMODULE, wchar_t* out, DWORD size) {
+    char path[PATH_MAX];
+    const ssize_t n = ::readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (n <= 0) return 0;
+    path[n] = '\0';
+    const std::size_t written = std::mbstowcs(out, path, size);
+    return written == (std::size_t)-1 ? 0 : (DWORD)written;
+}
+
+#define ERROR_ALREADY_EXISTS 183
+inline DWORD GetLastError() { return (DWORD)errno; }
+inline DWORD GetCurrentProcessId() { return (DWORD)::getpid(); }
+
+// MSVC byte-swap intrinsics.
+inline unsigned short _byteswap_ushort(unsigned short v) { return __builtin_bswap16(v); }
+inline unsigned int _byteswap_ulong(unsigned int v) { return __builtin_bswap32(v); }
+inline unsigned long long _byteswap_uint64(unsigned long long v) { return __builtin_bswap64(v); }
+
+// Wide and secure CRT stragglers.
+inline int _wcsicmp(const wchar_t* a, const wchar_t* b) { return ::wcscasecmp(a, b); }
+
+template <std::size_t N>
+int wcscpy_s(wchar_t (&buf)[N], const wchar_t* src) {
+    std::wcsncpy(buf, src, N - 1);
+    buf[N - 1] = L'\0';
+    return 0;
+}
+
+inline int gmtime_s(std::tm* out, const std::time_t* time) {
+    return ::gmtime_r(time, out) == nullptr ? 1 : 0;
 }

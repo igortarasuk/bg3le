@@ -638,13 +638,13 @@ public:
         MakeImpl(L, object, lifetime, GetImplementation<DynamicArrayProxyImpl<Queue<T>, T, 7>>());
     }
 
-    template <class T, int Size>
+    template <class T, std::size_t Size>
     inline static void Make(lua_State* L, std::array<T, Size>* object, LifetimeHandle lifetime)
     {
         MakeImpl(L, object, lifetime, GetImplementation<ConstSizeArrayProxyImpl<std::array<T, Size>, T, 1>>());
     }
 
-    template <class T, int Size>
+    template <class T, std::size_t Size>
     inline static void Make(lua_State* L, std::array<T, Size> const* object, LifetimeHandle lifetime)
     {
         MakeImpl(L, object, lifetime, GetImplementation<ConstSizeArrayProxyImpl<std::array<T, Size>, T, 1>>());

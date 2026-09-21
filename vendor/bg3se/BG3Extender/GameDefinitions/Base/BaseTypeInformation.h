@@ -267,7 +267,7 @@ inline StaticTypeInformation::InitializerProc* MakeDeferredTypeInitializer(Overl
     return &MakeDeferredArrayType<T>;
 }
 
-template <class T, int Size>
+template <class T, std::size_t Size>
 inline StaticTypeInformation::InitializerProc* MakeDeferredTypeInitializer(Overload<std::array<T, Size>>)
 {
     return &MakeDeferredArrayType<T>;

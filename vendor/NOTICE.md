@@ -128,6 +128,26 @@ inherited virtual destructor still needs a usual deallocation function.
 
 - `BG3Extender/Lua/Libs/ClientUI/CustomProperties.inl`
 
+**A non-type template parameter must match the exact type to deduce.**
+`std::array`'s extent is `std::size_t`, so `template <class T, int Size>` never
+matches it. MSVC deduces anyway. This one accounted for 71 errors in
+`LuaObjectProxies.cpp` alone, and their own serialisation helpers already used
+`size_t`:
+
+- `BG3Extender/Lua/Shared/Proxies/LuaArrayProxy.h:641,647`
+- `BG3Extender/GameDefinitions/Base/BaseTypeInformation.h:270`
+
+**Converting a function pointer to `void*` is conditionally supported**, not
+standard. MSVC does it implicitly; the casts are now explicit:
+
+- `BG3Extender/Lua/Shared/Proxies/LuaObjectProxies.cpp` (the `P_FALLBACK` macro)
+
+**libc++ has no wide-path `fstream` constructor**; MSVC provides one as an
+extension. These now convert with upstream's own `ToUTF8`:
+
+- `BG3Extender/Lua/Shared/LuaBundle.cpp:39`
+- `CoreLib/Crypto.cpp:85`
+
 **An include used the wrong directory case**, which resolves on Windows and
 not on Linux:
 
@@ -160,7 +180,14 @@ or sit ahead of the vendored tree on the include path.
   32-bit on Windows, so they are `unsigned int` and `int`, not `long`), the
   MSVC bit-scan intrinsics, the secure-CRT `sprintf_s` family, `_strdup`,
   `VirtualProtect` over `mprotect`, `QueryPerformanceCounter` over
-  `CLOCK_MONOTONIC`, and `GetCommandLineW` over `/proc/self/cmdline`
+  `CLOCK_MONOTONIC`, `GetCommandLineW` over `/proc/self/cmdline`,
+  `GetProcAddress`/`GetModuleHandleW` over `dlsym`/`dlopen`, critical sections
+  over recursive `pthread_mutex`, and the byte-swap and Interlocked intrinsics
+  over the compiler builtins. Basic Win32 typedefs are declared first, since
+  the rest of the header uses them
+- `Shlwapi.h`, `shlwapi.h`, `combaseapi.h`, `WS2tcpip.h` — `PathFileExistsW`,
+  the RPC UUID functions (faithful to the Windows GUID layout, since Guid
+  values round-trip through Osiris), and the TCP/IP half of Winsock
 - `concurrent_vector.h`, `concurrent_queue.h`, `ppl.h` — MSVC's
   `concurrency::` containers mapped onto [oneTBB](https://github.com/uxlfoundation/oneTBB)
   (Apache-2.0)

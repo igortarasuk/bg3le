@@ -40,7 +40,7 @@ clang++ -std=gnu++23 -stdlib=libc++ -fsyntax-only \
     -include "$ROOT/vendor/compat/msvc_compat.h" \
     -I"$ROOT/vendor/compat" -I"$V" -I"$V/BG3Extender" -I"$N" \
     -I"$E/glm" -I"$E/imgui" -I"$E/rapidjson/include" -I"$ROOT/external/lua" \
-    -I"$E/optick/src" -I/usr/include/SDL2 \
+    -I"$E/optick/src" -I"$E/tinycrypt/lib/include" -I/usr/include/SDL2 \
     "$TU"
 rc=$?
 

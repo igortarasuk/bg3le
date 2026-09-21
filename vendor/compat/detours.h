@@ -30,4 +30,7 @@ long DetourAttachEx(PVOID* ppPointer, PVOID pDetour,
                     PDETOUR_TRAMPOLINE* ppRealTrampoline, PVOID* ppRealTarget,
                     PVOID* ppRealDetour);
 long DetourDetach(PVOID* ppPointer, PVOID pDetour);
+long DetourTransactionBegin();
+long DetourTransactionCommit();
+long DetourUpdateThread(PVOID hThread);
 }

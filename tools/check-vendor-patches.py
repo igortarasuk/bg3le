@@ -62,6 +62,14 @@ CHECKS = [
      lambda: "name.c_str()" in text("BG3Extender/Lua/Libs/ClientAudio.inl")),
     ("derived_from guarded by a completeness check",
      lambda: "IsCompleteType<T>" in text("BG3Extender/GameDefinitions/Base/TypeMetadata.h")),
+    ("std::array extents deduced as size_t",
+     lambda: "template <class T, std::size_t Size>"
+             in text("BG3Extender/Lua/Shared/Proxies/LuaArrayProxy.h")),
+    ("P_FALLBACK casts function pointers to void*",
+     lambda: ".Getter = (void*)getter"
+             in text("BG3Extender/Lua/Shared/Proxies/LuaObjectProxies.cpp")),
+    ("fstream paths converted to UTF-8",
+     lambda: "ToUTF8(resPath)" in text("BG3Extender/Lua/Shared/LuaBundle.cpp")),
     ("NsCustomDataContext has a usual operator delete",
      lambda: "static void operator delete(void* ptr) noexcept"
              in text("BG3Extender/Lua/Libs/ClientUI/CustomProperties.inl")),

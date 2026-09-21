@@ -82,7 +82,8 @@ bool CryptoUtils::GenerateKeys(std::wstring const& privateKeyPath)
         return false;
     }
 
-    std::ofstream of(privateKeyPath.c_str(), std::ios::out | std::ios::binary);
+    // libc++ has no wide-path fstream constructor; MSVC does.
+    std::ofstream of(ToUTF8(privateKeyPath).c_str(), std::ios::out | std::ios::binary);
     if (!of.good()) {
         return false;
     }

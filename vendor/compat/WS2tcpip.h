@@ -5,9 +5,9 @@
 // Windows. The code it supports is by Norbyte and the bg3se contributors,
 // MIT + Commons Clause; only this shim is ours. With thanks to them.
 //
-// MSVC ships concurrency::concurrent_vector in <concurrent_vector.h>.
-// oneTBB provides the same container as tbb::concurrent_vector.
-#include <tbb/concurrent_vector.h>
-namespace concurrency { using tbb::concurrent_vector; }
+// The TCP/IP half of Winsock. Everything used is in the POSIX headers.
+//
+#include "WinSock2.h"
 
-namespace Concurrency = concurrency;
+#include <netdb.h>
+#include <netinet/tcp.h>

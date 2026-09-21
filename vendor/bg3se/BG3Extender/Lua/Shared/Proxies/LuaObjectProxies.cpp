@@ -635,11 +635,14 @@ inline constexpr RawPropertyAccessors::Serializer* PickPropertySerializer()
             .Serialize = &GenericNullSerializeProperty, \
         } },
 
+// These fields are void*, and converting a function pointer to void* is
+// conditionally supported rather than standard. MSVC does it implicitly; make
+// it explicit so clang accepts it too.
 #define P_FALLBACK(getter, setter, next) \
         { .Type = PropertyMapEntryType::Fallback, .Fallback = { \
-            .Getter = getter, \
-            .Setter = setter, \
-            .Next = next \
+            .Getter = (void*)getter, \
+            .Setter = (void*)setter, \
+            .Next = (void*)next \
         } },
 
 #include <GameDefinitions/Generated/PropertyMaps.inl>
