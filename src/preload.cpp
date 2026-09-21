@@ -26,6 +26,7 @@
 #include "debug_server.h"
 #include "lua_host.h"
 #include "osi.h"
+#include "stackdump.h"
 #include "mem.h"
 #include "log.h"
 
@@ -633,6 +634,14 @@ extern "C" long _ZN7COsiris4LoadER12COsiSmartBuf(void* self, void* buf) {
     statusf("OnAfterOsirisLoad: story loaded in %.2fs", now_s() - t0);
     g_story_ready_at = now_s();
     start_stall_profile();
+
+    // Sample mid-stall: every thread is parked, so this should show what on.
+    if (const char* e = std::getenv("BG3LE_STACKDUMP")) {
+        if (e[0] == '1') {
+            schedule_stack_dump(20.0, "mid level load");
+            schedule_stack_dump(40.0, "mid level load");
+        }
+    }
     return rc;
 }
 
