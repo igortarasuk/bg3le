@@ -5,6 +5,31 @@ Steam runtime container, on a brand-new game as well as an existing save.
 The Windows build under Proton loads the same save in ~15s while running
 BG3SE and 57 mods.
 
+## Confirmed: the shipped Linux assets are in Windows format
+
+PhysX serialized blobs are stored uncompressed in the paks, each with a
+header naming its version GUID and platform:
+
+    SEBD 77E92B17A4084033A0FDB51332D5A6BB W_64
+         ^ PhysX binary version GUID       ^ Windows 64-bit
+
+`Data/Engine.pak` from the **Linux** content depot (2378501) is byte-identical
+to the one from the Windows depot (1086941) -- same sha256 -- and all 68 of
+its PhysX blobs are tagged `W_64`. Larian cooks physics data on Windows and
+ships the same files to both platforms, so the native Linux build converts
+every blob on every load.
+
+This also rules out an obvious objection: these measurements were taken with
+the Windows `Data/` symlinked in to avoid a 144GB download, but the Linux
+depot's copy is identical, so the symlink introduces nothing. The bug is in
+the shipped data and affects every native Linux install.
+
+Verify with:
+
+    DepotDownloader -app 1086940 -depot 2378501 \
+        -filelist <(echo Data/Engine.pak) -dir /tmp/bg3-linux-data
+    grep -a -o -E "[0-9A-F]{32}[A-Z]_[0-9]{2}" /tmp/bg3-linux-data/Data/Engine.pak
+
 ## Cause
 
 Seven threads -- all six `WT/Low` workers plus `ServerWorker` -- occupy one
