@@ -5039,6 +5039,25 @@ function Ext.Stats.GetStatsLoadedBefore(modId)
   return out
 end
 
+-- Sync and SetPersistence exist at module level as well as on the stat
+-- object -- upstream's own comment calls the module-level pair a leftover
+-- it means to move. Both need RPGStats::SyncWithPrototypeManager, which
+-- bg3le does not reach, so both refuse; the name check upstream does first
+-- happens here too, so a typo still reports as a typo.
+function Ext.Stats.Sync(statName)
+  if Ext._Internal.StatsFind(statName) == nil then
+    Ext.Log.PrintError("Cannot sync nonexistent stat: " .. tostring(statName))
+    return
+  end
+  error("bg3le: Ext.Stats.Sync needs the engine's stat sync path, which "
+        .. "is not implemented", 2)
+end
+
+function Ext.Stats.SetPersistence()
+  error("bg3le: Ext.Stats.SetPersistence is deprecated upstream and needs "
+        .. "the engine's stat persistence flag, which is not implemented", 2)
+end
+
 Ext.Stats.Create = needs(
   "Ext.Stats.Create needs the engine's stat allocation and sync path")
 Ext.Stats.AddAttribute = needs(
