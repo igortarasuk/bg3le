@@ -121,6 +121,53 @@ extern "C" std::uint64_t bg3le_find_entity_with(void* container,
     return 0;
 }
 
+// Every live entity, or every entity carrying one component.
+//
+// The walk is the one bg3le already uses to find a single entity, run to
+// completion: each storage's InstanceToPageMap holds its entities as keys
+// in an array, so they come out without touching buckets or page masks.
+// Filtering is per storage rather than per entity, because a storage is an
+// archetype -- every entity in it has exactly the same component set, so
+// one lookup decides for all of them.
+//
+// Returns how many exist, which may exceed `max`; the caller sizes its
+// buffer from a first call and reads on a second, and a count that grew in
+// between is truncated rather than overrunning.
+extern "C" std::size_t bg3le_entities_collect(void* container,
+                                              int componentIndex,
+                                              std::uint64_t* out,
+                                              std::size_t max) {
+    if (container == nullptr) return 0;
+
+    auto* storages =
+        reinterpret_cast<bg3se::ecs::EntityStorageContainer*>(container);
+    const bool filtered = componentIndex >= 0;
+    const auto type =
+        bg3se::ecs::ComponentTypeIndex((std::uint16_t)componentIndex);
+
+    std::size_t found = 0;
+    for (auto* storage : storages->Storages) {
+        if (storage == nullptr) continue;
+        // ComponentsInClass, which is what bg3se's own HasComponent
+        // tests. ComponentTypeToIndex is a slot map and matched only 19
+        // entities for Health, none of which read one back.
+        if (filtered && !storage->HasComponent(type)) continue;
+
+        // InstanceToPageMap's keys, which are the handles the rest of
+        // bg3le already resolves -- the same ones find_entity_with hands
+        // to the component readers. The handle pages looked like the
+        // authoritative list and are not: their entries came back with a
+        // different high half and GetEntityStorageIndex rejected every
+        // one.
+        for (auto const& key : storage->InstanceToPageMap.keys()) {
+            if (key.Handle == bg3se::EntityHandle::NullHandle) continue;
+            if (out != nullptr && found < max) out[found] = key.Handle;
+            ++found;
+        }
+    }
+    return found;
+}
+
 // Finds the component of a given type on whichever entity carries it, by
 // scanning the container's storages. Used for the singleton components, which
 // bg3se normally reaches through EntityWorld -- and the world is the one thing

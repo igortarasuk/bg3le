@@ -461,6 +461,10 @@ extern "C" std::size_t bg3le_meta_class_count();
 extern "C" std::size_t bg3le_meta_component_count();
 extern "C" const char* bg3le_meta_engine_class(void const* handle);
 extern "C" const char* bg3le_meta_short_name(void const* handle);
+extern "C" std::size_t bg3le_entities_collect(void* container,
+                                              int componentIndex,
+                                              std::uint64_t* out,
+                                              std::size_t max);
 extern "C" void* bg3le_entity_component(void* container, std::uint64_t handle,
                                         std::uint16_t componentIndex,
                                         std::size_t componentSize);
@@ -1725,6 +1729,57 @@ int l_stats_list_attrs(lua_State* L) {
     return 1;
 }
 
+// Ext._Internal.AllEntities([component]) -> { handle, ... }
+//
+// Sized from a first pass so the second cannot overrun, which matters
+// because entities come and go between the two on a live world.
+int l_all_entities(lua_State* L) {
+    // The server world, which is the one every other read here uses.
+    // Enumerating ecs::container() instead handed back handles from
+    // whichever world was captured first -- valid there, rejected by the
+    // component readers, and so entirely unreadable.
+    void* container = server_container();
+    if (container == nullptr) {
+        lua_pushnil(L);
+        lua_pushstring(L, "the ECS container has not been captured yet");
+        return 2;
+    }
+
+    int component = -1;
+    if (!lua_isnoneornil(L, 1)) {
+        char const* name = luaL_checkstring(L, 1);
+
+        // Either spelling, as everywhere else that names a component: the
+        // index is registered under the engine name, and the metadata
+        // maps bg3se's short one onto it.
+        void const* meta = bg3le_meta_component(name);
+        char const* engineName =
+            meta != nullptr ? bg3le_meta_engine_class(meta) : name;
+
+        const auto index = component_index(engineName);
+        if (!index.has_value()) {
+            lua_pushnil(L);
+            lua_pushfstring(L, "no component named %s", name);
+            return 2;
+        }
+        component = (int)*index;
+    }
+
+    const std::size_t count =
+        bg3le_entities_collect(container, component, nullptr, 0);
+    std::vector<std::uint64_t> handles(count);
+    const std::size_t got = bg3le_entities_collect(
+        container, component, handles.data(), handles.size());
+
+    const std::size_t n = got < count ? got : count;
+    lua_createtable(L, (int)n, 0);
+    for (std::size_t i = 0; i < n; ++i) {
+        lua_pushinteger(L, (lua_Integer)handles[i]);
+        lua_rawseti(L, -2, (int)i + 1);
+    }
+    return 1;
+}
+
 // Ext._Internal.ComponentTypeNames() -> every component bg3le can read.
 int l_component_type_names(lua_State* L) {
     const std::size_t count = bg3le_meta_class_count();
@@ -2764,6 +2819,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "StatsEnumIndex");
     lua_pushcfunction(g_lua, l_stats_list_attrs);
     lua_setfield(g_lua, -2, "StatsListAttrs");
+    lua_pushcfunction(g_lua, l_all_entities);
+    lua_setfield(g_lua, -2, "AllEntities");
     lua_pushcfunction(g_lua, l_component_type_names);
     lua_setfield(g_lua, -2, "ComponentTypeNames");
     lua_pushcfunction(g_lua, l_type_names);
@@ -5179,16 +5236,72 @@ function Ext._Internal.FireEntityEvent(kind, component, entity, ...)
   end
 end
 
-Ext.Entity.GetAllEntities = needs(
-  "Ext.Entity.GetAllEntities needs to walk the ECS entity storage, which "
-  .. "bg3le reads component-wise but cannot yet enumerate")
-Ext.Entity.GetAllEntitiesWithComponent = needs(
-  "Ext.Entity.GetAllEntitiesWithComponent needs to walk the ECS entity "
-  .. "storage, which bg3le reads component-wise but cannot yet enumerate")
-Ext.Entity.GetAllEntitiesWithUuid = needs(
-  "Ext.Entity.GetAllEntitiesWithUuid needs to walk the ECS entity storage")
-Ext.Entity.GetEntitiesAroundPosition = needs(
-  "Ext.Entity.GetEntitiesAroundPosition needs the engine's spatial index")
+-- Entity enumeration, over the storage container bg3le captured. A
+-- storage is an archetype, so the component filter is one lookup per
+-- storage rather than per entity.
+--
+-- Handles come back as the integers Ext.Entity.Get accepts, which is what
+-- upstream returns too.
+function Ext.Entity.GetAllEntities()
+  local handles, err = Ext._Internal.AllEntities()
+  if handles == nil then error("bg3le: " .. tostring(err), 2) end
+  return handles
+end
+
+function Ext.Entity.GetAllEntitiesWithComponent(component)
+  if type(component) ~= "string" then
+    error("Ext.Entity.GetAllEntitiesWithComponent expects a component name", 2)
+  end
+  local handles, err = Ext._Internal.AllEntities(component)
+  if handles == nil then error("bg3le: " .. tostring(err), 2) end
+  return handles
+end
+
+-- The entities the engine gave a UUID, which is the set carrying
+-- ls::uuid::Component.
+function Ext.Entity.GetAllEntitiesWithUuid()
+  local handles, err = Ext._Internal.AllEntities("Uuid")
+  if handles == nil then error("bg3le: " .. tostring(err), 2) end
+
+  -- Upstream keys this one by UUID rather than returning a plain list.
+  local out = {}
+  for _, handle in ipairs(handles) do
+    local uuid = Ext.Entity.HandleToUuid(handle)
+    if uuid ~= nil then out[uuid] = handle end
+  end
+  return out
+end
+-- Entities within a radius of a point.
+--
+-- Upstream asks the engine's spatial index; bg3le has not located it, so
+-- this walks the entities that carry a transform and measures. The answer
+-- is the same set -- the index is an acceleration structure, not a
+-- different definition -- and at around five thousand transforms it is
+-- fast enough to call, but it is linear where upstream's is not, so a
+-- caller doing it every frame should know.
+function Ext.Entity.GetEntitiesAroundPosition(position, radius)
+  if type(position) ~= "table" or type(radius) ~= "number" then
+    error("Ext.Entity.GetEntitiesAroundPosition(position, radius)", 2)
+  end
+
+  local out = {}
+  local limit = radius * radius
+  for _, handle in ipairs(Ext.Entity.GetAllEntitiesWithComponent("Transform")) do
+    local entity = Ext.Entity.Get(handle)
+    local transform = entity ~= nil and entity.Transform or nil
+    local at = transform ~= nil and transform.Transform or nil
+    local translate = at ~= nil and at.Translate or nil
+    if translate ~= nil then
+      local dx = translate[1] - position[1]
+      local dy = translate[2] - position[2]
+      local dz = translate[3] - position[3]
+      if dx * dx + dy * dy + dz * dz <= limit then
+        out[#out + 1] = handle
+      end
+    end
+  end
+  return out
+end
 Ext.Entity.GetEntitiesOnTile = needs(
   "Ext.Entity.GetEntitiesOnTile needs the level's tile grid")
 Ext.Entity.Create = needs(
