@@ -16,6 +16,7 @@
 #include "ecs_world.h"
 #include "mem.h"
 #include "log.h"
+#include "vendor/mods.h"
 
 // Norbyte's Lua fork is compiled as C++, as bg3se compiles it, so these must
 // not be wrapped in extern "C" or the symbols will not match.
@@ -1033,6 +1034,20 @@ extern "C" bool bg3le_resource_guid_at(std::int32_t typeIndex, std::size_t i,
 // Ext.Stats. The manager is found by fingerprint like the resource manager;
 // see src/vendor/stats.cpp for why the attribute values need four lookups
 // rather than an offset.
+// Ext.Mod. The module list is found from the base module's constant
+// uuid; see src/vendor/mods.cpp.
+extern "C" std::size_t bg3le_mods_count();
+extern "C" char const* bg3le_mods_uuid_at(std::size_t index);
+extern "C" void* bg3le_mods_at(std::size_t index);
+extern "C" void* bg3le_mods_find(char const* uuid);
+extern "C" void* bg3le_mods_base();
+extern "C" std::size_t bg3le_mods_available_count();
+extern "C" void* bg3le_mods_available_at(std::size_t index);
+extern "C" bool bg3le_mod_info(void const* module, bg3le::ModInfo* out);
+extern "C" std::size_t bg3le_mod_list_count(void const* module, int list);
+extern "C" bool bg3le_mod_list_at(void const* module, int list,
+                                  std::size_t index, bg3le::ModShortDesc* out);
+
 extern "C" void* bg3le_stats_manager();
 extern "C" std::size_t bg3le_stats_count();
 extern "C" void* bg3le_stats_at(std::size_t index);
@@ -1345,6 +1360,144 @@ int l_resource_guids(lua_State* L) {
         if (!bg3le_meta_format_guid(guid, text, sizeof(text))) continue;
         lua_pushstring(L, text);
         lua_rawseti(L, -2, ++written);
+    }
+    return 1;
+}
+
+// ---- Ext.Mod ----
+
+// Ext._Internal.ModCount() -> n
+int l_mod_count(lua_State* L) {
+    lua_pushinteger(L, (lua_Integer)bg3le_mods_count());
+    return 1;
+}
+
+// Ext._Internal.ModUuidAt(index) -> uuid string
+int l_mod_uuid_at(lua_State* L) {
+    const auto i = (std::size_t)luaL_checkinteger(L, 1);
+    char const* uuid = bg3le_mods_uuid_at(i);
+    if (uuid == nullptr) return 0;
+    lua_pushstring(L, uuid);
+    return 1;
+}
+
+// Ext._Internal.ModAt(index) -> address, and ModFind(uuid) -> address.
+// Ext.Mod takes the module by address so a lookup is paid for once.
+int l_mod_at(lua_State* L) {
+    const auto i = (std::size_t)luaL_checkinteger(L, 1);
+    void* module = bg3le_mods_at(i);
+    if (module == nullptr) return 0;
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)module);
+    return 1;
+}
+
+int l_mod_find(lua_State* L) {
+    void* module = bg3le_mods_find(luaL_checkstring(L, 1));
+    if (module == nullptr) return 0;
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)module);
+    return 1;
+}
+
+// Ext._Internal.ModAvailableCount() / ModAvailableAt(index)
+int l_mod_available_count(lua_State* L) {
+    lua_pushinteger(L, (lua_Integer)bg3le_mods_available_count());
+    return 1;
+}
+
+int l_mod_available_at(lua_State* L) {
+    const auto i = (std::size_t)luaL_checkinteger(L, 1);
+    void* module = bg3le_mods_available_at(i);
+    if (module == nullptr) return 0;
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)module);
+    return 1;
+}
+
+int l_mod_base(lua_State* L) {
+    void* module = bg3le_mods_base();
+    if (module == nullptr) return 0;
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)module);
+    return 1;
+}
+
+void push_version(lua_State* L, std::uint32_t const v[4]) {
+    lua_createtable(L, 4, 0);
+    for (int i = 0; i < 4; ++i) {
+        lua_pushinteger(L, (lua_Integer)v[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+}
+
+void set_string(lua_State* L, char const* key, char const* value) {
+    lua_pushstring(L, value != nullptr ? value : "");
+    lua_setfield(L, -2, key);
+}
+
+// Ext._Internal.ModInfo(address) -> the ModuleInfo table
+//
+// Keys and shapes follow reference/mod-shape.txt exactly; a mod written
+// against bg3se reads mod.Info.Directory and has to find it here.
+int l_mod_info(lua_State* L) {
+    auto const* module =
+        (void const*)(std::uintptr_t)luaL_checkinteger(L, 1);
+    bg3le::ModInfo info{};
+    if (!bg3le_mod_info(module, &info)) return 0;
+
+    lua_createtable(L, 0, 16);
+    set_string(L, "ModuleUUID", info.ModuleUUIDString);
+    set_string(L, "ModuleUUIDString", info.ModuleUUIDString);
+    set_string(L, "Name", info.Name);
+    set_string(L, "Directory", info.Directory);
+    set_string(L, "Hash", info.Hash);
+    set_string(L, "Author", info.Author);
+    set_string(L, "Description", info.Description);
+    set_string(L, "StartLevelName", info.StartLevelName);
+    set_string(L, "MenuLevelName", info.MenuLevelName);
+    set_string(L, "LobbyLevelName", info.LobbyLevelName);
+    set_string(L, "CharacterCreationLevelName",
+               info.CharacterCreationLevelName);
+    set_string(L, "PhotoBoothLevelName", info.PhotoBoothLevelName);
+
+    push_version(L, info.ModVersion);
+    lua_setfield(L, -2, "ModVersion");
+    push_version(L, info.PublishVersion);
+    lua_setfield(L, -2, "PublishVersion");
+
+    lua_pushinteger(L, (lua_Integer)info.NumPlayers);
+    lua_setfield(L, -2, "NumPlayers");
+    lua_pushinteger(L, (lua_Integer)info.FileSize);
+    lua_setfield(L, -2, "FileSize");
+    lua_pushinteger(L, (lua_Integer)info.PublishHandle);
+    lua_setfield(L, -2, "PublishHandle");
+    return 1;
+}
+
+// Ext._Internal.ModList(address, which) -> { ModuleShortDesc, ... }
+// which is 0 Dependencies, 1 ModConflicts, 2 Addons.
+int l_mod_list(lua_State* L) {
+    auto const* module =
+        (void const*)(std::uintptr_t)luaL_checkinteger(L, 1);
+    const int which = (int)luaL_checkinteger(L, 2);
+
+    const std::size_t n = bg3le_mod_list_count(module, which);
+    lua_createtable(L, (int)n, 0);
+    for (std::size_t i = 0; i < n; ++i) {
+        bg3le::ModShortDesc desc{};
+        if (!bg3le_mod_list_at(module, which, i, &desc)) break;
+
+        lua_createtable(L, 0, 7);
+        set_string(L, "ModuleUUID", desc.ModuleUUIDString);
+        set_string(L, "ModuleUUIDString", desc.ModuleUUIDString);
+        set_string(L, "Name", desc.Name);
+        set_string(L, "Folder", desc.Folder);
+        set_string(L, "Hash", desc.Hash);
+        push_version(L, desc.ModVersion);
+        lua_setfield(L, -2, "ModVersion");
+        push_version(L, desc.PublishVersion);
+        lua_setfield(L, -2, "PublishVersion");
+        lua_pushinteger(L, (lua_Integer)desc.PublishHandle);
+        lua_setfield(L, -2, "PublishHandle");
+
+        lua_rawseti(L, -2, (int)i + 1);
     }
     return 1;
 }
@@ -2198,6 +2351,24 @@ void lua_init() {
     lua_setfield(g_lua, -2, "MapKey");
     lua_pushcfunction(g_lua, l_variant_index);
     lua_setfield(g_lua, -2, "VariantIndex");
+    lua_pushcfunction(g_lua, l_mod_count);
+    lua_setfield(g_lua, -2, "ModCount");
+    lua_pushcfunction(g_lua, l_mod_uuid_at);
+    lua_setfield(g_lua, -2, "ModUuidAt");
+    lua_pushcfunction(g_lua, l_mod_at);
+    lua_setfield(g_lua, -2, "ModAt");
+    lua_pushcfunction(g_lua, l_mod_find);
+    lua_setfield(g_lua, -2, "ModFind");
+    lua_pushcfunction(g_lua, l_mod_base);
+    lua_setfield(g_lua, -2, "ModBase");
+    lua_pushcfunction(g_lua, l_mod_available_count);
+    lua_setfield(g_lua, -2, "ModAvailableCount");
+    lua_pushcfunction(g_lua, l_mod_available_at);
+    lua_setfield(g_lua, -2, "ModAvailableAt");
+    lua_pushcfunction(g_lua, l_mod_info);
+    lua_setfield(g_lua, -2, "ModInfo");
+    lua_pushcfunction(g_lua, l_mod_list);
+    lua_setfield(g_lua, -2, "ModList");
     lua_pushcfunction(g_lua, l_stats_count);
     lua_setfield(g_lua, -2, "StatsCount");
     lua_pushcfunction(g_lua, l_stats_name_at);
@@ -2815,6 +2986,76 @@ function Ext.Entity.Get(id)
   return setmetatable({Handle = handle,
                        EntityUuid = type(id) == "string" and id or nil},
                       entity_meta)
+end
+
+-- ---- Ext.Mod ----
+--
+-- Names from reference/ext-api-surface.txt; the shape of a mod from
+-- reference/mod-shape.txt. GetLoadOrder returns an array of uuid strings, as
+-- reference/mod-loadorder.txt shows.
+Ext.Mod = {}
+
+local function make_mod(addr)
+  local info = Ext._Internal.ModInfo(addr)
+  if info == nil then return nil end
+  return {
+    Info = info,
+    Dependencies = Ext._Internal.ModList(addr, 0),
+    ModConflicts = Ext._Internal.ModList(addr, 1),
+    Addons = Ext._Internal.ModList(addr, 2),
+  }
+end
+
+function Ext.Mod.GetLoadOrder()
+  local out = {}
+  local n = Ext._Internal.ModCount()
+  for i = 0, n - 1 do
+    local uuid = Ext._Internal.ModUuidAt(i)
+    if uuid ~= nil then out[#out + 1] = uuid end
+  end
+  return out
+end
+
+function Ext.Mod.IsModLoaded(uuid)
+  if type(uuid) ~= "string" then return false end
+  return Ext._Internal.ModFind(uuid) ~= nil
+end
+
+function Ext.Mod.GetMod(uuid)
+  if type(uuid) ~= "string" then return nil end
+  local addr = Ext._Internal.ModFind(uuid)
+  if addr == nil then return nil end
+  return make_mod(addr)
+end
+
+-- ModManager::BaseModule, which is the campaign module rather than the first
+-- mod in load order -- upstream returns that member, so this does too.
+function Ext.Mod.GetBaseMod()
+  local addr = Ext._Internal.ModBase()
+  if addr == nil then return nil end
+  return make_mod(addr)
+end
+
+-- Upstream returns the engine's ModManager. Settings is left out: it sits
+-- past a hash map whose size on this build is not established, and an empty
+-- table there would be a wrong answer rather than a missing one.
+function Ext.Mod.GetModManager()
+  local function collect(count, at)
+    local out = {}
+    for i = 0, count() - 1 do
+      local addr = at(i)
+      if addr ~= nil then out[#out + 1] = make_mod(addr) end
+    end
+    return out
+  end
+
+  return {
+    BaseModule = Ext.Mod.GetBaseMod(),
+    LoadOrderedModules = collect(Ext._Internal.ModCount,
+                                 Ext._Internal.ModAt),
+    AvailableMods = collect(Ext._Internal.ModAvailableCount,
+                            Ext._Internal.ModAvailableAt),
+  }
 end
 
 -- ---- Ext.Stats ----

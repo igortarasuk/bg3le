@@ -53,10 +53,20 @@ component's declared size with the size the engine recorded, and
   it — the stats array, the modifier lists, the value lists, the string,
   int64, guid and float pools, and `Object`'s own field offsets — is located
   by content and validated before use
+- `Ext.Mod`, all five functions. The mod manager has no symbol either, so
+  the list is found from the one thing every install shares: the base
+  module's UUID is the constant `ed539163-…`, which locates a `Module`
+  exactly, and the array holding it is the load order. `ModuleInfo` turns
+  out to be the Windows struct with Larian's sixteen-byte string in place of
+  `std::string` — which is why `sizeof(Module)` upstream does not match the
+  240-byte stride in memory — and every field was confirmed against a module
+  whose values the reference already records
 - **Verified against the real extender.** `reference/` holds output captured
-  from a running Windows install over the debugger, and `Ext.Stats` matches
-  it: the same 15,754 stats in the same order, the same attribute values,
-  the same proxy object with its bound methods, floats to the digit. The
+  from a running Windows install over the debugger, and bg3le matches it:
+  the same 15,754 stats in the same order, the same attribute values, the
+  same proxy object with its bound methods, floats to the digit, and
+  `Ext.Mod.GetMod("ed539163-…")` returning a structure equal key for key and
+  value for value to `reference/mod-shape.txt`. The
   public API is a compatibility contract — a mod written against bg3se has
   to work here — so it follows the reference rather than convenience.
   `tools/grab-reference.sh` reproduces the capture
@@ -86,11 +96,19 @@ component's declared size with the size the engine recorded, and
 
 ## What is left
 
-- **Most of `Ext.*`.** Around 250 functions bg3se exposes have no equivalent
-  here yet — `Ext.Mod`, `Ext.Loca`, `Ext.Vars`, `Ext.Level`, `Ext.Net` and
-  the client-side modules are declared but empty. The ECS plumbing they need
-  is done, and `reference/ext-api-surface.txt` lists every one of them with
-  its shape, so they are no longer guesswork
+- **Most of `Ext.*`.** Around 245 functions bg3se exposes have no equivalent
+  here yet — `Ext.Loca`, `Ext.Vars`, `Ext.Level`, `Ext.Net` and the
+  client-side modules are declared but empty. The ECS plumbing they need is
+  done, and `reference/ext-api-surface.txt` lists every one of them with its
+  shape, so they are no longer guesswork
+- **`ModId` on a stat, and `ModManager.Settings`.** Upstream does not read
+  `ModId` off the stat — there is no such field — it watches which mod's
+  `.txt` was open as each entry was parsed. bg3le is preloaded before the
+  game starts, so it can hook the same thing, but it does not yet, and the
+  two keys are absent rather than filled with a plausible guess. `Settings`
+  sits past a hash map whose size on this build is not established, so
+  `GetModManager` returns `BaseModule`, `LoadOrderedModules` and
+  `AvailableMods` and omits it
 - **Writing stats.** `Ext.Stats.Get` returns upstream's proxy object with its
   four methods, but `Sync`, `SetPersistence`, `SetRawAttribute` and
   `CopyFrom` raise: writing needs the engine's stat sync path, which is not
