@@ -16,7 +16,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # The Steam install is the native build now, so the game and its Data live in
 # one place and the separate tree with a Data symlink is gone.
 GAME="$HOME/.local/share/Steam/steamapps/common/Baldurs Gate 3"
-SNIPER="$HOME/.local/share/Steam/steamapps/common/SteamLinuxRuntime_sniper"
+SNIPER_DIR="$HOME/.local/share/Steam/steamapps/common/SteamLinuxRuntime_sniper"
 
 export MANGOHUD="${MANGOHUD:-1}"
 export BG3LE_DUMP_DB="${BG3LE_DUMP_DB:-1}"  # temporary: structural dump
@@ -63,7 +63,30 @@ if [ ! -f steam_appid.txt ]; then
     echo "run-native: wrote steam_appid.txt (Steam install lacked it)" >&2
 fi
 
-launch=("$SNIPER/run" -- ./bin/bg3 "$@")
+# SNIPER=0 runs the binary straight on the host, no container.
+#
+# It needs almost nothing: of the game's 16 shared libraries only two are
+# missing here, libssl.so.1.1 and libcrypto.so.1.1, because this system has
+# OpenSSL 3. Copies taken from the sniper platform sit in compat-libs and are
+# put on the library path. They live outside the runtime tree on purpose --
+# Steam's paths carry a version and move when the runtime updates.
+#
+# Worth having beyond tidiness: inside the container the libraries are recorded
+# under /run/host, which does not resolve from outside its namespace, and that
+# breaks perf symbolization and DWARF unwinding -- the reason several profiles
+# this session could not name a single frame. GameMode also cannot find
+# libgamemode.so or the session bus in there.
+if [ "${SNIPER:-1}" = "0" ]; then
+    COMPAT="$(cd "$HERE/.." && pwd)/compat-libs"
+    if [ ! -f "$COMPAT/libssl.so.1.1" ]; then
+        echo "run-native: SNIPER=0 needs $COMPAT/libssl.so.1.1" >&2
+        exit 1
+    fi
+    export LD_LIBRARY_PATH="$COMPAT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    launch=(./bin/bg3 "$@")
+else
+    launch=("$SNIPER_DIR/run" -- ./bin/bg3 "$@")
+fi
 
 # GameMode is off unless asked for, because it does not work here and says so
 # loudly. Inside the sniper container libgamemodeauto cannot dlopen
