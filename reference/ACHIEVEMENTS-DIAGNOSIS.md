@@ -299,3 +299,54 @@ Two options, in order of directness:
    e.g. opening the achievements panel if the Steam overlay exposes one, or
    completing a small in-game milestone that would normally pop an
    achievement.
+
+## Confirmed live: the block is real, and `LoadAchievementsDisabled`'s enum value is known
+
+From the debug console, with a loaded save (host character
+`2c8e709e-01da-5c94-c989-475872f32125` fetched via `Osi.GetHostCharacter()`):
+called `Osi.UnlockAchievement("NEW_ACHIEVEMENT_1_0", host)` through the normal
+Osiris dispatcher (same path a story script uses, not a raw pointer call --
+low risk, and it didn't crash). No Steam achievement toast appeared. Not
+conclusive on its own (the achievement name is a guess -- BG3's Steam schema
+only exposes generic `NEW_ACHIEVEMENT_1_N` display-string keys via
+`~/.local/share/Steam/appcache/stats/UserGameStatsSchema_1086940.bin`, not
+necessarily the real API names), but consistent with everything else found
+here: the game does gate achievements while mods are active, same as on
+Windows.
+
+Separately, the save-slot UI badge shown for a modded save (the user noticed
+it directly in the Load-game list -- a strong, correct call: this runs when
+the save list is *populated*, not when a specific save is *loaded*, which is
+exactly why nothing hooked in `LoadSavegame` ever fired) uses the string
+`LoadAchievementsDisabled`, found once in `.rodata` at `0x19584fd`. Traced its
+only code reference to a large (0x3b1b340-0x3b1bde0) generic
+"numeric-id -> localized-string, with an LRU-ish cache" dispatcher --
+this is Noesis UI's string-resolution helper, used for hundreds of different
+UI messages throughout the game, not achievement-specific by itself.
+
+Reconstructed its multi-tier jump-table dispatch by hand and confirmed by
+brute-force byte-scanning each of the 4 candidate tables
+(`0x1bd4298`/`0x1bd4498`/`0x1bd44c8`/`0x1bd4804`) for a slot whose relative
+offset resolves to `0x3b1b5b4` (the `LoadAchievementsDisabled` case):
+
+**Enum value `144` (`0x90`) selects `LoadAchievementsDisabled`** -- match at
+table `0x1bd4298`, index `44` (`144 - 100 = 44`, matching the range check
+`cmp eax,0x63; jle ...; add eax,-100; cmp eax,0x7f; ja error` seen in the
+dispatcher's own range-selection code).
+
+The dispatcher's only 2 direct callers (`0x30f77ef` passing `144+189=` no --
+they pass `0x133`/307 and `0x2c1`/705, neither is 144) are unrelated error
+paths elsewhere in the engine. No `lea`-based function-pointer reference and
+no raw 8-byte pointer to the dispatcher's own address exist anywhere in
+`.rodata`/`.data`/`.data.rel.ro` either, so whatever supplies `144` is not a
+literal in any single x86 instruction we can grep for -- it is very likely a
+**data-driven value** (a lookup table indexed by save-slot state, or a Noesis
+XAML/property-binding enum), which static grepping for an immediate operand
+cannot find. This is the actual reason the search stalled here, not a dead
+end in the reasoning -- the next session should look for where `144` (or a
+small integer in that neighbourhood) sits as *data* rather than as an
+instruction operand, e.g. scanning `.rodata`/`.data.rel.ro` for `0x90`
+adjacent to the other save-slot-state enum values used by this same
+dispatcher (`0x133`, `0x2c1`, and whatever the "corrupted save" / "wrong
+version" cases turn out to be), which would locate the enum table itself
+rather than one instruction referencing one entry of it.
