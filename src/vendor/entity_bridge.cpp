@@ -271,6 +271,30 @@ extern "C" void bg3le_world_probe(void* container, void** world,
     *poolCount = (std::int32_t)w->Replication->ComponentPools.Size();
 }
 
+// A one-frame component, which does not live in the entity page at all.
+//
+// These are the transient event components -- a request or a notification that
+// exists for a single tick. The engine keeps them in a per-storage pool keyed
+// by entity rather than in the page, so reading one through the page path
+// returns whatever happens to be at that offset. That is what the 17 size
+// mismatches SizeAudit reported were: not a wrong struct, a wrong storage
+// mechanism. Same failure shape as the proxy components, silent in the same
+// way.
+extern "C" void* bg3le_entity_one_frame_component(void* container,
+                                                  std::uint64_t handle,
+                                                  std::uint16_t componentIndex) {
+    if (container == nullptr) return nullptr;
+
+    auto* storages = reinterpret_cast<bg3se::ecs::EntityStorageContainer*>(container);
+    const auto entity = bg3se::EntityHandle(handle);
+
+    auto* storage = storages->GetEntityStorage(entity);
+    if (storage == nullptr) return nullptr;
+
+    return storage->GetOneFrameComponent(
+        entity, bg3se::ecs::ComponentTypeIndex(componentIndex));
+}
+
 // The engine's own recorded size for a component.
 //
 // Worth having because the size is not cosmetic: GetComponent returns

@@ -414,6 +414,10 @@ extern "C" void const* bg3le_meta_component(const char* engineName);
 extern "C" std::size_t bg3le_meta_component_size(void const* handle);
 extern "C" std::size_t bg3le_meta_component_stride(void const* handle);
 extern "C" bool bg3le_meta_component_is_proxy(void const* handle);
+extern "C" bool bg3le_meta_component_is_one_frame(void const* handle);
+extern "C" void* bg3le_entity_one_frame_component(void* container,
+                                                  std::uint64_t handle,
+                                                  std::uint16_t componentIndex);
 extern "C" bool bg3le_meta_field(void const* handle, const char* name,
                                  std::uint32_t* offset, std::uint16_t* size,
                                  std::uint8_t* kind, std::uint8_t* elemKind,
@@ -490,7 +494,17 @@ const char* engine_name_of(const char* name) {
 // as a fallback.
 std::optional<std::int32_t> component_index(const char* name) {
     if (auto i = ecs::index_of(ecs::Context::Component, name)) return i;
-    return ecs::index_of(ecs::Context::OneFrameComponent, name);
+
+    // A one-frame component's engine index carries 0x8000, which is what
+    // ecs::IsOneFrame tests for. The two registries are numbered
+    // independently, so without the flag a one-frame index silently collides
+    // with an unrelated inline component -- which is what put 17 of them in
+    // SizeAudit's mismatch list. Those were never size disagreements; they
+    // were comparisons against whichever inline component shared the number.
+    if (auto i = ecs::index_of(ecs::Context::OneFrameComponent, name)) {
+        return *i | 0x8000;
+    }
+    return std::nullopt;
 }
 
 // Generic component access, driven by bg3se's field tables rather than by a
@@ -551,6 +565,15 @@ void* component_pointer(std::uint64_t handle, const char* name,
 
     const auto index = component_index(engineName);
     if (!index.has_value()) return nullptr;
+
+    // A one-frame component is not in the entity page at all: the engine keeps
+    // it in a per-storage pool keyed by entity. Reading one through the page
+    // returns whatever is at that offset, which is what the one-frame entries
+    // in SizeAudit were -- not a wrong struct, a wrong mechanism.
+    if (bg3le_meta_component_is_one_frame(*meta)) {
+        return bg3le_entity_one_frame_component(
+            server_container(), handle, static_cast<std::uint16_t>(*index));
+    }
 
     // The stride, not the struct size. For a proxy component the page holds a
     // pointer and the struct lives wherever it points, so passing the struct

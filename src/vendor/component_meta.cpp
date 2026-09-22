@@ -423,6 +423,16 @@ constexpr bool is_proxy_component() {
     else return false;
 }
 
+// Whether the component lives in a per-storage pool rather than in the entity
+// page. These are the transient event components; the engine keeps them keyed
+// by entity in a pool of their own, so reading one through the page returns
+// whatever is at that offset. bg3se records it on the component itself.
+template <class T>
+constexpr bool is_one_frame_component() {
+    if constexpr (IsComponentType<T>) return T::OneFrame;
+    else return false;
+}
+
 struct ClassFields {
     char const* Name;           // the C++ class name, what INHERIT refers to
     char const* ComponentName;  // bg3se's short name, or null
@@ -438,6 +448,9 @@ struct ClassFields {
     // component inline. For one of these the stride is a pointer and the
     // pointer has to be followed; see bg3le_meta_component_stride.
     bool IsProxy;
+    // Whether the component lives in a per-storage pool instead of the entity
+    // page, in which case the page path does not apply to it at all.
+    bool IsOneFrame;
 };
 
 template <class T>
@@ -657,6 +670,7 @@ inline constexpr ClassFields kClassFields{
     FieldTable<T>::kFields,
     sizeof(T),
     is_proxy_component<T>(),
+    is_one_frame_component<T>(),
 };
 
 // Every class table, collected the way upstream collects its own.
@@ -924,6 +938,11 @@ extern "C" std::size_t bg3le_meta_component_stride(void const* handle) {
 extern "C" bool bg3le_meta_component_is_proxy(void const* handle) {
     if (handle == nullptr) return false;
     return static_cast<ClassFields const*>(handle)->IsProxy;
+}
+
+extern "C" bool bg3le_meta_component_is_one_frame(void const* handle) {
+    if (handle == nullptr) return false;
+    return static_cast<ClassFields const*>(handle)->IsOneFrame;
 }
 
 namespace {

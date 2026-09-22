@@ -14,8 +14,11 @@ Clause); bg3le reuses them rather than rediscovering years of reverse
 engineering, and would not be a realistic project otherwise. **Thank you.**
 
 See [vendor/NOTICE.md](vendor/NOTICE.md) for attribution and every change made
-to the vendored code — all of it to compile under clang rather than MSVC,
-none of it behavioural.
+to the vendored code — all of it to compile under clang rather than MSVC, none
+of it behavioural. Its component definitions have been checked against the
+native build rather than assumed: `Ext._Internal.SizeAudit()` compares every
+component's declared size with the size the engine recorded, and
+`tools/meta-check.c` checks field offsets without needing the game.
 
 ## What works
 
@@ -33,7 +36,9 @@ none of it behavioural.
   names every ECS type index in its symbol table, so the component and
   replication registries come straight out of `.symtab` — the Windows extender
   has to recover the same mapping by scanning the image for byte patterns.
-  Typed for `Health` so far; see [What is left](#what-is-left)
+  Fields come from bg3se's own generated metadata rather than from accessors
+  written per component, so every component it describes is reachable by name;
+  see [What is left](#what-is-left) for the kinds that do not convert yet
 - A Lua debugger server compatible with the
   [bg3lua](https://github.com/lenonk/bg3lua) client (`client/` submodule),
   plus `CreateConsole` parity that opens a terminal on startup
@@ -55,10 +60,6 @@ none of it behavioural.
   `TranslatedString` and raw pointers. Naming an unsupported field raises
   rather than returning nil, so a mod cannot mistake a missing conversion for
   a missing value
-- **One-frame components.** 17 of them report a size the engine disagrees
-  with, because they live in a per-storage pool rather than in the entity
-  page, so reads of those go through the wrong path.
-  `Ext._Internal.SizeAudit()` lists them
 - **The client-side modules.** `Ext.ClientUI` in particular is blocked on the
   placeholder Noesis RTTI — the native game ships no Noesis typeinfo at all,
   so `src/vendor/noesis_rtti_linux.cpp` aliases 19 of them to one real
