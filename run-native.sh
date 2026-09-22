@@ -35,6 +35,16 @@ export BG3LE_DUMP_DB="${BG3LE_DUMP_DB:-1}"  # temporary: structural dump
 export RADV_PERFOPTS="${RADV_PERFOPTS:-async_compile}"
 export vk_x11_strict_image_count="${vk_x11_strict_image_count:-false}"
 
+# Nothing sets SDL_VIDEODRIVER here on purpose: setting it on the command line
+# already reaches the game, since pressure-vessel passes the environment
+# through. The bundled libSDL2.so has both backends compiled in and the sniper
+# runtime carries libwayland-client, so either is reachable --
+# SDL_VIDEODRIVER=wayland for a native surface, x11 to force XWayland.
+#
+# Neither explains the frametime problem. A Proton DX11 run and a Proton Vulkan
+# run share one windowing path and only one of them stutters, so the stutter
+# does not track the window system.
+
 cd "$GAME"
 
 launch=("$SNIPER/run" -- ./bin/bg3 "$@")
