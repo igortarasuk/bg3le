@@ -52,6 +52,11 @@ enum class FieldKind : std::uint8_t {
     // points at it when there is one, so it indexes like a container -- which
     // keeps "empty" distinct from "cannot be read".
     Optional,
+    // One of several types, with the active one known only at runtime.
+    // Alternatives lists a descriptor per alternative and ActiveIndex says
+    // which is live, so indexing it selects an alternative -- and only
+    // resolves for the one actually held, since the bytes are not the others.
+    Variant,
     // Not a field: records that the class also has the fields of the class
     // named in Name. Classes are declared in dependency-free order, so bases
     // are resolved by name at load rather than by pointer.
@@ -97,6 +102,10 @@ struct FieldDesc {
     // to the field. Indexing a container therefore continues with this
     // descriptor, which is how "Resources[0][1].Amount" works.
     FieldDesc const* ElemDesc;
+    // Variant only. Alternatives is null-terminated; ActiveIndex returns the
+    // live one, or the largest size_t when the variant is valueless.
+    FieldDesc const* const* Alternatives;
+    std::size_t (*ActiveIndex)(void const* variant);
 };
 
 }  // namespace bg3le

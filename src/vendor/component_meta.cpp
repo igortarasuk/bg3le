@@ -197,6 +197,32 @@ void* optional_data_thunk(void const* opt) {
     return (void*)&**o;
 }
 
+// std::variant holds one of several types, and which one is known only at
+// runtime -- so unlike every other container here its element cannot be
+// described by a single type. It carries one descriptor per alternative
+// instead, and the resolver picks by the active index.
+//
+// Read through index() and std::visit rather than by reaching into the
+// discriminant, for the same reason optional goes through has_value().
+template <class T>
+struct VariantTraits {
+    static constexpr bool kIsVariant = false;
+};
+
+template <class V>
+std::size_t variant_index_thunk(void const* v) {
+    auto const* var = static_cast<V const*>(v);
+    if (var->valueless_by_exception()) return (std::size_t)-1;
+    return var->index();
+}
+
+template <class V>
+void* variant_data_thunk(void const* v) {
+    auto const* var = static_cast<V const*>(v);
+    if (var->valueless_by_exception()) return nullptr;
+    return std::visit([](auto const& held) { return (void*)&held; }, *var);
+}
+
 // A hash map keeps its keys and its values in two parallel contiguous runs,
 // so slot i holds key i alongside value i -- which is what makes it
 // presentable without hashing anything: iteration is a walk over both runs.
@@ -286,6 +312,8 @@ constexpr FieldKind kind_of() {
         return FieldKind::Map;
     } else if constexpr (OptionalTraits<T>::kIsOptional) {
         return FieldKind::Optional;
+    } else if constexpr (VariantTraits<T>::kIsVariant) {
+        return FieldKind::Variant;
     } else if constexpr (scalar_kind_of<T>() != FieldKind::Unsupported) {
         return scalar_kind_of<T>();
     } else if constexpr (std::is_class_v<T>) {
@@ -313,6 +341,15 @@ constexpr FieldDesc make_field(char const* name, std::size_t offset);
 // continue with the element's own accessors rather than with the field's.
 template <class T>
 inline constexpr FieldDesc kElementDesc = make_field<T>("(element)", 0);
+
+// One descriptor per alternative, null-terminated. Declared here rather than
+// with the other traits because it needs kElementDesc.
+template <class... Ts>
+struct VariantTraits<std::variant<Ts...>> {
+    static constexpr bool kIsVariant = true;
+    static inline constexpr FieldDesc const* kAlternatives[] = {
+        &kElementDesc<Ts>..., nullptr};
+};
 
 // Builds a field descriptor from its type. Having every kind decision here
 // rather than spelled out in each macro means adding a kind is one edit.
@@ -367,6 +404,10 @@ constexpr FieldDesc make_field(char const* name, std::size_t offset) {
         describe_elements.template operator()<E>();
         f.Count = &optional_count_thunk<T>;
         f.Data = &optional_data_thunk<T>;
+    } else if constexpr (VariantTraits<T>::kIsVariant) {
+        f.Alternatives = VariantTraits<T>::kAlternatives;
+        f.ActiveIndex = &variant_index_thunk<T>;
+        f.Data = &variant_data_thunk<T>;
     } else if constexpr (MapTraits<T>::kIsMap) {
         using K = typename MapTraits<T>::Key;
         using V = typename MapTraits<T>::Value;
@@ -849,6 +890,41 @@ Resolved resolve_path(ClassFields const* cls, char const* path, void* base) {
             }
             subscripts = subscripts.substr(close + 1);
 
+            // A variant is the one container whose element type is not fixed,
+            // so it is handled before the size and descriptor checks the
+            // others share.
+            if (current.Kind == FieldKind::Variant) {
+                if (current.Alternatives == nullptr
+                    || current.ActiveIndex == nullptr
+                    || current.Data == nullptr) {
+                    return out;
+                }
+
+                std::size_t alternatives = 0;
+                while (current.Alternatives[alternatives] != nullptr) {
+                    ++alternatives;
+                }
+                if (index >= alternatives) return out;
+
+                if (address != nullptr) {
+                    // Only the alternative actually held resolves: the bytes
+                    // are not any of the others, and reading them as though
+                    // they were is exactly the sort of plausible nonsense
+                    // worth refusing.
+                    if (current.ActiveIndex(address) != index) return out;
+                    void* held = current.Data(address);
+                    if (held == nullptr) return out;
+                    address = held;
+                }
+
+                const bool readOnlyVariant = current.ReadOnly;
+                char const* variantName = current.Name;
+                current = *current.Alternatives[index];
+                current.Name = variantName;
+                current.ReadOnly = current.ReadOnly || readOnlyVariant;
+                continue;
+            }
+
             if (current.ElemSize == 0 || current.ElemDesc == nullptr) return out;
 
             switch (current.Kind) {
@@ -957,6 +1033,22 @@ std::uint8_t reportable_kind(FieldDesc const& field, unsigned depth = 0) {
         return (std::uint8_t)FieldKind::Unsupported;
     }
 
+    if (field.Kind == FieldKind::Variant) {
+        if (field.Alternatives == nullptr) {
+            return (std::uint8_t)FieldKind::Unsupported;
+        }
+        // Usable if any alternative is: a variant of a readable type and an
+        // unreadable one is still worth having, and which it holds is a
+        // runtime question.
+        for (auto const* const* alt = field.Alternatives; *alt != nullptr; ++alt) {
+            if (reportable_kind(**alt, depth + 1)
+                != (std::uint8_t)FieldKind::Unsupported) {
+                return (std::uint8_t)FieldKind::Variant;
+            }
+        }
+        return (std::uint8_t)FieldKind::Unsupported;
+    }
+
     if (field.Kind == FieldKind::ScalarArray || field.Kind == FieldKind::DynArray
         || field.Kind == FieldKind::Map || field.Kind == FieldKind::Optional) {
         // A container is usable if its elements are: a scalar, a struct bg3se
@@ -1060,6 +1152,33 @@ extern "C" int bg3le_meta_array_length(void const* handle, char const* path,
 
     *count = r.Field.Count(r.Address);
     return 0;
+}
+
+// Which alternative a variant currently holds, and how many it has.
+//
+// Needs the component, because the active one is a runtime fact. Returns false
+// if the field is not a variant; sets active to the count when the variant is
+// valueless, which no index can then match.
+extern "C" bool bg3le_meta_variant_index(void const* handle, char const* path,
+                                         void* component, std::size_t* active,
+                                         std::size_t* count) {
+    *active = 0;
+    *count = 0;
+    if (handle == nullptr || path == nullptr || component == nullptr) return false;
+
+    const auto r = resolve_path(static_cast<ClassFields const*>(handle), path,
+                                component);
+    if (!r.Ok || r.Address == nullptr) return false;
+    if (r.Field.Kind != FieldKind::Variant) return false;
+    if (r.Field.Alternatives == nullptr || r.Field.ActiveIndex == nullptr) {
+        return false;
+    }
+
+    while (r.Field.Alternatives[*count] != nullptr) ++*count;
+
+    const std::size_t live = r.Field.ActiveIndex(r.Address);
+    *active = (live == (std::size_t)-1) ? *count : live;
+    return true;
 }
 
 // The key of one slot of a map.
@@ -1463,6 +1582,62 @@ extern "C" int bg3le_meta_selftest() {
         }
     }
 
+    // A variant, in both of its alternatives. The point of the checks is that
+    // only the one actually held resolves: the bytes are not the others, and
+    // reading them as though they were gives a number that looks like a value.
+    {
+        SummonLifetimeComponent lifetime;
+        auto const* lifeMeta = static_cast<ClassFields const*>(
+            bg3le_meta_component("eoc::summon::LifetimeComponent"));
+        std::size_t activeAlt = 0;
+        std::size_t altCount = 0;
+
+        lifetime.Lifetime = (std::uint8_t)7;
+        if (!bg3le_meta_variant_index(lifeMeta, "Lifetime", &lifetime,
+                                      &activeAlt, &altCount)) {
+            fail("Lifetime is not reported as a variant");
+        } else {
+            if (altCount != 2) fail("Lifetime does not have two alternatives");
+            if (activeAlt != 0) fail("the uint8 alternative is not active");
+        }
+
+        if (!bg3le_meta_resolve(lifeMeta, "Lifetime[0]", &lifetime, &address,
+                                &kind, &size, &readOnly)) {
+            fail("the live alternative does not resolve");
+        } else if (*(std::uint8_t*)address != 7) {
+            fail("the live alternative does not read back");
+        }
+
+        // The alternative that is not held has to refuse.
+        if (bg3le_meta_resolve(lifeMeta, "Lifetime[1]", &lifetime, &address,
+                               &kind, &size, &readOnly)) {
+            fail("an alternative that is not held resolved");
+        }
+
+        // Switch it and the answers swap over.
+        lifetime.Lifetime = 2.5f;
+        if (!bg3le_meta_variant_index(lifeMeta, "Lifetime", &lifetime,
+                                      &activeAlt, &altCount)) {
+            fail("Lifetime stopped being a variant");
+        } else if (activeAlt != 1) {
+            fail("the float alternative is not active after assignment");
+        }
+        if (!bg3le_meta_resolve(lifeMeta, "Lifetime[1]", &lifetime, &address,
+                                &kind, &size, &readOnly)) {
+            fail("the float alternative does not resolve");
+        } else if (*(float*)address != 2.5f) {
+            fail("the float alternative does not read back");
+        }
+        if (bg3le_meta_resolve(lifeMeta, "Lifetime[0]", &lifetime, &address,
+                               &kind, &size, &readOnly)) {
+            fail("the uint8 alternative resolved while the float was held");
+        }
+        if (bg3le_meta_resolve(lifeMeta, "Lifetime[2]", &lifetime, &address,
+                               &kind, &size, &readOnly)) {
+            fail("an alternative past the end resolved");
+        }
+    }
+
     // Enum labels, checked against what bg3se prints on Windows for the same
     // save: ReplenishType came back as 2 and 8 here where bg3se showed
     // ["Default"] and ["Rest"]. It is a bitmask, so the labels are flags.
@@ -1608,6 +1783,7 @@ extern "C" char const* bg3le_meta_kind_name(std::uint8_t kind) {
         case FieldKind::DynArray: return "array";
         case FieldKind::Map: return "map";
         case FieldKind::Optional: return "optional";
+        case FieldKind::Variant: return "variant";
         case FieldKind::Inherit: return "inherit";
         default: return "unsupported";
     }

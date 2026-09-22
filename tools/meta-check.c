@@ -301,13 +301,15 @@ int main(int argc, char** argv) {
         printf("\ncoverage: %zu of %zu fields convert across %zu components"
                " (%.1f%%)\n", usable, fields, components,
                fields ? 100.0 * (double)usable / (double)fields : 0.0);
-        static char const* const kindNames[] = {
-            "unsupported", "bool", "float", "double", "int8", "uint8", "int16",
-            "uint16", "int32", "uint32", "int64", "uint64", "guid", "entity",
-            "fixed array", "struct", "array", "map"};
-        for (size_t k = 0; k < sizeof(kindNames) / sizeof(kindNames[0]); k++) {
+        // Named by the library rather than by a list here. A hardcoded list
+        // was wrong the moment a kind was inserted into the middle of the
+        // enum: every label after it shifted, so the breakdown claimed 335
+        // maps where there are 111, and the kinds past the end of the list
+        // vanished from the report entirely. The totals stayed right, which is
+        // what let it survive a glance.
+        for (size_t k = 0; k < 32; k++) {
             if (byKind[k] != 0) {
-                printf("  %-12s %zu\n", kindNames[k], byKind[k]);
+                printf("  %-12s %zu\n", meta_kind_name((uint8_t)k), byKind[k]);
             }
         }
     }

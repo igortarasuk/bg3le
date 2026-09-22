@@ -438,6 +438,10 @@ extern "C" int bg3le_meta_array_length(void const* handle, const char* path,
                                        void* component, std::size_t* count,
                                        std::uint16_t* elemSize,
                                        std::uint8_t* elemKind);
+extern "C" bool bg3le_meta_variant_index(void const* handle,
+                                         const char* path, void* component,
+                                         std::size_t* active,
+                                         std::size_t* count);
 extern "C" bool bg3le_meta_map_key(void const* handle, const char* path,
                                    void* component, std::size_t index,
                                    void** address, std::uint8_t* kind,
@@ -518,7 +522,7 @@ std::optional<std::int32_t> component_index(const char* name) {
 enum class FieldKind : std::uint8_t {
     Unsupported = 0, Bool, Float, Double, Int8, Uint8, Int16, Uint16,
     Int32, Uint32, Int64, Uint64, Guid, Entity, FixedString, ScalarArray,
-    Struct, DynArray, Map, Optional, Inherit,
+    Struct, DynArray, Map, Optional, Variant, Inherit,
 };
 
 extern "C" const char* bg3le_meta_kind_name(std::uint8_t kind);
@@ -1016,6 +1020,38 @@ int l_array_info(lua_State* L) {
     // any more, since read_path asks about the element's own path, so it can
     // simply be accurate.
     lua_pushstring(L, field_kind_name((FieldKind)elemKind));
+    return 2;
+}
+
+// Ext._Internal.VariantIndex(handle, component, path) -> active, count
+//
+// active is zero-based, and equals count when the variant holds nothing.
+// std::variant only reaches that state if a move threw, so it should not
+// happen -- but it is representable, so it is reported rather than conflated
+// with holding alternative zero.
+int l_variant_index(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
+    const char* name = luaL_checkstring(L, 2);
+    const char* path = luaL_checkstring(L, 3);
+
+    void const* meta = nullptr;
+    void* component = component_pointer(handle, name, &meta);
+    if (meta == nullptr || component == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s is not available on this entity", name);
+        return 2;
+    }
+
+    std::size_t active = 0;
+    std::size_t count = 0;
+    if (!bg3le_meta_variant_index(meta, path, component, &active, &count)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s is not a variant", name, path);
+        return 2;
+    }
+
+    lua_pushinteger(L, (lua_Integer)active);
+    lua_pushinteger(L, (lua_Integer)count);
     return 2;
 }
 
@@ -1641,6 +1677,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "ArrayInfo");
     lua_pushcfunction(g_lua, l_map_key);
     lua_setfield(g_lua, -2, "MapKey");
+    lua_pushcfunction(g_lua, l_variant_index);
+    lua_setfield(g_lua, -2, "VariantIndex");
     lua_pushcfunction(g_lua, l_field_address);
     lua_setfield(g_lua, -2, "FieldAddress");
     lua_pushcfunction(g_lua, l_field_bytes);
@@ -1923,6 +1961,18 @@ read_path = function(handle, comp, path)
     end
     if held == 0 then return nil end
     return read_path(handle, comp, path .. "[0]")
+  end
+
+  -- A variant reads as whatever it currently holds. Which alternative that is
+  -- is a runtime fact, so it is asked for rather than derived -- and only the
+  -- live one resolves, since the bytes are not any of the others.
+  if kind == "variant" then
+    local active, count = Ext._Internal.VariantIndex(handle, comp, path)
+    if active == nil then
+      error("bg3le: " .. comp .. "." .. path .. ": " .. tostring(count), 0)
+    end
+    if active >= count then return nil end  -- valueless
+    return read_path(handle, comp, path .. "[" .. active .. "]")
   end
 
   if kind == "struct" then

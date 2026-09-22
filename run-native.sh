@@ -21,8 +21,7 @@ export BG3LE_DUMP_DB="${BG3LE_DUMP_DB:-1}"  # temporary: structural dump
 
 cd "$GAME"
 
-#launch=("$SNIPER/run" -- ./bin/bg3 "$@")
-launch=(./bin/bg3 "$@")
+launch=("$SNIPER/run" -- ./bin/bg3 "$@")
 if [ "${GAMEMODE:-1}" != "0" ] && command -v gamemoderun >/dev/null 2>&1; then
     launch=(gamemoderun "${launch[@]}")
 fi
