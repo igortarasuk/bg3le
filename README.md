@@ -39,6 +39,27 @@ component's declared size with the size the engine recorded, and
   Fields come from bg3se's own generated metadata rather than from accessors
   written per component, so every component it describes is reachable by name;
   see [What is left](#what-is-left) for the kinds that do not convert yet
+- `Ext.StaticData.Get`/`GetAll` against the engine's GUID resource manager.
+  It has no symbol, so it is found by fingerprint: the manager is one
+  `HashMap<StaticDataTypeIndex, GuidResourceBankBase*>`, and a table whose
+  keys are all drawn from the 121 static data type indices the symbol table
+  already names is that manager rather than a coincidence
+- `Ext.Stats`: 15,754 stats, enumerable and readable by name, with every
+  attribute kind decoded — ints, floats, strings, GUIDs, enumerations and
+  flag sets. `RPGStats` has no symbol and its layout is not ours (our
+  `TreasureRarities` sits at 800 where the engine's is at 3648), so nothing
+  is read through a member offset: the anchor is seven consecutive
+  `FixedString` indices spelling the treasure rarities, and everything past
+  it — the stats array, the modifier lists, the value lists, the string,
+  int64, guid and float pools, and `Object`'s own field offsets — is located
+  by content and validated before use
+- **Verified against the real extender.** `reference/` holds output captured
+  from a running Windows install over the debugger, and `Ext.Stats` matches
+  it: the same 15,754 stats in the same order, the same attribute values,
+  the same proxy object with its bound methods, floats to the digit. The
+  public API is a compatibility contract — a mod written against bg3se has
+  to work here — so it follows the reference rather than convenience.
+  `tools/grab-reference.sh` reproduces the capture
 - A Lua debugger server compatible with the
   [bg3lua](https://github.com/lenonk/bg3lua) client (`client/` submodule),
   plus `CreateConsole` parity that opens a terminal on startup
@@ -48,13 +69,41 @@ component's declared size with the size the engine recorded, and
   lock-free thread-local pool. See
   [reference/SLOW-LOAD-DIAGNOSIS.md](reference/SLOW-LOAD-DIAGNOSIS.md).
 
+- **A 30fps endgame save brought to 71fps.** BG3's Vulkan backend streams
+  per-frame data through the `DEVICE_LOCAL | HOST_VISIBLE` heap. On an
+  external GPU that heap is BAR-mapped VRAM across a Thunderbolt hop, where
+  CPU writes run at 0.21 GB/s against 14.68 GB/s to host memory, so the main
+  thread sat in `memcpy` while the GPU starved at 57%. `src/vulkan_memory.cpp`
+  hides `HOST_VISIBLE` from the device-local types so the engine's own
+  selection picks host memory: p99 frametime 184ms to 15.8ms, GPU busy to
+  99%, and less total CPU. It measures the hardware at startup and does
+  nothing on a machine where those writes are fast
+- **The engine's thread pinning undone.** It pins each thread to one logical
+  CPU, which makes that core the frame gate; the same game under Proton runs
+  every thread on `0-15` because Wine ignores the requests, and that build
+  never had the problem. `src/affinity.cpp` widens the masks: startup p99
+  frametime 133ms to 77.8ms, and no pegged core
+
 ## What is left
 
-- **Most of `Ext.*`.** Around 265 functions bg3se exposes have no equivalent
-  here yet. The ECS plumbing they need is done, so most are now a component
-  index plus a vendored struct
-- **The last 5% of the field kinds.** 2,570 of 2,708 component fields convert
-  (94.9%, from `tools/meta-check.c`): scalars, enums and bitmasks, nested
+- **Most of `Ext.*`.** Around 250 functions bg3se exposes have no equivalent
+  here yet — `Ext.Mod`, `Ext.Loca`, `Ext.Vars`, `Ext.Level`, `Ext.Net` and
+  the client-side modules are declared but empty. The ECS plumbing they need
+  is done, and `reference/ext-api-surface.txt` lists every one of them with
+  its shape, so they are no longer guesswork
+- **Writing stats.** `Ext.Stats.Get` returns upstream's proxy object with its
+  four methods, but `Sync`, `SetPersistence`, `SetRawAttribute` and
+  `CopyFrom` raise: writing needs the engine's stat sync path, which is not
+  reached yet. They raise rather than no-op so a mod author sees what is
+  missing instead of a change that silently does nothing
+- **Functors, conditions and requirements inside stats.** Their shapes are
+  recorded in `reference/stats-spell.txt` — nested objects carrying a
+  `TypeId` — and bg3se exposes them through the same property maps this
+  already re-expands for components, so the field machinery should reach
+  them once `Object::Functors` is located
+- **The last 6% of the field kinds.** 3,344 of 3,558 fields convert
+  (94.0%, from `tools/meta-check.c`; the count grew when static data
+  resources joined the table and they carry `TranslatedString`): scalars, enums and bitmasks, nested
   structs, fixed and dynamic arrays, hash sets, hash maps, glm vectors,
   `std::optional`, `std::variant` and `FixedString`. What is left is mostly
   `TranslatedString` and raw pointers. Naming an unsupported field raises
@@ -113,8 +162,18 @@ and non-Steam installs, and ideally without the player editing launch options
 by hand. Until that exists, running it means knowing how to preload a library
 into a process inside the Steam runtime container.
 
+`run-native.sh` is the development harness rather than that story. It runs the
+game inside the Steam runtime container by default, and `SNIPER=0` runs it
+straight on the host — the native binary needs only `libssl.so.1.1` and
+`libcrypto.so.1.1`, which `compat-libs/` supplies. Running outside the
+container matters for debugging: inside it, libraries are recorded under
+`/run/host`, which does not resolve from outside the namespace, and `perf`
+can symbolize nothing.
+
 Offsets are pinned to game version `4.8.400.7143220`. `tools/find_slots.py` and
-`tools/recover_symbols.py` regenerate them for a new build.
+`tools/recover_symbols.py` regenerate them for a new build. The reference
+capture in `reference/` was taken against game `v4.73.98.727`, recorded in
+`reference/version.txt` so a later mismatch is attributable.
 
 ## How it hooks
 
