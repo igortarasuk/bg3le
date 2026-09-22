@@ -28,6 +28,9 @@ enum class FieldKind : std::uint8_t {
     Uint64,
     Guid,
     Entity,
+    // A 32-bit index into the engine's global string table, readable only once
+    // that table has been found -- see src/vendor/fixed_string.cpp.
+    FixedString,
     // A fixed-extent array of one of the scalar kinds above, which is how the
     // engine stores the per-ability and per-skill tables. ElemKind and
     // ElemCount describe the elements.

@@ -440,6 +440,10 @@ extern "C" bool bg3le_meta_map_key(void const* handle, const char* path,
                                    std::uint16_t* size);
 extern "C" bool bg3le_meta_format_guid(void const* bytes, char* out,
                                        std::size_t capacity);
+// From src/vendor/fixed_string.cpp.
+extern "C" const char* bg3le_fixed_string(std::uint32_t index,
+                                          std::uint32_t* length);
+extern "C" void* bg3le_string_table();
 extern "C" bool bg3le_meta_enum_label(void const* handle, const char* path,
                                       std::size_t index, const char** label,
                                       std::uint64_t* value, bool* isBitmask);
@@ -499,31 +503,16 @@ std::optional<std::int32_t> component_index(const char* name) {
 // Mirrors bg3le::FieldKind in src/component_meta_abi.h.
 enum class FieldKind : std::uint8_t {
     Unsupported = 0, Bool, Float, Double, Int8, Uint8, Int16, Uint16,
-    Int32, Uint32, Int64, Uint64, Guid, Entity, ScalarArray, Struct,
-    DynArray, Map, Inherit,
+    Int32, Uint32, Int64, Uint64, Guid, Entity, FixedString, ScalarArray,
+    Struct, DynArray, Map, Inherit,
 };
 
+extern "C" const char* bg3le_meta_kind_name(std::uint8_t kind);
+
+// Named in one place, in src/vendor/component_meta.cpp, because these were
+// duplicated and inserting a kind mid-enum renumbered everything after it.
 const char* field_kind_name(FieldKind kind) {
-    switch (kind) {
-        case FieldKind::Bool: return "boolean";
-        case FieldKind::Float: return "float";
-        case FieldKind::Double: return "double";
-        case FieldKind::Int8: return "int8";
-        case FieldKind::Uint8: return "uint8";
-        case FieldKind::Int16: return "int16";
-        case FieldKind::Uint16: return "uint16";
-        case FieldKind::Int32: return "int32";
-        case FieldKind::Uint32: return "uint32";
-        case FieldKind::Int64: return "int64";
-        case FieldKind::Uint64: return "uint64";
-        case FieldKind::Guid: return "guid";
-        case FieldKind::Entity: return "entity";
-        case FieldKind::ScalarArray: return "array";
-        case FieldKind::Struct: return "struct";
-        case FieldKind::DynArray: return "array";
-        case FieldKind::Map: return "map";
-        default: return "unsupported";
-    }
+    return bg3le_meta_kind_name((std::uint8_t)kind);
 }
 
 // The stride of a scalar kind, used to walk a fixed-extent array. Zero for
@@ -539,6 +528,8 @@ std::size_t field_kind_size(FieldKind kind) {
         case FieldKind::Double: case FieldKind::Int64: case FieldKind::Uint64:
         case FieldKind::Entity:
             return 8;
+        case FieldKind::FixedString:
+            return 4;
         case FieldKind::Guid:
             return 16;
         default:
@@ -650,6 +641,34 @@ bool push_field(lua_State* L, const void* address, FieldKind kind,
             double d = 0;
             if (!safe_read(address, &d, 8)) return false;
             lua_pushnumber(L, d);
+            return true;
+        }
+        case FieldKind::FixedString: {
+            // The index is meaningless on its own, so an unresolved one is
+            // reported rather than pushed as a number: a bare integer would
+            // read as a value and it is not one.
+            std::uint32_t index = 0;
+            if (!safe_read(address, &index, 4)) return false;
+            if (index == 0xffffffffu) {
+                lua_pushnil(L);
+                return true;
+            }
+            std::uint32_t length = 0;
+            const char* text = bg3le_fixed_string(index, &length);
+            if (text == nullptr) {
+                lua_pushfstring(L,
+                    bg3le_string_table() == nullptr
+                        ? "<string table not found>"
+                        : "<unresolved string %d>", (int)index);
+                return true;
+            }
+            char buf[513];
+            if (length > sizeof(buf) - 1) length = sizeof(buf) - 1;
+            if (!safe_read(text, buf, length)) {
+                lua_pushstring(L, "<unreadable string>");
+                return true;
+            }
+            lua_pushlstring(L, buf, length);
             return true;
         }
         case FieldKind::Guid: {

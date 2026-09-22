@@ -29,6 +29,7 @@ static int (*meta_selftest)(void);
 static int (*install_game_allocator)(void*, void*);
 static void const* (*meta_class_at)(size_t);
 static char const* (*meta_engine_class)(void const*);
+static char const* (*meta_kind_name)(uint8_t);
 
 static int failures = 0;
 
@@ -86,7 +87,7 @@ static void expect_absent(char const* component, char const* field) {
 // bg3se cannot traverse is reported as unsupported rather than as a struct,
 // since a caller acts on that answer.
 static void expect_kind(char const* component, char const* field,
-                        uint8_t wantKind) {
+                        char const* wantKind) {
     void const* meta = meta_component(component);
     uint32_t offset = 0;
     uint16_t size = 0, elemCount = 0;
@@ -98,13 +99,13 @@ static void expect_kind(char const* component, char const* field,
         failures++;
         return;
     }
-    if (kind != wantKind) {
-        printf("  FAIL %s.%s: kind %u, expected %u\n", component, field, kind,
-               wantKind);
+    if (strcmp(meta_kind_name(kind), wantKind) != 0) {
+        printf("  FAIL %s.%s: kind %s, expected %s\n", component, field,
+               meta_kind_name(kind), wantKind);
         failures++;
         return;
     }
-    printf("  ok   %s.%s is kind %u\n", component, field, kind);
+    printf("  ok   %s.%s is %s\n", component, field, wantKind);
 }
 
 // Checks that a dotted path accumulates offsets: the offset of "outer.inner"
@@ -197,6 +198,7 @@ int main(int argc, char** argv) {
     BIND(install_game_allocator, "bg3le_install_game_allocator")
     BIND(meta_class_at, "bg3le_meta_class_at")
     BIND(meta_engine_class, "bg3le_meta_engine_class")
+    BIND(meta_kind_name, "bg3le_meta_kind_name")
 #undef BIND
 
     // The self-test builds a real dynamic array, which allocates through
@@ -257,17 +259,17 @@ int main(int argc, char** argv) {
     // of the map itself must fail rather than reading the container's own
     // bytes as a struct.
     expect_absent("eoc::ActionResourcesComponent", "Resources.Amount");
-    expect_kind("eoc::ActionResourcesComponent", "Resources", 17);  // Map
+    expect_kind("eoc::ActionResourcesComponent", "Resources", "map");
 
     // glm vectors carry everything positional, and they are the reason
     // Bound.Translate read as unsupported until they were recognised. A vec3
     // is three floats; kind 14 is a fixed-extent array.
-    expect_kind("eoc::BoundComponent", "Bound.Translate", 14);
-    expect_kind("eoc::BoundComponent", "Bound.RotationQuat", 14);
-    expect_kind("eoc::BoundComponent", "Bound.Scale", 2);  // plain float
+    expect_kind("eoc::BoundComponent", "Bound.Translate", "array");
+    expect_kind("eoc::BoundComponent", "Bound.RotationQuat", "array");
+    expect_kind("eoc::BoundComponent", "Bound.Scale", "float");
 
     // Hash sets read as arrays of their keys.
-    expect_kind("eoc::summon::ContainerComponent", "Characters", 16);  // DynArray
+    expect_kind("eoc::summon::ContainerComponent", "Characters", "array");
 
     void const* health = meta_component("eoc::HealthComponent");
     printf("  eoc::HealthComponent is %zu bytes\n", meta_component_size(health));

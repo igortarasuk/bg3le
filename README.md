@@ -48,16 +48,17 @@ none of it behavioural.
 - **Most of `Ext.*`.** Around 265 functions bg3se exposes have no equivalent
   here yet. The ECS plumbing they need is done, so most are now a component
   index plus a vendored struct
-- **The last fifth of the field kinds.** 2,189 of 2,708 component fields
-  convert (80.8%, from `tools/meta-check.c`): scalars, enums, nested structs,
-  fixed and dynamic arrays, hash sets and hash maps. What is left is mostly
-  `FixedString`, which is a 32-bit index into the engine's global string
-  table — and that table has no symbol and no entry point, since
-  `ls::FixedString`'s methods are all inlined in the native build. Until it is
-  found, a `FixedString` field is unreadable and a map keyed by one has
-  reachable values but unreadable keys. Naming an unsupported field raises
+- **The last 8% of the field kinds.** 2,491 of 2,708 component fields convert
+  (92.0%, from `tools/meta-check.c`): scalars, enums and bitmasks, nested
+  structs, fixed and dynamic arrays, hash sets, hash maps, glm vectors and
+  `FixedString`. What is left is `std::variant`, `std::optional`,
+  `TranslatedString` and raw pointers. Naming an unsupported field raises
   rather than returning nil, so a mod cannot mistake a missing conversion for
   a missing value
+- **One-frame components.** 17 of them report a size the engine disagrees
+  with, because they live in a per-storage pool rather than in the entity
+  page, so reads of those go through the wrong path.
+  `Ext._Internal.SizeAudit()` lists them
 - **The client-side modules.** `Ext.ClientUI` in particular is blocked on the
   placeholder Noesis RTTI — the native game ships no Noesis typeinfo at all,
   so `src/vendor/noesis_rtti_linux.cpp` aliases 19 of them to one real

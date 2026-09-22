@@ -217,6 +217,9 @@ constexpr FieldKind scalar_kind_of() {
     else if constexpr (std::is_same_v<T, std::uint64_t>) return FieldKind::Uint64;
     else if constexpr (std::is_same_v<T, Guid>) return FieldKind::Guid;
     else if constexpr (std::is_same_v<T, EntityHandle>) return FieldKind::Entity;
+    // A FixedString is a four-byte index, so it behaves as a scalar here even
+    // though resolving it needs the engine's string table.
+    else if constexpr (std::is_same_v<T, FixedString>) return FieldKind::FixedString;
     else return FieldKind::Unsupported;
 }
 
@@ -1464,6 +1467,38 @@ extern "C" bool bg3le_meta_enum_label(void const* handle, char const* path,
     *label = labels[index].Name;
     *value = labels[index].Value;
     return true;
+}
+
+// The name of a field kind.
+//
+// The single source of truth for these, because they were duplicated in
+// lua_host.cpp and inserting a kind into the middle of the enum silently
+// renumbered everything after it -- which broke the checks that asserted on
+// numbers, and would have mislabelled every kind after the insertion had the
+// two lists ever disagreed.
+extern "C" char const* bg3le_meta_kind_name(std::uint8_t kind) {
+    switch ((FieldKind)kind) {
+        case FieldKind::Bool: return "boolean";
+        case FieldKind::Float: return "float";
+        case FieldKind::Double: return "double";
+        case FieldKind::Int8: return "int8";
+        case FieldKind::Uint8: return "uint8";
+        case FieldKind::Int16: return "int16";
+        case FieldKind::Uint16: return "uint16";
+        case FieldKind::Int32: return "int32";
+        case FieldKind::Uint32: return "uint32";
+        case FieldKind::Int64: return "int64";
+        case FieldKind::Uint64: return "uint64";
+        case FieldKind::Guid: return "guid";
+        case FieldKind::Entity: return "entity";
+        case FieldKind::FixedString: return "string";
+        case FieldKind::ScalarArray: return "array";
+        case FieldKind::Struct: return "struct";
+        case FieldKind::DynArray: return "array";
+        case FieldKind::Map: return "map";
+        case FieldKind::Inherit: return "inherit";
+        default: return "unsupported";
+    }
 }
 
 // How many enums carry labels, for the startup log.
