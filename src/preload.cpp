@@ -16,6 +16,8 @@
 #include <atomic>
 #include <sched.h>
 #include <spawn.h>
+#include <strings.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <chrono>
 #include <thread>
@@ -940,6 +942,80 @@ extern "C" long _ZN7COsiris12PrepareMergeEPKw(void* self, const wchar_t* a) {
     long rc = real != nullptr ? real(self, a) : 0;
     logf("COsiris::PrepareMerge took %.2fs", now_s() - t0);
     return rc;
+}
+
+// ---- Steam achievement diagnostics ----
+//
+// bg3's own PLT has zero relocations against
+// SteamAPI_ISteamUserStats_SetAchievement/StoreStats (confirmed via
+// `readelf -r`) -- it is a normal C++ Steamworks SDK consumer, not a flat-API
+// one. It gets its ISteamUserStats* through
+// SteamInternal_FindOrCreateUserInterface(hSteamUser, "STEAMUSERSTATS_..."]
+// (this symbol *is* PLT-imported, many call sites) and then calls straight
+// through the interface's vtable. libsteam_api.so's own
+// SteamAPI_ISteamUserStats_SetAchievement is just `jmp [rax+0x38]` on that
+// same object (confirmed by disassembly), i.e. slot index 7 -- so that is the
+// slot to patch, not a symbol to interpose.
+
+namespace {
+
+using SetAchievementFn = bool (*)(void*, const char*);
+std::atomic<SetAchievementFn> g_real_set_achievement{nullptr};
+std::atomic<bool> g_user_stats_vtable_patched{false};
+
+bool hooked_set_achievement(void* self, const char* name) {
+    logf("ISteamUserStats::SetAchievement(%p, \"%s\")", self,
+         name != nullptr ? name : "(null)");
+    dump_all_thread_stacks("SetAchievement call");
+    auto real = g_real_set_achievement.load();
+    bool rc = real != nullptr ? real(self, name) : false;
+    logf("ISteamUserStats::SetAchievement -> %s", rc ? "true" : "false");
+    return rc;
+}
+
+// vtable is a shared, effectively-static table (one C++ class, one set of
+// thunks) -- patch it once, the first time an ISteamUserStats interface
+// pointer is seen, rather than on every FindOrCreateUserInterface call.
+void maybe_hook_user_stats_vtable(void* iface) {
+    if (iface == nullptr) return;
+    bool expected = false;
+    if (!g_user_stats_vtable_patched.compare_exchange_strong(expected, true)) return;
+
+    void** vtable = *reinterpret_cast<void***>(iface);
+    void** slot = vtable + 7;  // +0x38 -- SetAchievement, per the flat-API thunk
+
+    const long page = ::sysconf(_SC_PAGESIZE);
+    const auto addr = reinterpret_cast<std::uintptr_t>(slot);
+    auto* page_start = reinterpret_cast<void*>(addr & ~(std::uintptr_t)(page - 1));
+    const std::size_t span = (addr + sizeof(void*)) - (std::uintptr_t)page_start;
+    if (::mprotect(page_start, span, PROT_READ | PROT_WRITE) != 0) {
+        logf("steam hook: mprotect failed for ISteamUserStats vtable %p", vtable);
+        g_user_stats_vtable_patched.store(false);
+        return;
+    }
+    g_real_set_achievement.store(reinterpret_cast<SetAchievementFn>(*slot));
+    *slot = reinterpret_cast<void*>(&hooked_set_achievement);
+    ::mprotect(page_start, span, PROT_READ);
+
+    logf("steam hook: ISteamUserStats vtable %p, SetAchievement slot -> %p (was %p)",
+         vtable, (void*)&hooked_set_achievement, (void*)g_real_set_achievement.load());
+}
+
+}  // namespace
+
+extern "C" void* SteamInternal_FindOrCreateUserInterface(int32_t hSteamUser,
+                                                          const char* version) {
+    static auto real = next<void* (*)(int32_t, const char*)>(
+        "SteamInternal_FindOrCreateUserInterface");
+    void* iface = real != nullptr ? real(hSteamUser, version) : nullptr;
+    logf("SteamInternal_FindOrCreateUserInterface(\"%s\") -> %p",
+         version != nullptr ? version : "(null)", iface);
+    // Case-insensitive: the real constant is all-caps
+    // ("STEAMUSERSTATS_INTERFACE_VERSIONxxx"), unlike this match string.
+    if (version != nullptr && ::strcasestr(version, "UserStats") != nullptr) {
+        maybe_hook_user_stats_vtable(iface);
+    }
+    return iface;
 }
 
 // ---- entry point ----
