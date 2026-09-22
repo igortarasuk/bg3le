@@ -205,7 +205,7 @@ bool build() {
 bool ready() {
     if (state().Built) return true;
     static int attempts = 0;
-    if (attempts >= 8) return false;
+    if (attempts >= 40) return false;
     ++attempts;
     return build();
 }

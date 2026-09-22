@@ -1082,6 +1082,9 @@ extern "C" char const* bg3le_stats_attr_label(void const* object,
                                               std::size_t index, int raw);
 extern "C" char const* bg3le_stats_attr_string(int raw);
 extern "C" char const* bg3le_stats_attr_translated(int raw);
+extern "C" char const* bg3le_loca_get(char const* handle);
+extern "C" std::size_t bg3le_loca_count();
+extern "C" char const* bg3le_loca_handle_at(std::size_t index);
 extern "C" char const* bg3le_stats_attr_condition(int raw);
 extern "C" char const* bg3le_stats_ai_flags(void const* object);
 extern "C" char const* bg3le_stats_enum_label(char const* enumeration,
@@ -1724,6 +1727,27 @@ int l_stats_list_attrs(lua_State* L) {
         lua_setfield(L, -2, "Name");
         lua_pushstring(L, type != nullptr ? type : "");
         lua_setfield(L, -2, "Type");
+        lua_rawseti(L, -2, (int)i + 1);
+    }
+    return 1;
+}
+
+// Ext._Internal.Loca(handle) -> text
+int l_loca_get(lua_State* L) {
+    char const* text = bg3le_loca_get(luaL_checkstring(L, 1));
+    if (text == nullptr) return 0;
+    lua_pushstring(L, text);
+    return 1;
+}
+
+// Ext._Internal.LocaKeys() -> every handle the repository holds
+int l_loca_keys(lua_State* L) {
+    const std::size_t count = bg3le_loca_count();
+    lua_createtable(L, (int)count, 0);
+    for (std::size_t i = 0; i < count; ++i) {
+        char const* handle = bg3le_loca_handle_at(i);
+        if (handle == nullptr) break;
+        lua_pushstring(L, handle);
         lua_rawseti(L, -2, (int)i + 1);
     }
     return 1;
@@ -2819,6 +2843,10 @@ void lua_init() {
     lua_setfield(g_lua, -2, "StatsEnumIndex");
     lua_pushcfunction(g_lua, l_stats_list_attrs);
     lua_setfield(g_lua, -2, "StatsListAttrs");
+    lua_pushcfunction(g_lua, l_loca_get);
+    lua_setfield(g_lua, -2, "Loca");
+    lua_pushcfunction(g_lua, l_loca_keys);
+    lua_setfield(g_lua, -2, "LocaKeys");
     lua_pushcfunction(g_lua, l_all_entities);
     lua_setfield(g_lua, -2, "AllEntities");
     lua_pushcfunction(g_lua, l_component_type_names);
@@ -5351,13 +5379,40 @@ for _, name in ipairs({"Get", "GetAll"}) do
 end
 
 -- ---- Ext.Loca ----
-for _, name in ipairs({"GetTranslatedString", "GetTranslatedStringKey",
-                       "UpdateTranslatedString", "UpdateTranslatedStringKey",
-                       "GetAllTranslatedStringKeys"}) do
+--
+-- Over the translated string repository, found by content: see
+-- src/vendor/loca.cpp. The index is bg3le's own copy of the engine's
+-- pools, so a lookup cannot be caught mid-rehash.
+
+-- Upstream returns the fallback when a handle is unknown, and an empty
+-- string when there is no fallback either.
+function Ext.Loca.GetTranslatedString(handle, fallback)
+  if type(handle) ~= "string" then return fallback or "" end
+  if #Ext._Internal.LocaKeys() == 0 then
+    error("bg3le: Ext.Loca.GetTranslatedString needs the translated string "
+          .. "repository, which the content search has not identified "
+          .. "reliably yet; see src/vendor/loca.cpp", 2)
+  end
+  local text = Ext._Internal.Loca(handle)
+  if text ~= nil then return text end
+  return fallback or ""
+end
+
+function Ext.Loca.GetAllTranslatedStringKeys()
+  return Ext._Internal.LocaKeys()
+end
+
+-- The key-to-handle direction is a separate table the engine keeps
+-- (TextToStringKey), which bg3le has not located; the handle-to-text pools
+-- are what the content search finds.
+Ext.Loca.GetTranslatedStringKey = needs(
+  "Ext.Loca.GetTranslatedStringKey needs the repository's key table, "
+  .. "which is separate from the text pools bg3le found")
+
+for _, name in ipairs({"UpdateTranslatedString", "UpdateTranslatedStringKey"}) do
   Ext.Loca[name] = needs(
-    "Ext.Loca." .. name .. " needs ls::TranslatedStringRepository, which "
-    .. "bg3le has not located; Ext.Stats reports loca handles but cannot "
-    .. "resolve them to text")
+    "Ext.Loca." .. name .. " writes to the translated string repository, "
+    .. "which bg3le reads but does not modify")
 end
 
 -- ---- Ext.Template ----
