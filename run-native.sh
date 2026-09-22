@@ -19,6 +19,22 @@ SNIPER="$HOME/.local/share/Steam/steamapps/common/SteamLinuxRuntime_sniper"
 export MANGOHUD="${MANGOHUD:-1}"
 export BG3LE_DUMP_DB="${BG3LE_DUMP_DB:-1}"  # temporary: structural dump
 
+# Driver tuning, exported so it reaches the game inside the container.
+#
+# vk_x11_strict_image_count is a Mesa driconf option, and Mesa reads driconf
+# options from an environment variable of the same name -- confirmed present in
+# this machine's libvulkan_radeon.so.
+#
+# RADV_PERFOPTS is not a variable that driver reads. It reads RADV_DEBUG and
+# RADV_PERFTEST, and "async_compile" appears nowhere in it; the RADV_PERFTEST
+# options this build (Mesa 26.2.3) does carry include cswave32, gewave32,
+# pswave32, nosam, nircache, transfer_queue, dccmsaa, localbos and
+# video_decode. An unrecognised variable is simply ignored, so the line is a
+# no-op rather than harmful -- kept as asked, and recorded here so it is not
+# later mistaken for something that is doing work.
+export RADV_PERFOPTS="${RADV_PERFOPTS:-async_compile}"
+export vk_x11_strict_image_count="${vk_x11_strict_image_count:-false}"
+
 cd "$GAME"
 
 launch=("$SNIPER/run" -- ./bin/bg3 "$@")
