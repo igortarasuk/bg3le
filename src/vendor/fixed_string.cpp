@@ -190,8 +190,63 @@ bool looks_like_table(void const* candidate, std::size_t available) {
 void* g_table = nullptr;
 bool g_searched = false;
 
-// Scans the writable anonymous mappings. The table is a heap allocation, so
-// file-backed regions are skipped, which is most of the address space.
+}  // namespace
+
+// Whether a /proc/self/maps line describes a region worth scanning, and its
+// bounds.
+//
+// Exported so it can be checked against real map lines without a game. The
+// first version of this skipped two fields before looking for the pathname,
+// but the format is
+//
+//   address perms offset dev inode pathname
+//
+// so it landed on the inode, saw a digit, concluded every region was
+// file-backed, and scanned nothing at all -- reporting "not found" for a table
+// it had never looked for. The logging caught that; a test would have caught
+// it sooner.
+//
+// Anonymous writable mappings only, which is not a guess about where the table
+// lives: bg3se reaches it through a GlobalStringTable**, so the variable holds
+// a pointer and the table itself is a heap allocation. Two other reasons agree.
+// The scan reads directly rather than through safe_read, because safe_read is
+// a process_vm_readv syscall and this makes hundreds of millions of probes --
+// and a direct read of a file-backed page can raise SIGBUS if the file has
+// been truncated, where an anonymous page cannot. So the fast path is also the
+// safe one.
+extern "C" bool bg3le_scannable_region(char const* line,
+                                       unsigned long long* from,
+                                       unsigned long long* to) {
+    char perms[8] = {0};
+    int consumed = 0;
+    if (std::sscanf(line, "%llx-%llx %7s %*s %*s %*s %n", from, to, perms,
+                    &consumed) < 3) {
+        return false;
+    }
+    if (perms[0] != 'r' || perms[1] != 'w') return false;
+    if (*to <= *from) return false;
+
+    char const* path = line + consumed;
+    while (*path == ' ') ++path;
+
+    // No pathname at all, or one of the kernel's bracketed names. [heap] and
+    // [stack] are anonymous and fine to read; the two below are not ordinary
+    // memory.
+    if (*path == '\0' || *path == '\n') return true;
+    if (*path != '[') return false;
+    if (std::strncmp(path, "[vvar", 5) == 0) return false;
+    if (std::strncmp(path, "[vsyscall", 9) == 0) return false;
+    return true;
+}
+
+namespace {
+
+bool scannable_region(char const* line, unsigned long long* from,
+                      unsigned long long* to) {
+    return bg3le_scannable_region(line, from, to);
+}
+
+// Scans every writable region, in address order.
 void* search_for_table() {
     // Logged rather than left as a claim in the comment above: this is the
     // divergence that makes sizeof(SubTable) unusable as the stride.
@@ -210,19 +265,7 @@ void* search_for_table() {
     while (std::fgets(line, sizeof(line), maps) != nullptr) {
         unsigned long long from = 0;
         unsigned long long to = 0;
-        char perms[8] = {0};
-        int consumed = 0;
-        if (std::sscanf(line, "%llx-%llx %7s %*s %*s %n", &from, &to, perms,
-                        &consumed) < 3) {
-            continue;
-        }
-        if (perms[0] != 'r' || perms[1] != 'w') continue;
-
-        // Anonymous only: a path after the fields means file-backed.
-        const char* rest = line + consumed;
-        while (*rest == ' ') ++rest;
-        const bool anonymous = (*rest == '\n' || *rest == '\0' || *rest == '[');
-        if (!anonymous) continue;
+        if (!scannable_region(line, &from, &to)) continue;
 
         ++regions;
         const std::size_t size = (std::size_t)(to - from);
@@ -238,15 +281,14 @@ void* search_for_table() {
 
             std::fclose(maps);
             logf("string table: found at %p (scanned %zu bytes over %zu "
-                 "anonymous regions)", candidate, scanned, regions);
+                 "regions)", candidate, scanned, regions);
             return (void*)candidate;
         }
     }
 
     std::fclose(maps);
-    logf("string table: not found (scanned %zu bytes over %zu anonymous "
-         "regions); FixedString fields stay unreadable",
-         scanned, regions);
+    logf("string table: not found (scanned %zu bytes over %zu regions); "
+         "FixedString fields stay unreadable", scanned, regions);
     return nullptr;
 }
 
