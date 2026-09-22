@@ -1,0 +1,9 @@
+entities with Health: 524
+{
+    "Hp": 24,
+    "IsInvulnerable": false,
+    "MaxHp": 24,
+    "MaxTemporaryHp": 0,
+    "TemporaryHp": 0,
+    "field_10": "00000000-0000-0000-0000-000000000000"
+}

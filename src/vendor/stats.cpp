@@ -962,6 +962,38 @@ int property_type(void const* enumeration) {
 
 }  // namespace
 
+// The stat this one inherits from, or null.
+//
+// Using sits immediately before ModifierListIndex in the header, and that
+// offset was derived, so this one comes for free: the value is an index into
+// the same stats array, or -1.
+extern "C" char const* bg3le_stats_using(void const* object) {
+    Found const& f = state();
+    if (!f.Attributes || object == nullptr || f.ListIndexOffset < 4) {
+        return nullptr;
+    }
+    std::int32_t index = 0;
+    if (!read_as((char const*)object + f.ListIndexOffset - 4, &index)) {
+        return nullptr;
+    }
+    if (index < 0 || (std::size_t)index >= f.Objects.Size) return nullptr;
+    void const* parent = nullptr;
+    if (!read_as((char const*)f.Objects.Buffer
+                     + (std::size_t)index * sizeof(void*), &parent)) {
+        return nullptr;
+    }
+    return bg3le_stats_name(parent);
+}
+
+// The index of the modifier list this stat uses, or -1.
+extern "C" int bg3le_stats_list_index(void const* object) {
+    Found const& f = state();
+    if (!f.Attributes || object == nullptr) return -1;
+    std::uint32_t index = 0;
+    if (!read_as((char const*)object + f.ListIndexOffset, &index)) return -1;
+    return (int)index;
+}
+
 extern "C" char const* bg3le_stats_type(void const* object) {
     void const* list = list_for(object);
     if (list == nullptr) return nullptr;

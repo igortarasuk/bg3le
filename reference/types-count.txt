@@ -1,0 +1,26 @@
+types: 4313
+eoc::combat::EndTurnRequest
+aspk::BillboardComponent
+TriggerPhysicsType
+StatsStatusGroup
+SightRangeAdditiveBoostComponent
+resource::CustomDiceTemplate
+aspk::TLInterpolationKeyComponent<aspk::keys::AtmosphereAndLightingChannelKey>
+esv::StatusInteraction
+Array<LegacyMap<EntityHandle, bool>>
+Array<resource::MaterialResource::Vector4Parameter>
+AiSurfaceMetaData
+esv::hit::HitSystem
+Variant<aspk::keys::SoundEventKey::Type0,aspk::keys::SoundEventKey::Type1,aspk::keys::SoundEventKey::Type2,aspk::keys::SoundEventKey::Type3,aspk::keys::SoundEventKey::Type4,aspk::keys::SoundEventKey::Type5>
+LegacyMap<Guid, Array<FixedString>>
+GuiStyleVar
+Variant<interrupt::SpellCastEvent,interrupt::CastHitEvent,interrupt::SpellRollEvent,interrupt::ConditionalRollEvent,interrupt::EnterAttackRangeEvent,interrupt::LeaveAttackRangeEvent,interrupt::SpellPreDamageEvent,interrupt::PlaceholderSpellRollEvent,interrupt::ConditionResultEvent,interrupt::StatusAppliedEvent,interrupt::DeathEvent,interrupt::DebugEvent>
+esv::trigger::CachedLeaveEventsComponent
+Variant<spell::Modification::ModifyAreaRadius,spell::Modification::ModifyMaximumTargets,spell::Modification::ModifyNumberOfTargets,spell::Modification::ModifySavingThrowDisadvantage,spell::Modification::ModifySpellFlags,spell::Modification::ModifySpellRoll,spell::Modification::ModifyStatusDuration,spell::Modification::ModifySummonDuration,spell::Modification::ModifySurfaceDuration,spell::Modification::ModifyTargetRadius,spell::Modification::ModifyUseCosts,spell::Modification::ModifyVisuals,spell::Modification::ModifyIconGlow,spell::Modification::ModifyTooltipDescription>
+Variant<esv::spell_cast::Event_Finish,esv::spell_cast::Event_MoveDuringCastInitialize,esv::spell_cast::Event_MoveDuringCastStart,esv::spell_cast::Event_MoveDuringCastUpdate,esv::spell_cast::Event_MoveDuringCastEnd,esv::spell_cast::Event_Cast,esv::spell_cast::Event_CastHit,esv::spell_cast::Event_CastTextKey,esv::spell_cast::Event_TargetHit,esv::spell_cast::Event_SpellRollAbort,esv::spell_cast::Event_WeaponSetRequest,esv::spell_cast::Event_PlayAnimation,esv::spell_cast::Event_PhaseChange,esv::spell_cast::Event_CacheFlagChange,esv::spell_cast::Event_UseCostsChange,esv::spell_cast::Event_InitializeRolls,esv::spell_cast::Event_AdvanceRoll,esv::spell_cast::Event_AdvanceReaction,esv::spell_cast::Event_FireProjectile,esv::spell_cast::Event_ChangeProjectileDelayTimer,esv::spell_cast::Event_PopDelayedProjectile,esv::spell_cast::Event_InitializeIntermediateTargets,esv::spell_cast::Event_AddDelayedCastHit,esv::spell_cast::Event_ChangeCastPosition,esv::spell_cast::Event_ChangeCastEndPosition,esv::spell_cast::Event_ChangeMovementTransactionId,esv::spell_cast::Event_MovementEnd,esv::spell_cast::Event_CreateZone,esv::spell_cast::Event_DoTeleport,esv::spell_cast::Event_CreateWall,esv::spell_cast::Event_TargetsChanged,esv::spell_cast::Event_CastOptionsChange,esv::spell_cast::Event_TargetsChange,esv::spell_cast::Event_AddSharedMovement,esv::spell_cast::Event_AddProjectileCache,esv::spell_cast::Event_AddMovementInfo,esv::spell_cast::Event_InterruptStart,esv::spell_cast::Event_InterruptEventChange,esv::spell_cast::Event_InterruptApplyResult,esv::spell_cast::Event_InterruptEnd,esv::spell_cast::Event_PrecalculatedInterruptors,esv::spell_cast::Event_PushPausedAnimationEvents,esv::spell_cast::Event_ChangeStoryActionId,esv::spell_cast::Event_ZoneRangeUpdate,esv::spell_cast::Event_PrecalculatedConditionals,esv::spell_cast::Event_UpdateConditionals,esv::spell_cast::Event_UpdateInterruptors>
+spell_cast::CastTextKeyEventOneFrameComponent
+stats::SetStatusDurationFunctor
+status::ContainerComponent
+LegacyMap<EntityHandle, photo_mode::DummyEquipmentVisualVisibility>
+esv::spell_cast::Event_AddMovementInfo
+MaterialParameterPresetSlot

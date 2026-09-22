@@ -1039,6 +1039,8 @@ extern "C" void* bg3le_stats_at(std::size_t index);
 extern "C" char const* bg3le_stats_name(void const* object);
 extern "C" void* bg3le_stats_find(char const* name);
 extern "C" char const* bg3le_stats_type(void const* object);
+extern "C" char const* bg3le_stats_using(void const* object);
+extern "C" int bg3le_stats_list_index(void const* object);
 extern "C" std::size_t bg3le_stats_attr_count(void const* object);
 extern "C" bool bg3le_stats_attr_at(void const* object, std::size_t index,
                                     char const** nameOut,
@@ -1404,6 +1406,22 @@ int l_stats_type(lua_State* L) {
     char const* type = bg3le_stats_type(obj);
     if (type == nullptr) return 0;
     lua_pushstring(L, type);
+    return 1;
+}
+
+// Ext._Internal.StatsUsing(address) -> parent stat name
+int l_stats_using(lua_State* L) {
+    auto* obj = (void*)(std::uintptr_t)luaL_checkinteger(L, 1);
+    char const* name = bg3le_stats_using(obj);
+    if (name == nullptr) return 0;
+    lua_pushstring(L, name);
+    return 1;
+}
+
+// Ext._Internal.StatsListIndex(address) -> index
+int l_stats_list_index(lua_State* L) {
+    auto* obj = (void*)(std::uintptr_t)luaL_checkinteger(L, 1);
+    lua_pushinteger(L, bg3le_stats_list_index(obj));
     return 1;
 }
 
@@ -2190,6 +2208,10 @@ void lua_init() {
     lua_setfield(g_lua, -2, "StatsFind");
     lua_pushcfunction(g_lua, l_stats_type);
     lua_setfield(g_lua, -2, "StatsType");
+    lua_pushcfunction(g_lua, l_stats_using);
+    lua_setfield(g_lua, -2, "StatsUsing");
+    lua_pushcfunction(g_lua, l_stats_list_index);
+    lua_setfield(g_lua, -2, "StatsListIndex");
     lua_pushcfunction(g_lua, l_stats_attr_count);
     lua_setfield(g_lua, -2, "StatsAttrCount");
     lua_pushcfunction(g_lua, l_stats_attr_at);
@@ -2820,14 +2842,33 @@ local function read_attribute(addr, i)
     -- produced a longsword proficient in clubs and light armour, so both
     -- paths now follow upstream's Object::GetFlags.
     if kind == 5 then
-      value = Ext._Internal.StatsAttrFlags(addr, i, raw) or ""
+      -- A flag set is an array upstream, empty when nothing is set, so it is
+      -- an array here. The public shape has to match or a mod that iterates
+      -- it breaks.
+      local joined = Ext._Internal.StatsAttrFlags(addr, i, raw)
+      local list = {}
+      if joined ~= nil and joined ~= "" then
+        for part in joined:gmatch("[^;]+") do list[#list + 1] = part end
+      end
+      value = list
     else
       value = Ext._Internal.StatsAttrLabel(addr, i, raw) or raw
     end
+  elseif kind == 10 then
+    -- Requirements is an array upstream. Reading the entries needs
+    -- Object::Requirements, which is not located yet, so the array is empty
+    -- rather than absent: an empty list is the right shape and an honest
+    -- value for a stat with no requirements, which most have.
+    value = {}
+  elseif kind == 7 then
+    value = nil                      -- StatsFunctors: null upstream
+  elseif kind == 8 or kind == 9 then
+    -- Conditions resolve to their expression string upstream. The condition
+    -- pool is not located yet, so an empty string keeps the type right.
+    value = ""
+  elseif kind == 12 then
+    value = nil                      -- TranslatedString
   else
-    -- Functors, conditions, requirements and translated strings are stored
-    -- elsewhere on the object; the raw handle is reported rather than guessed
-    -- at, so nothing here pretends to a value it does not have.
     value = raw
   end
 
@@ -2849,14 +2890,24 @@ function Ext.Stats.Get(name)
     local attr, value = read_attribute(addr, i)
     if attr ~= nil then out[attr] = value end
   end
+
   -- An empty attribute set means the discovery did not land, which is worth
   -- saying rather than returning a lone name that looks complete.
   if n == 0 then
     out.AttributesUnavailable =
       "no attributes readable; see the stats lines in the extender log"
-  else
-    out.ModifierList = Ext._Internal.StatsType(addr)
+    return out
   end
+
+  -- Fields upstream puts alongside the attributes. Names and shapes follow
+  -- reference/stats-weapon.txt rather than being chosen here.
+  out.ModifierList = Ext._Internal.StatsType(addr)
+  out.ModifierListIndex = Ext._Internal.StatsListIndex(addr)
+  out.Using = Ext._Internal.StatsUsing(addr) or ""
+  -- Sets on the object itself, which are not located yet; upstream reports
+  -- them as arrays and they are empty far more often than not.
+  out.ComboCategories = {}
+  out.ComboProperties = {}
   return out
 end
 
@@ -2879,14 +2930,19 @@ function Ext.Stats.GetTypes(name)
   return out
 end
 
--- Ext.Stats.GetAllStats() -> { name, ... }
+-- Ext.Stats.GetStats([modifierList]) -> { name, ... }
+--
+-- Upstream's name and signature. An earlier version called this GetAllStats
+-- and added a GetStatsCount that upstream does not have; the public surface
+-- has to match or a mod written against bg3se will not run here. Internal
+-- entry points stay ours to shape -- it is Ext.* that is the contract.
 --
 -- No filter argument. Filtering by modifier list needs the modifier lists,
 -- which are not located yet, and the obvious implementation -- StatsFind per
 -- stat -- is quadratic: 15754 stats each costing a linear scan of 15754.
 -- That would hang the story thread, which has already happened once on this
 -- feature and is not worth repeating for a convenience.
-function Ext.Stats.GetAllStats(modifierList)
+function Ext.Stats.GetStats(modifierList)
   local out = {}
   local n = Ext._Internal.StatsCount()
   for i = 0, n - 1 do
@@ -2908,8 +2964,9 @@ function Ext.Stats.GetAllStats(modifierList)
   return out
 end
 
--- How many stats the manager holds, without building a table of names.
-function Ext.Stats.GetStatsCount() return Ext._Internal.StatsCount() end
+-- Not part of upstream's surface, so it lives under _Internal where our own
+-- additions belong; #Ext.Stats.GetStats() is the public way to count.
+function Ext._Internal.StatsTotal() return Ext._Internal.StatsCount() end
 
 -- ---- Ext.StaticData ----
 --
