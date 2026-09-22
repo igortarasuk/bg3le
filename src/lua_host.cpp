@@ -1023,10 +1023,304 @@ int l_array_info(lua_State* L) {
     return 2;
 }
 
+extern "C" void const* bg3le_meta_class(const char* className);
+extern "C" bool bg3le_meta_parse_guid(const char* text, void* out);
+extern "C" void* bg3le_resource_get(std::int32_t typeIndex, void const* guid,
+                                    std::size_t resourceSize);
+extern "C" std::size_t bg3le_resource_count(std::int32_t typeIndex);
+extern "C" bool bg3le_resource_guid_at(std::int32_t typeIndex, std::size_t i,
+                                       void* guidOut);
 extern "C" void* bg3le_resource_manager();
 extern "C" std::size_t bg3le_resource_bank_count();
 extern "C" bool bg3le_resource_bank_at(std::size_t i, std::int32_t* typeIndex,
                                        void** bank);
+
+// A field call's subject: a class, and the address its fields are relative to.
+//
+// The field machinery never needed an entity -- only these two. An entity and
+// a component resolve to a subject; a static data resource already is one,
+// which is what makes the same code serve both without a second copy of it.
+struct Subject {
+    void const* Meta{nullptr};
+    void* Base{nullptr};
+};
+
+// From an address and a class name, as a static data resource arrives.
+bool subject_from_object(lua_State* L, int addressIdx, int classIdx,
+                         Subject* out, const char** className) {
+    *className = luaL_checkstring(L, classIdx);
+    out->Base = (void*)(std::uintptr_t)luaL_checkinteger(L, addressIdx);
+    out->Meta = bg3le_meta_class(*className);
+    if (out->Meta == nullptr || out->Base == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "no field metadata for class %s", *className);
+        return false;
+    }
+    return true;
+}
+
+// Ext._Internal.ObjectFields(class [, path]) -> { field = kind, ... }
+int l_object_fields(lua_State* L) {
+    const char* className = luaL_checkstring(L, 1);
+    const char* path = luaL_optstring(L, 2, nullptr);
+
+    void const* meta = bg3le_meta_class(className);
+    if (meta == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "no field metadata for class %s", className);
+        return 2;
+    }
+
+    constexpr std::size_t kMax = 512;
+    const char* names[kMax];
+    std::uint8_t kinds[kMax];
+    const std::size_t count =
+        bg3le_meta_fields_at(meta, path, names, kinds, kMax);
+    if (count == 0 && path != nullptr && path[0] != '\0') {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s cannot be traversed", className, path);
+        return 2;
+    }
+
+    lua_newtable(L);
+    for (std::size_t i = 0; i < count; ++i) {
+        lua_pushstring(L, field_kind_name((FieldKind)kinds[i]));
+        lua_setfield(L, -2, names[i]);
+    }
+    return 1;
+}
+
+// Ext._Internal.ObjectFieldInfo(class, path) -> kind, elemKind, elemCount
+int l_object_field_info(lua_State* L) {
+    const char* className = luaL_checkstring(L, 1);
+    const char* path = luaL_checkstring(L, 2);
+
+    void const* meta = bg3le_meta_class(className);
+    if (meta == nullptr) return 0;
+
+    std::uint32_t offset = 0;
+    std::uint16_t size = 0;
+    std::uint8_t kind = 0;
+    std::uint8_t elemKind = 0;
+    std::uint16_t elemCount = 0;
+    if (!bg3le_meta_field(meta, path, &offset, &size, &kind, &elemKind,
+                          &elemCount)) {
+        return 0;
+    }
+
+    lua_pushstring(L, field_kind_name((FieldKind)kind));
+    lua_pushstring(L, field_kind_name((FieldKind)elemKind));
+    lua_pushinteger(L, elemCount);
+    return 3;
+}
+
+// Ext._Internal.ObjectGetField(address, class, path)
+int l_object_get_field(lua_State* L) {
+    Subject subject;
+    const char* className = nullptr;
+    if (!subject_from_object(L, 1, 2, &subject, &className)) return 2;
+    const char* path = luaL_checkstring(L, 3);
+
+    void* address = nullptr;
+    std::uint8_t kind = 0;
+    std::uint16_t size = 0;
+    bool readOnly = false;
+    if (!bg3le_meta_resolve(subject.Meta, path, subject.Base, &address, &kind,
+                            &size, &readOnly)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s does not resolve", className, path);
+        return 2;
+    }
+
+    std::uint32_t fieldOffset = 0;
+    std::uint16_t fieldSize = 0;
+    std::uint8_t fieldKind = 0;
+    std::uint8_t elemKind = 0;
+    std::uint16_t elemCount = 0;
+    bg3le_meta_field(subject.Meta, path, &fieldOffset, &fieldSize, &fieldKind,
+                     &elemKind, &elemCount);
+
+    const std::size_t width = field_kind_size((FieldKind)kind);
+    if (width != 0 && width <= 8) {
+        std::uint64_t raw = 0;
+        if (safe_read(address, &raw, width)
+            && push_enum(L, subject.Meta, path, raw)) {
+            return 1;
+        }
+    }
+
+    if (!push_field(L, address, (FieldKind)kind, (FieldKind)elemKind,
+                    elemCount)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s is of an unsupported kind (%s)", className,
+                        path, field_kind_name((FieldKind)kind));
+        return 2;
+    }
+    return 1;
+}
+
+// Ext._Internal.ObjectArrayInfo(address, class, path) -> count, elementKind
+int l_object_array_info(lua_State* L) {
+    Subject subject;
+    const char* className = nullptr;
+    if (!subject_from_object(L, 1, 2, &subject, &className)) return 2;
+    const char* path = luaL_checkstring(L, 3);
+
+    std::size_t count = 0;
+    std::uint16_t elemSize = 0;
+    std::uint8_t elemKind = 0;
+    const int status = bg3le_meta_array_length(subject.Meta, path, subject.Base,
+                                               &count, &elemSize, &elemKind);
+    if (status != 0) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "cannot size %s.%s (status %d)", className, path,
+                        status);
+        return 2;
+    }
+
+    lua_pushinteger(L, (lua_Integer)count);
+    lua_pushstring(L, field_kind_name((FieldKind)elemKind));
+    return 2;
+}
+
+// Ext._Internal.ObjectVariantIndex(address, class, path) -> active, count
+int l_object_variant_index(lua_State* L) {
+    Subject subject;
+    const char* className = nullptr;
+    if (!subject_from_object(L, 1, 2, &subject, &className)) return 2;
+    const char* path = luaL_checkstring(L, 3);
+
+    std::size_t active = 0;
+    std::size_t count = 0;
+    if (!bg3le_meta_variant_index(subject.Meta, path, subject.Base, &active,
+                                  &count)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s is not a variant", className, path);
+        return 2;
+    }
+
+    lua_pushinteger(L, (lua_Integer)active);
+    lua_pushinteger(L, (lua_Integer)count);
+    return 2;
+}
+
+// Ext._Internal.ObjectMapKey(address, class, path, index) -> key
+int l_object_map_key(lua_State* L) {
+    Subject subject;
+    const char* className = nullptr;
+    if (!subject_from_object(L, 1, 2, &subject, &className)) return 2;
+    const char* path = luaL_checkstring(L, 3);
+    const auto index = (std::size_t)luaL_checkinteger(L, 4);
+
+    void* address = nullptr;
+    std::uint8_t kind = 0;
+    std::uint16_t size = 0;
+    if (!bg3le_meta_map_key(subject.Meta, path, subject.Base, index, &address,
+                            &kind, &size)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s has no key at slot %d", className, path,
+                        (int)index);
+        return 2;
+    }
+
+    if (!push_field(L, address, (FieldKind)kind)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "the keys of %s.%s are of an unsupported kind (%s)",
+                        className, path, field_kind_name((FieldKind)kind));
+        return 2;
+    }
+    return 1;
+}
+
+// Ext._Internal.ResourceGet(class, guid) -> address
+//
+// The chain: the class names the resource type, its EngineClass names the
+// static data type, the symbol table gives that type's index, the manager
+// gives the bank for the index, and the bank maps the GUID to the resource.
+// Every link but the manager was already in place.
+int l_resource_get(lua_State* L) {
+    const char* className = luaL_checkstring(L, 1);
+    const char* guidText = luaL_checkstring(L, 2);
+
+    void const* meta = bg3le_meta_class(className);
+    if (meta == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "no metadata for resource class %s", className);
+        return 2;
+    }
+
+    const char* engineClass = bg3le_meta_engine_class(meta);
+    if (engineClass == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s has no engine class, so no static data type",
+                        className);
+        return 2;
+    }
+
+    const auto typeIndex =
+        ecs::index_of(ecs::Context::ImmutableData, engineClass);
+    if (!typeIndex.has_value()) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s is not a registered static data type",
+                        engineClass);
+        return 2;
+    }
+
+    std::uint8_t guid[16];
+    if (!bg3le_meta_parse_guid(guidText, guid)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s is not a GUID", guidText);
+        return 2;
+    }
+
+    void* resource =
+        bg3le_resource_get(*typeIndex, guid, bg3le_meta_component_size(meta));
+    if (resource == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "no %s with that GUID; the bank holds %d",
+                        className, (int)bg3le_resource_count(*typeIndex));
+        return 2;
+    }
+
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)resource);
+    return 1;
+}
+
+// Ext._Internal.ResourceGuids(class) -> { guid, ... }
+int l_resource_guids(lua_State* L) {
+    const char* className = luaL_checkstring(L, 1);
+
+    void const* meta = bg3le_meta_class(className);
+    const char* engineClass =
+        meta != nullptr ? bg3le_meta_engine_class(meta) : nullptr;
+    if (engineClass == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "no static data type for %s", className);
+        return 2;
+    }
+
+    const auto typeIndex =
+        ecs::index_of(ecs::Context::ImmutableData, engineClass);
+    if (!typeIndex.has_value()) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s is not a registered static data type",
+                        engineClass);
+        return 2;
+    }
+
+    const std::size_t count = bg3le_resource_count(*typeIndex);
+    lua_createtable(L, (int)count, 0);
+    int written = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint8_t guid[16];
+        if (!bg3le_resource_guid_at(*typeIndex, i, guid)) continue;
+        char text[40];
+        if (!bg3le_meta_format_guid(guid, text, sizeof(text))) continue;
+        lua_pushstring(L, text);
+        lua_rawseti(L, -2, ++written);
+    }
+    return 1;
+}
 
 // Ext._Internal.ResourceBanks() -> { Manager, Banks = { {...}, ... } }
 //
@@ -1725,6 +2019,22 @@ void lua_init() {
     lua_setfield(g_lua, -2, "VariantIndex");
     lua_pushcfunction(g_lua, l_resource_banks);
     lua_setfield(g_lua, -2, "ResourceBanks");
+    lua_pushcfunction(g_lua, l_resource_get);
+    lua_setfield(g_lua, -2, "ResourceGet");
+    lua_pushcfunction(g_lua, l_resource_guids);
+    lua_setfield(g_lua, -2, "ResourceGuids");
+    lua_pushcfunction(g_lua, l_object_fields);
+    lua_setfield(g_lua, -2, "ObjectFields");
+    lua_pushcfunction(g_lua, l_object_field_info);
+    lua_setfield(g_lua, -2, "ObjectFieldInfo");
+    lua_pushcfunction(g_lua, l_object_get_field);
+    lua_setfield(g_lua, -2, "ObjectGetField");
+    lua_pushcfunction(g_lua, l_object_array_info);
+    lua_setfield(g_lua, -2, "ObjectArrayInfo");
+    lua_pushcfunction(g_lua, l_object_variant_index);
+    lua_setfield(g_lua, -2, "ObjectVariantIndex");
+    lua_pushcfunction(g_lua, l_object_map_key);
+    lua_setfield(g_lua, -2, "ObjectMapKey");
     lua_pushcfunction(g_lua, l_field_address);
     lua_setfield(g_lua, -2, "FieldAddress");
     lua_pushcfunction(g_lua, l_field_bytes);
@@ -2280,6 +2590,73 @@ function Ext.Entity.Get(id)
   return setmetatable({Handle = handle,
                        EntityUuid = type(id) == "string" and id or nil},
                       entity_meta)
+end
+
+-- ---- Ext.StaticData ----
+--
+-- Static data is read as a snapshot rather than as a live view, which is the
+-- one place this differs from a component. A component can change under you,
+-- so its fields are read on access; a resource definition is loaded once and
+-- does not, so a plain table is simpler and more useful -- it can be held,
+-- compared and serialised without reading the game again.
+--
+-- Fields go through the same metadata and the same resolver a component's do;
+-- only the base address comes from elsewhere. A kind bg3le cannot convert
+-- arrives as a marker rather than being dropped, for the reason it does
+-- everywhere else.
+local function read_object(addr, class, prefix, out)
+  local fields, err = Ext._Internal.ObjectFields(class, prefix)
+  if fields == nil then error("bg3le: " .. tostring(err), 0) end
+
+  for name, kind in pairs(fields) do
+    local path = (prefix == "") and name or (prefix .. "." .. name)
+    if kind == "unsupported" then
+      out[name] = "<unsupported>"
+    elseif kind == "struct" then
+      out[name] = read_object(addr, class, path, {})
+    elseif kind == "array" then
+      local count = Ext._Internal.ObjectArrayInfo(addr, class, path)
+      local items = {}
+      for i = 0, (count or 0) - 1 do
+        local value, ferr = Ext._Internal.ObjectGetField(
+          addr, class, path .. "[" .. i .. "]")
+        if value == nil and ferr ~= nil then
+          items[i + 1] = "<unreadable>"
+        else
+          items[i + 1] = value
+        end
+      end
+      out[name] = items
+    else
+      local value, ferr = Ext._Internal.ObjectGetField(addr, class, path)
+      if value == nil and ferr ~= nil then
+        out[name] = "<unreadable>"
+      else
+        out[name] = value
+      end
+    end
+  end
+  return out
+end
+
+Ext.StaticData = {}
+
+-- Ext.StaticData.Get(guid, type), where type is the resource class name such
+-- as "ActionResource". Returns nil plus a reason, so a caller can tell "no
+-- such GUID" from "no such resource type".
+function Ext.StaticData.Get(guid, resourceType)
+  if type(guid) ~= "string" or type(resourceType) ~= "string" then
+    return nil, "Ext.StaticData.Get takes a GUID string and a type name"
+  end
+
+  local addr, err = Ext._Internal.ResourceGet(resourceType, guid)
+  if addr == nil then return nil, err end
+  return read_object(addr, resourceType, "", {})
+end
+
+-- Every GUID in a resource bank, so a type can be enumerated.
+function Ext.StaticData.GetAll(resourceType)
+  return Ext._Internal.ResourceGuids(resourceType)
 end
 
 function Ext.Entity.HandleToUuid(handle)

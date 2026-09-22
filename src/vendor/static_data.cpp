@@ -21,6 +21,7 @@
 #include <stdafx.h>
 
 #include <GameDefinitions/GuidResources.h>
+#include <GameDefinitions/Components/All.h>
 
 #include <cstdio>
 #include <cstring>
@@ -170,6 +171,54 @@ void* search_for_manager() {
     return nullptr;
 }
 
+// Where a bank's resource map starts, past the base class.
+//
+// Computed from a concrete instantiation rather than added up by hand, so the
+// compiler supplies it. bg3se declares GetObjectByKey as a virtual, and
+// calling it would be shorter -- but that means calling a vtable slot by
+// number, which is a guess about the engine's vtable order, and a wrong guess
+// there calls an unrelated function. The map's layout can be checked; a vtable
+// index cannot.
+// The element type is irrelevant: Resources sits immediately after the base,
+// so any instantiation gives the same answer, and a local stand-in says that
+// more plainly than naming a real resource would.
+struct OffsetProbe : bg3se::resource::GuidResource {};
+
+constexpr std::size_t kResourcesOffset =
+    offsetof(bg3se::resource::GuidResourceBank<OffsetProbe>, Resources);
+
+// Looks a GUID up in a bank, given the size of one resource.
+//
+// Linear over the key array rather than hashed: the engine's hash for a Guid
+// key is its own, and a wrong hash would miss silently, where a linear scan
+// either finds the key or does not. Banks hold hundreds of entries and this
+// runs once per lookup.
+void* find_resource(void* bank, void const* guid, std::size_t resourceSize) {
+    if (bank == nullptr || guid == nullptr || resourceSize == 0) return nullptr;
+
+    auto const* map = (char const*)bank + kResourcesOffset;
+
+    void* keyBuf = nullptr;
+    std::uint32_t keyCount = 0;
+    void* valueBuf = nullptr;
+    if (!read_as(map + kKeysOffset + kArrayBuffer, &keyBuf)) return nullptr;
+    if (!read_as(map + kKeysOffset + kArraySize, &keyCount)) return nullptr;
+    if (!read_as(map + kValuesOffset + kArrayBuffer, &valueBuf)) return nullptr;
+    if (keyBuf == nullptr || valueBuf == nullptr) return nullptr;
+    if (keyCount > (1u << 22)) return nullptr;  // implausible; refuse
+
+    for (std::uint32_t i = 0; i < keyCount; ++i) {
+        bg3se::Guid key{};
+        if (!read_as((char const*)keyBuf + i * sizeof(bg3se::Guid), &key)) {
+            return nullptr;
+        }
+        if (std::memcmp(&key, guid, sizeof(key)) == 0) {
+            return (char*)valueBuf + (std::size_t)i * resourceSize;
+        }
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 // Found on first use and cached, for the same reason as the string table: the
@@ -200,6 +249,44 @@ extern "C" std::size_t bg3le_resource_bank_count() {
     if (manager == nullptr) return 0;
     return reinterpret_cast<GuidResourceManager*>(manager)
         ->Definitions.keys().size();
+}
+
+// A resource by type index and GUID, or null. resourceSize is the size of one
+// resource of that type, which the caller takes from the field metadata.
+extern "C" void* bg3le_resource_get(std::int32_t typeIndex, void const* guid,
+                                    std::size_t resourceSize) {
+    return find_resource(bg3le_resource_bank(typeIndex), guid, resourceSize);
+}
+
+// How many resources a bank holds, so a caller can tell an empty bank from a
+// missing GUID.
+extern "C" std::size_t bg3le_resource_count(std::int32_t typeIndex) {
+    void* bank = bg3le_resource_bank(typeIndex);
+    if (bank == nullptr) return 0;
+
+    std::uint32_t keyCount = 0;
+    if (!read_as((char const*)bank + kResourcesOffset + kKeysOffset + kArraySize,
+                 &keyCount)) {
+        return 0;
+    }
+    return keyCount > (1u << 22) ? 0 : keyCount;
+}
+
+// The GUID of the i'th resource in a bank, for listing one.
+extern "C" bool bg3le_resource_guid_at(std::int32_t typeIndex, std::size_t i,
+                                       void* guidOut) {
+    void* bank = bg3le_resource_bank(typeIndex);
+    if (bank == nullptr || guidOut == nullptr) return false;
+
+    auto const* map = (char const*)bank + kResourcesOffset;
+    void* keyBuf = nullptr;
+    std::uint32_t keyCount = 0;
+    if (!read_as(map + kKeysOffset + kArrayBuffer, &keyBuf)) return false;
+    if (!read_as(map + kKeysOffset + kArraySize, &keyCount)) return false;
+    if (keyBuf == nullptr || i >= keyCount) return false;
+
+    return safe_read((char const*)keyBuf + i * sizeof(bg3se::Guid), guidOut,
+                     sizeof(bg3se::Guid));
 }
 
 extern "C" bool bg3le_resource_bank_at(std::size_t i, std::int32_t* typeIndex,

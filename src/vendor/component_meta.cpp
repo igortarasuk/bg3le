@@ -1792,6 +1792,26 @@ extern "C" char const* bg3le_meta_kind_name(std::uint8_t kind) {
 // How many enums carry labels, for the startup log.
 extern "C" std::size_t bg3le_meta_enum_count() { return std::size(kAllEnums); }
 
+// Parses a GUID the way the engine spells it, which is the inverse of
+// bg3le_meta_format_guid -- both go through bg3se so they stay inverses.
+extern "C" bool bg3le_meta_parse_guid(char const* text, void* out) {
+    if (text == nullptr || out == nullptr) return false;
+    const auto parsed = Guid::ParseGuidString(text);
+    if (!parsed.has_value()) return false;
+    std::memcpy(out, &*parsed, sizeof(Guid));
+    return true;
+}
+
+// A class by its C++ name, for the things bg3se describes that are not
+// components -- a static data resource, for instance. The same handle works
+// with every field call, since those only ever needed a class and a base
+// address; it was reaching the address that was entity-specific.
+extern "C" void const* bg3le_meta_class(char const* className) {
+    if (className == nullptr) return nullptr;
+    auto it = by_class_name().find(className);
+    return it != by_class_name().end() ? it->second : nullptr;
+}
+
 // The engine's name for a component, so a caller who looked the component up
 // by bg3se's short name can still reach bg3le's symbol-table index, which is
 // keyed by the engine name.
