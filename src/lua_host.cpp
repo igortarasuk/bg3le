@@ -412,6 +412,8 @@ extern "C" bool bg3le_game_allocator_ready();
 // The component field tables, from src/vendor/component_meta.cpp.
 extern "C" void const* bg3le_meta_component(const char* engineName);
 extern "C" std::size_t bg3le_meta_component_size(void const* handle);
+extern "C" std::size_t bg3le_meta_component_stride(void const* handle);
+extern "C" bool bg3le_meta_component_is_proxy(void const* handle);
 extern "C" bool bg3le_meta_field(void const* handle, const char* name,
                                  std::uint32_t* offset, std::uint16_t* size,
                                  std::uint8_t* kind, std::uint8_t* elemKind,
@@ -555,9 +557,22 @@ void* component_pointer(std::uint64_t handle, const char* name,
     const auto index = component_index(engineName);
     if (!index.has_value()) return nullptr;
 
-    return bg3le_entity_component(server_container(), handle,
-                                  static_cast<std::uint16_t>(*index),
-                                  bg3le_meta_component_size(*meta));
+    // The stride, not the struct size. For a proxy component the page holds a
+    // pointer and the struct lives wherever it points, so passing the struct
+    // size would stride the page wrongly and then read the pointer's own bytes
+    // as the first fields. 46 of the components a live save carries are
+    // proxies, so this is not an edge case.
+    void* slot = bg3le_entity_component(server_container(), handle,
+                                        static_cast<std::uint16_t>(*index),
+                                        bg3le_meta_component_stride(*meta));
+    if (slot == nullptr) return nullptr;
+
+    if (bg3le_meta_component_is_proxy(*meta)) {
+        void* target = nullptr;
+        if (!safe_read(slot, &target, sizeof(target))) return nullptr;
+        return target;
+    }
+    return slot;
 }
 
 // Pushes a field, read through safe_read so a stale handle yields nil rather
@@ -973,7 +988,7 @@ int l_size_audit(lua_State* L) {
         if (engineSize < 0) continue;  // no live entity has it
 
         ++checked;
-        const auto declared = (int)bg3le_meta_component_size(cls);
+        const auto declared = (int)bg3le_meta_component_stride(cls);
         if (declared == engineSize) {
             ++matched;
             continue;

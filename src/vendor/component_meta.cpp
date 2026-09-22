@@ -321,6 +321,21 @@ constexpr char const* component_name_of() {
     else return nullptr;
 }
 
+// Whether the entity's page holds a pointer to the component rather than the
+// component itself.
+//
+// These exist and they are not rare: 46 of the 586 components a live save
+// carries are proxies, including BoundComponent, esv::Character, esv::Item and
+// every esv trigger. Reading one as though it were inline reads the pointer's
+// own bytes as the first fields, which is not a subtle kind of wrong -- and it
+// was only caught by comparing every component's declared size against the
+// size the engine recorded, because the engine records 8 for all of them.
+template <class T>
+constexpr bool is_proxy_component() {
+    if constexpr (IsProxyComponentType<T>) return true;
+    else return false;
+}
+
 struct ClassFields {
     char const* Name;           // the C++ class name, what INHERIT refers to
     char const* ComponentName;  // bg3se's short name, or null
@@ -330,9 +345,12 @@ struct ClassFields {
     // compare rather than by guessing at qualification.
     std::string_view TypeName;
     FieldDesc const* Fields;
-    // The stride bg3se walks a component page with, so it has to be the
-    // engine's real component size.
+    // The size of the struct itself.
     std::size_t Size;
+    // Whether the page holds a pointer to the component rather than the
+    // component inline. For one of these the stride is a pointer and the
+    // pointer has to be followed; see bg3le_meta_component_stride.
+    bool IsProxy;
 };
 
 template <class T>
@@ -440,6 +458,7 @@ inline constexpr ClassFields kClassFields{
     FieldTable<T>::kTypeName,
     FieldTable<T>::kFields,
     sizeof(T),
+    is_proxy_component<T>(),
 };
 
 // Every class table, collected the way upstream collects its own.
@@ -692,6 +711,20 @@ extern "C" void const* bg3le_meta_component(char const* engineName) {
 extern "C" std::size_t bg3le_meta_component_size(void const* handle) {
     if (handle == nullptr) return 0;
     return static_cast<ClassFields const*>(handle)->Size;
+}
+
+// The stride the engine walks the component page with, which is what
+// GetComponent multiplies the entity's slot by. For a proxy component that is
+// a pointer, not the struct: the struct lives wherever the pointer says.
+extern "C" std::size_t bg3le_meta_component_stride(void const* handle) {
+    if (handle == nullptr) return 0;
+    auto const* cls = static_cast<ClassFields const*>(handle);
+    return cls->IsProxy ? sizeof(void*) : cls->Size;
+}
+
+extern "C" bool bg3le_meta_component_is_proxy(void const* handle) {
+    if (handle == nullptr) return false;
+    return static_cast<ClassFields const*>(handle)->IsProxy;
 }
 
 namespace {
