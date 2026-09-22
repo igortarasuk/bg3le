@@ -37,15 +37,15 @@ export BG3LE_DUMP_DB="${BG3LE_DUMP_DB:-1}"  # temporary: structural dump
 export RADV_PERFOPTS="${RADV_PERFOPTS:-async_compile}"
 export vk_x11_strict_image_count="${vk_x11_strict_image_count:-false}"
 
-# Nothing sets SDL_VIDEODRIVER here on purpose: setting it on the command line
-# already reaches the game, since pressure-vessel passes the environment
-# through. The bundled libSDL2.so has both backends compiled in and the sniper
-# runtime carries libwayland-client, so either is reachable --
-# SDL_VIDEODRIVER=wayland for a native surface, x11 to force XWayland.
+# Wayland by default: a native surface rather than XWayland. Measurably
+# steadier GPU clocks and slightly better frametimes, and the bundled
+# libSDL2.so has the backend compiled in with libwayland-client present in the
+# sniper runtime. SDL_VIDEODRIVER=x11 forces XWayland back.
 #
-# Neither explains the frametime problem. A Proton DX11 run and a Proton Vulkan
-# run share one windowing path and only one of them stutters, so the stutter
-# does not track the window system.
+# This is a preference, not a fix. A Proton DX11 run and a Proton Vulkan run
+# share one windowing path and only one of them stuttered, so the stutter never
+# tracked the window system.
+export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-wayland}"
 
 cd "$GAME"
 
@@ -83,6 +83,17 @@ if [ "${GAMEMODE:-0}" != "0" ] && command -v gamemoderun >/dev/null 2>&1; then
     launch=(gamemoderun "${launch[@]}")
 fi
 
-LD_PRELOAD="$HERE/build/libbg3le.so" \
+# BG3LE_EXTRA_PRELOAD appends another library to the preload list, for
+# experiments that do not belong in the extender. Currently used to test
+# thread affinity: the engine pins each of its threads to one logical cpu,
+# while the same game under Proton runs with every thread on 0-15 because
+# Wine does not pass the affinity requests through -- and that build keeps the
+# gpu at 80% busy where the native one manages 38%.
+preload="$HERE/build/libbg3le.so"
+if [ -n "${BG3LE_EXTRA_PRELOAD:-}" ]; then
+    preload="$preload:$BG3LE_EXTRA_PRELOAD"
+fi
+
+LD_PRELOAD="$preload" \
 BG3LE_LOG="${BG3LE_LOG:-/tmp/bg3le.log}" \
 exec "${launch[@]}"
