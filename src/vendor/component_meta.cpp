@@ -1744,6 +1744,12 @@ extern "C" void const* bg3le_meta_class_at(std::size_t index) {
     return kAllClasses[index];
 }
 
+// The bg3se name of a reflected class, for Ext.Types.GetAllTypes.
+extern "C" char const* bg3le_meta_class_name(void const* handle) {
+    if (handle == nullptr) return nullptr;
+    return static_cast<ClassFields const*>(handle)->Name;
+}
+
 extern "C" std::size_t bg3le_meta_component_count() {
     std::size_t n = 0;
     for (auto const* cls : kAllClasses) {

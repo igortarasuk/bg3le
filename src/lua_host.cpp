@@ -1033,6 +1033,9 @@ int l_array_info(lua_State* L) {
 }
 
 extern "C" void const* bg3le_meta_class(const char* className);
+extern "C" char const* bg3le_meta_class_name(void const* handle);
+extern "C" std::size_t bg3le_meta_class_count();
+extern "C" void const* bg3le_meta_class_at(std::size_t index);
 extern "C" bool bg3le_meta_parse_guid(const char* text, void* out);
 extern "C" void* bg3le_resource_get(std::int32_t typeIndex, void const* guid,
                                     std::size_t resourceSize);
@@ -1670,6 +1673,33 @@ int l_object_expression(lua_State* L) {
     return 3;
 }
 
+// Ext._Internal.TypeNames() -> every reflected class name, for Ext.Types.
+int l_type_names(lua_State* L) {
+    const std::size_t count = bg3le_meta_class_count();
+    lua_createtable(L, (int)count, 0);
+
+    int n = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        void const* cls = bg3le_meta_class_at(i);
+        char const* name = cls != nullptr ? bg3le_meta_class_name(cls)
+                                          : nullptr;
+        if (name == nullptr) continue;
+        lua_pushstring(L, name);
+        lua_rawseti(L, -2, ++n);
+    }
+    return 1;
+}
+
+// Ext._Internal.TypeIsComponent(class) -> engine component name, or nil
+int l_type_component(lua_State* L) {
+    void const* meta = bg3le_meta_class(luaL_checkstring(L, 1));
+    if (meta == nullptr) return 0;
+    char const* engine = bg3le_meta_engine_class(meta);
+    if (engine == nullptr) return 0;
+    lua_pushstring(L, engine);
+    return 1;
+}
+
 // Ext._Internal.StatsFunctorGroups(address, attribute)
 //   -> { {TextKey, Functors}, ... } where Functors is a list of
 //      {address, class} pairs for the prelude to read reflectively.
@@ -2046,6 +2076,8 @@ int l_map_key(lua_State* L) {
 extern "C" int bg3le_component_engine_size(void* container,
                                            std::uint16_t componentIndex);
 extern "C" void const* bg3le_meta_class_at(std::size_t index);
+extern "C" char const* bg3le_meta_class_name(void const* handle);
+extern "C" std::size_t bg3le_meta_class_count();
 
 // Ext._Internal.SizeAudit() -> { Checked, Matched, Mismatches = {...} }
 //
@@ -2655,6 +2687,10 @@ void lua_init() {
     lua_setfield(g_lua, -2, "ObjectCondition");
     lua_pushcfunction(g_lua, l_object_expression);
     lua_setfield(g_lua, -2, "ObjectExpression");
+    lua_pushcfunction(g_lua, l_type_names);
+    lua_setfield(g_lua, -2, "TypeNames");
+    lua_pushcfunction(g_lua, l_type_component);
+    lua_setfield(g_lua, -2, "TypeIsComponent");
     lua_pushcfunction(g_lua, l_stats_functor_groups);
     lua_setfield(g_lua, -2, "StatsFunctorGroups");
     lua_pushcfunction(g_lua, l_stats_ai_flags);
@@ -3259,6 +3295,392 @@ function Ext._Internal.FireOsirisListener(name, arity, event, ...)
   end
 end
 
+-- ---- Ext.Types ----
+--
+-- bg3se's type registry, over the same property maps bg3le already
+-- compiles in. TypeInformation's keys are its own, from
+-- GameDefinitions/Base/BaseTypeInformation.h, so a mod reading
+-- info.Members or info.Kind finds what it expects.
+Ext.Types = {}
+
+local LUA_TYPE_ID = {
+  ["nil"] = "Unknown", boolean = "Boolean", number = "Float",
+  string = "String", table = "Object", ["function"] = "Function",
+  userdata = "Object", thread = "Unknown",
+}
+
+local type_names_cache
+
+function Ext.Types.GetAllTypes()
+  if type_names_cache == nil then
+    type_names_cache = Ext._Internal.TypeNames()
+    table.sort(type_names_cache)
+  end
+  -- A copy: upstream returns a fresh array, and a caller sorting or
+  -- clearing it must not corrupt the registry.
+  local out = {}
+  for i, name in ipairs(type_names_cache) do out[i] = name end
+  return out
+end
+
+function Ext.Types.GetTypeInfo(typeName)
+  if type(typeName) ~= "string" then return nil end
+
+  local fields = Ext._Internal.ObjectFields(typeName, "")
+  if fields == nil then return nil end
+
+  local members = {}
+  for name, kind in pairs(fields) do
+    members[name] = kind
+  end
+
+  return {
+    TypeName = typeName,
+    NativeName = typeName,
+    Kind = "Object",
+    Members = members,
+    Methods = {},
+    EnumValues = {},
+    ReturnValues = {},
+    Params = {},
+    IsBitfield = false,
+    IsBuiltin = false,
+    HasWildcardProperties = false,
+    ComponentName = Ext._Internal.TypeIsComponent(typeName),
+    -- Filled where bg3le knows them; the rest are absent rather than
+    -- guessed, and a nil here reads the same as upstream's empty ref.
+    ParentType = nil,
+    ElementType = nil,
+    KeyType = nil,
+  }
+end
+
+function Ext.Types.GetObjectType(object)
+  if type(object) ~= "table" then return nil end
+  -- bg3le hands out plain tables, so the only objects that carry a type
+  -- are the ones it tagged.
+  local meta = getmetatable(object)
+  if meta ~= nil and meta.__name ~= nil then return meta.__name end
+  return nil
+end
+
+function Ext.Types.TypeOf(object)
+  local name = Ext.Types.GetObjectType(object)
+  if name == nil then return nil end
+  return Ext.Types.GetTypeInfo(name)
+end
+
+function Ext.Types.IsA(object, typeName)
+  return Ext.Types.GetObjectType(object) == typeName
+end
+
+function Ext.Types.GetValueType(object)
+  return LUA_TYPE_ID[type(object)] or "Unknown"
+end
+
+function Ext.Types.GetBaseValueType(object)
+  return Ext.Types.GetValueType(object)
+end
+
+function Ext.Types.Validate(object)
+  -- Upstream walks an object's property map checking every member reads
+  -- back. bg3le's objects are plain values that were already read, so
+  -- there is nothing left that can fail; true is the honest answer for
+  -- anything it produced, and a non-table is not one.
+  return type(object) == "table"
+end
+
+-- Upstream's Serialize turns an engine object proxy into a plain Lua
+-- table, and Unserialize applies one back; neither touches JSON. An
+-- earlier version here stringified, which would have handed a mod a string
+-- where it expected a table.
+local function deep_plain(value, seen)
+  if type(value) ~= "table" then return value end
+  if seen[value] then return seen[value] end
+
+  local out = {}
+  seen[value] = out
+  for k, v in pairs(value) do
+    if type(v) ~= "function" then out[k] = deep_plain(v, seen) end
+  end
+  return out
+end
+
+function Ext.Types.Serialize(object)
+  return deep_plain(object, {})
+end
+
+function Ext.Types.Unserialize(object, values)
+  if type(values) ~= "table" then
+    error("Ext.Types.Unserialize expects a table", 2)
+  end
+  for k, v in pairs(values) do object[k] = v end
+  return object
+end
+
+function Ext.Types.Construct(typeName)
+  -- Making an engine object means allocating with the game's allocator and
+  -- running its constructor, neither of which bg3le reaches. Saying so
+  -- beats handing back an empty table that looks like one.
+  error("bg3le: Ext.Types.Construct cannot build engine objects yet ("
+        .. tostring(typeName) .. ")", 2)
+end
+
+function Ext.Types.GetHashSetValueAt(object, index)
+  if type(object) ~= "table" then return nil end
+  return object[index + 1]
+end
+
+function Ext.Types.GetFunctionLocation(fn)
+  if type(fn) ~= "function" then return nil end
+  local info = debug.getinfo(fn, "S")
+  if info == nil then return nil end
+  return info.short_src, info.linedefined
+end
+
+-- Custom properties and methods are grafted onto bg3se's property map for
+-- a type. bg3le's objects are plain tables built per read, so a graft has
+-- nowhere to live that would survive the next read.
+function Ext.Types.AddCustomFunction()
+  error("bg3le: Ext.Types.AddCustomFunction needs the property map to be "
+        .. "extensible at runtime, which it is not here", 2)
+end
+
+function Ext.Types.AddCustomProperty()
+  error("bg3le: Ext.Types.AddCustomProperty needs the property map to be "
+        .. "extensible at runtime, which it is not here", 2)
+end
+
+function Ext.Types.GenerateIdeHelpers()
+  error("bg3le: Ext.Types.GenerateIdeHelpers needs the annotation writer, "
+        .. "which is not implemented", 2)
+end
+
+-- ---- Ext.Vars ----
+--
+-- Mod and user variables. The registry, the storage and the dirty
+-- tracking are real; what is missing is the two things that need the
+-- engine -- replication to clients and savegame persistence -- so Sync
+-- records the intent and says once that nothing leaves the process.
+Ext.Vars = {}
+
+local mod_variable_defs = {}
+local mod_variables = {}
+local user_variable_defs = {}
+local user_variables = {}
+local dirty_mod = {}
+local dirty_user = {}
+local warned_sync = false
+
+local function warn_sync(what)
+  if warned_sync then return end
+  warned_sync = true
+  Ext.Log.PrintWarning("bg3le: " .. what .. " is local to this process; "
+    .. "variable replication and savegame persistence are not implemented")
+end
+
+function Ext.Vars.RegisterModVariable(moduleUuid, name, options)
+  if type(moduleUuid) ~= "string" or type(name) ~= "string" then
+    error("Ext.Vars.RegisterModVariable(moduleUuid, name[, options])", 2)
+  end
+  mod_variable_defs[moduleUuid] = mod_variable_defs[moduleUuid] or {}
+  mod_variable_defs[moduleUuid][name] = options or {}
+  mod_variables[moduleUuid] = mod_variables[moduleUuid] or {}
+end
+
+-- Returns the module's variable table. Writing to it is how a mod sets
+-- one, so it is the live table rather than a copy, and a write marks the
+-- key dirty through the proxy.
+function Ext.Vars.GetModVariables(moduleUuid)
+  local defs = mod_variable_defs[moduleUuid]
+  if defs == nil then return nil end
+
+  local store = mod_variables[moduleUuid]
+  return setmetatable({}, {
+    __index = function(_, key) return store[key] end,
+    __newindex = function(_, key, value)
+      if defs[key] == nil then
+        error("no mod variable named " .. tostring(key)
+              .. " is registered for " .. tostring(moduleUuid), 2)
+      end
+      store[key] = value
+      dirty_mod[moduleUuid] = dirty_mod[moduleUuid] or {}
+      dirty_mod[moduleUuid][key] = true
+    end,
+    __pairs = function()
+      return next, store, nil
+    end,
+  })
+end
+
+function Ext.Vars.SyncModVariables()
+  warn_sync("Ext.Vars.SyncModVariables")
+  dirty_mod = {}
+end
+
+function Ext.Vars.DirtyModVariables(moduleUuid, key)
+  if moduleUuid == nil then
+    for uuid, defs in pairs(mod_variable_defs) do
+      dirty_mod[uuid] = dirty_mod[uuid] or {}
+      for k in pairs(defs) do dirty_mod[uuid][k] = true end
+    end
+    return
+  end
+  dirty_mod[moduleUuid] = dirty_mod[moduleUuid] or {}
+  if key == nil then
+    for k in pairs(mod_variable_defs[moduleUuid] or {}) do
+      dirty_mod[moduleUuid][k] = true
+    end
+  else
+    dirty_mod[moduleUuid][key] = true
+  end
+end
+
+function Ext.Vars.RegisterUserVariable(name, options)
+  if type(name) ~= "string" then
+    error("Ext.Vars.RegisterUserVariable(name[, options])", 2)
+  end
+  user_variable_defs[name] = options or {}
+end
+
+function Ext.Vars.SyncUserVariables()
+  warn_sync("Ext.Vars.SyncUserVariables")
+  dirty_user = {}
+end
+
+function Ext.Vars.DirtyUserVariables(entityGuid, key)
+  local bucket = entityGuid or "*"
+  dirty_user[bucket] = dirty_user[bucket] or {}
+  if key == nil then
+    for k in pairs(user_variable_defs) do dirty_user[bucket][k] = true end
+  else
+    dirty_user[bucket][key] = true
+  end
+end
+
+function Ext.Vars.GetEntitiesWithVariable(variable)
+  local out = {}
+  for guid, vars in pairs(user_variables) do
+    if vars[variable] ~= nil then out[#out + 1] = guid end
+  end
+  table.sort(out)
+  return out
+end
+
+-- The store behind an entity's UserVars, used by Ext.Entity.
+function Ext._Internal.UserVariableStore(guid)
+  user_variables[guid] = user_variables[guid] or {}
+  return user_variables[guid], user_variable_defs
+end
+
+-- ---- Ext.Net ----
+--
+-- bg3le runs server-side and is always the host; there is no second
+-- process to talk to. The extender's own network channel is a protobuf
+-- message riding the game's connection, which bg3le does not implement, so
+-- the sending half refuses rather than dropping messages silently.
+Ext.Net = {}
+
+local net_listeners = {}
+
+function Ext.Net.IsHost() return true end
+
+function Ext.Net.Version() return Ext.Utils.Version() end
+
+function Ext.Net.PlayerHasExtender(_)
+  -- True for the host, which is the only peer that exists here.
+  return true
+end
+
+local function no_network(name)
+  error("bg3le: Ext.Net." .. name .. " needs the extender's network "
+        .. "channel, which is not implemented; nothing was sent", 2)
+end
+
+function Ext.Net.BroadcastMessage() no_network("BroadcastMessage") end
+function Ext.Net.PostMessageToClient() no_network("PostMessageToClient") end
+function Ext.Net.PostMessageToUser() no_network("PostMessageToUser") end
+
+-- Registered listeners are kept and dispatched locally, so a mod that
+-- talks to itself over a channel still works.
+function Ext.RegisterNetListener(channel, handler)
+  net_listeners[channel] = net_listeners[channel] or {}
+  table.insert(net_listeners[channel], handler)
+end
+
+function Ext._Internal.FireNetMessage(channel, payload, userId)
+  for _, handler in ipairs(net_listeners[channel] or {}) do
+    local ok, err = pcall(handler, channel, payload, userId)
+    if not ok then
+      Ext.Log.PrintError("net listener failed: " .. tostring(err))
+    end
+  end
+end
+
+-- ---- top level ----
+
+-- Deferred to the next server tick, which is where the timer queue already
+-- runs, so the callback lands on the story thread like upstream's.
+function Ext.OnNextTick(fn)
+  if type(fn) ~= "function" then
+    error("Ext.OnNextTick expects a function", 2)
+  end
+  return Ext.Timer.WaitFor(0, fn)
+end
+
+local mod_events = {}
+
+function Ext.RegisterModEvent(modUuid, event)
+  mod_events[modUuid] = mod_events[modUuid] or {}
+  mod_events[modUuid][event] = mod_events[modUuid][event] or {}
+end
+
+local console_commands = {}
+
+function Ext.RegisterConsoleCommand(name, handler)
+  if type(name) ~= "string" or type(handler) ~= "function" then
+    error("Ext.RegisterConsoleCommand(name, handler)", 2)
+  end
+  console_commands[name] = handler
+end
+
+-- Called by the console when a line starts with a registered command.
+function Ext._Internal.RunConsoleCommand(name, ...)
+  local handler = console_commands[name]
+  if handler == nil then return false end
+  local ok, err = pcall(handler, name, ...)
+  if not ok then
+    Ext.Log.PrintError("console command failed: " .. tostring(err))
+  end
+  return true
+end
+
+-- Ext.Require(path) or Ext.Require(modGuid, path): loads a mod's Lua file
+-- once, caching by the name it was asked for, as upstream does.
+local required = {}
+
+function Ext.Require(a, b)
+  local path = b or a
+  if required[path] ~= nil then return required[path] end
+
+  local contents = Ext.IO.LoadFile(path, "data")
+  if contents == nil then
+    error("Ext.Require: cannot read " .. tostring(path), 2)
+  end
+  local chunk, err = load(contents, path, "t")
+  if chunk == nil then error(err, 2) end
+
+  local result = chunk()
+  if result == nil then result = true end
+  required[path] = result
+  return result
+end
+
+-- bg3se exposes its shared library table here. bg3le has no bundled
+-- library to expose, so it is an empty table rather than absent: a mod
+-- indexing it gets nil for a member instead of an error on the table.
+Ext.CoreLib = {}
+
 -- ---- Ext.Utils ----
 Ext.Utils = {
   Print = Ext.Log.Print,
@@ -3367,9 +3789,8 @@ function Ext.IsClient() return false end
 -- "Loca" rather than "Localization" -- the latter is not a module bg3se
 -- has, so a mod asking for Ext.Loca got a nil index instead of the error
 -- the stub exists to give.
-for _, name in ipairs({"Entity", "Stats", "Level", "StaticData", "Mod", "Net",
-                       "Vars", "Types", "Loca", "Events", "Resource",
-                       "Template"}) do
+for _, name in ipairs({"Entity", "Stats", "Level", "StaticData", "Mod",
+                       "Loca", "Events", "Resource", "Template"}) do
   if Ext[name] == nil then Ext[name] = stub(name) end
 end
 Ext.Definition = Ext.StaticData
