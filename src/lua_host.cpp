@@ -1915,16 +1915,22 @@ make_map = function(handle, comp, path)
       if not ok then error("bg3le: " .. tostring(err), 0) end
     end,
     __len = count,
-    -- Iterating yields key, value. A key that cannot be converted ends the
-    -- iteration rather than yielding nil, which would read as a shorter map;
-    -- Entries() is the way round that.
+    -- Iterating yields key, value.
+    --
+    -- A key that cannot be converted yields a placeholder rather than ending
+    -- the iteration. Ending it made a map that holds entries render as {},
+    -- which is indistinguishable from an empty one: SummonContainer.ByTag
+    -- holds two tagged entries whose FixedString keys bg3le cannot read, and
+    -- it dumped as empty. The values are perfectly reachable, so hiding them
+    -- was the worst of the options -- a placeholder is visible, stopping was
+    -- not.
     __pairs = function(self)
       local i = -1
       return function()
         i = i + 1
         if i >= count() then return nil end
         local k = key_at(i)
-        if k == nil then return nil end
+        if k == nil then k = "<unreadable key " .. i .. ">" end
         return k, value_at(i)
       end, self, nil
     end,

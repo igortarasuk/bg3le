@@ -226,12 +226,21 @@ check("Entries count", #m.Entries(), 3)
 check("Entries[1].Key", m.Entries()[1].Key, "alpha")
 check("Entries[1].Value", m.Entries()[1].Value, 10)
 
+-- A key that cannot be converted must not hide its entry. Ending the
+-- iteration there made a map with entries render as {}, which is
+-- indistinguishable from an empty one -- that is how SummonContainer.ByTag,
+-- which holds two entries under FixedString keys, dumped as empty.
 keysConvertible = false
-check("pairs stops when keys cannot convert", (function()
-  local n = 0
-  for _ in pairs(m) do n = n + 1 end
-  return n
-end)(), 0)
+local placeholders = 0
+local valuesSeen = 0
+for k, v in pairs(m) do
+  valuesSeen = valuesSeen + 1
+  if type(k) == "string" and k:find("unreadable", 1, true) then
+    placeholders = placeholders + 1
+  end
+end
+check("pairs still yields every entry", valuesSeen, 3)
+check("unreadable keys become placeholders", placeholders, 3)
 check("Entries still returns the values", #m.Entries(), 3)
 check("Entries[2].Value without keys", m.Entries()[2].Value, 99)
 keysConvertible = true

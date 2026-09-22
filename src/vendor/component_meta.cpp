@@ -84,6 +84,32 @@ struct ArrayTraits<std::array<T, N>> {
     static constexpr std::size_t kCount = N;
 };
 
+// glm's vectors and quaternions are fixed runs of floats, and they carry
+// everything positional in the engine -- Bound.Translate is a glm::vec3, so
+// without this the position of anything in the world reads as unsupported.
+// They are plain aggregates, so they read exactly as a fixed-extent array
+// does.
+template <class T>
+struct GlmTraits {
+    static constexpr bool kIsGlm = false;
+    using Elem = void;
+    static constexpr std::size_t kCount = 0;
+};
+
+template <glm::length_t N, class T, glm::qualifier Q>
+struct GlmTraits<glm::vec<N, T, Q>> {
+    static constexpr bool kIsGlm = true;
+    using Elem = T;
+    static constexpr std::size_t kCount = (std::size_t)N;
+};
+
+template <class T, glm::qualifier Q>
+struct GlmTraits<glm::qua<T, Q>> {
+    static constexpr bool kIsGlm = true;
+    using Elem = T;
+    static constexpr std::size_t kCount = 4;
+};
+
 // bg3se's Array is the engine's dynamically sized array. Its length and buffer
 // members are private, so they are reached through size() and data(), which
 // are public and constexpr -- instantiated per field type below, so no member
@@ -208,6 +234,13 @@ constexpr FieldKind kind_of() {
         } else {
             return FieldKind::Unsupported;
         }
+    } else if constexpr (GlmTraits<T>::kIsGlm) {
+        if constexpr (scalar_kind_of<typename GlmTraits<T>::Elem>()
+                      != FieldKind::Unsupported) {
+            return FieldKind::ScalarArray;
+        } else {
+            return FieldKind::Unsupported;
+        }
     } else if constexpr (VectorTraits<T>::kIsVector
                          || SetTraits<T>::kIsSet) {
         return FieldKind::DynArray;
@@ -274,6 +307,10 @@ constexpr FieldDesc make_field(char const* name, std::size_t offset) {
         using E = typename ArrayTraits<T>::Elem;
         describe_elements.template operator()<E>();
         f.ElemCount = (std::uint16_t)ArrayTraits<T>::kCount;
+    } else if constexpr (GlmTraits<T>::kIsGlm) {
+        using E = typename GlmTraits<T>::Elem;
+        describe_elements.template operator()<E>();
+        f.ElemCount = (std::uint16_t)GlmTraits<T>::kCount;
     } else if constexpr (VectorTraits<T>::kIsVector) {
         using E = typename VectorTraits<T>::Elem;
         describe_elements.template operator()<E>();

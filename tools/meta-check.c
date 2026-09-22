@@ -259,6 +259,13 @@ int main(int argc, char** argv) {
     expect_absent("eoc::ActionResourcesComponent", "Resources.Amount");
     expect_kind("eoc::ActionResourcesComponent", "Resources", 17);  // Map
 
+    // glm vectors carry everything positional, and they are the reason
+    // Bound.Translate read as unsupported until they were recognised. A vec3
+    // is three floats; kind 14 is a fixed-extent array.
+    expect_kind("eoc::BoundComponent", "Bound.Translate", 14);
+    expect_kind("eoc::BoundComponent", "Bound.RotationQuat", 14);
+    expect_kind("eoc::BoundComponent", "Bound.Scale", 2);  // plain float
+
     // Hash sets read as arrays of their keys.
     expect_kind("eoc::summon::ContainerComponent", "Characters", 16);  // DynArray
 
