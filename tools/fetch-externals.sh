@@ -33,7 +33,14 @@ else
          -o noesis.zip
     mkdir -p Noesis
     # GNU tar cannot read zip archives; on Windows tar is bsdtar, which can.
-    bsdtar -xf noesis.zip -C Noesis
+    # Debian's libarchive-tools package (bsdtar) has had unresolvable
+    # dependency pins on some mirrors, so fall back to unzip, which every
+    # Debian-based build image carries without friction.
+    if command -v bsdtar >/dev/null 2>&1; then
+        bsdtar -xf noesis.zip -C Noesis
+    else
+        unzip -q noesis.zip -d Noesis
+    fi
     rm noesis.zip
 fi
 

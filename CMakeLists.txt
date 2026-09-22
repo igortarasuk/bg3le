@@ -45,7 +45,10 @@ add_link_options(-stdlib=libc++ -nostdlib++ -static-libgcc)
 
 find_library(LIBCXX_STATIC NAMES libc++.a REQUIRED)
 find_library(LIBCXXABI_STATIC NAMES libc++abi.a REQUIRED)
-link_libraries(${LIBCXX_STATIC} ${LIBCXXABI_STATIC})
+# glibc 2.31 (Debian 11 / Steam Runtime sniper) still ships pthread_*
+# symbols in libpthread rather than folded into libc (that merge landed in
+# glibc 2.34), so libc++'s threading support needs it named explicitly.
+link_libraries(${LIBCXX_STATIC} ${LIBCXXABI_STATIC} pthread)
 
 # ---------------------------------------------------------------------------
 # Lua (Norbyte's fork; see external/lua/README.bg3le)
@@ -215,6 +218,7 @@ list(APPEND ABSL_LIBS ${EXTERNAL}/protobuf/build/third_party/utf8_range/libutf8_
 
 target_include_directories(bg3se_vendor PRIVATE
     ${EXTERNAL}/protobuf/src
+    ${EXTERNAL}/protobuf/third_party/utf8_range
     ${ABSL_PREFIX}/include)
 
 # The abseil archives are mutually dependent, so a single left-to-right pass
