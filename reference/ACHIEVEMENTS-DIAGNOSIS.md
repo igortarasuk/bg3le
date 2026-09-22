@@ -131,13 +131,114 @@ disassembly. `os`/`io` are unrestricted from that Lua VM (`os.execute`,
 `Ext.Mod` is currently empty (`{}`) -- `ModManager`/`EoCServer` access isn't
 implemented yet, consistent with them having no name to resolve by.
 
+## `EoCServer` found -- the vendored offsets are correct after all
+
+First attempt was wrong in an instructive way: `preload.cpp`'s server-tick
+hook (`update_messages_hook`, `kUpdateMessagesFunc = 0x7077120`) does **not**
+receive `esv::GameServer*` despite the existing comment above it -- its `self`
+disassembles to a mutex-protected ring-buffer flush (fields at
+`+0x790..+0x7d0`, a `pthread_mutex_t` at `+0x7a8`), i.e. some low-level
+outbound-message queue, not the class in `GameDefinitions/Net.h`. Computing
+`EoCServer = self - 168` from that gave garbage (`Mods.count` in the billions).
+The offsets themselves were not the problem -- the pointer was.
+
+The real path, found by disassembling `esv::LoadProtocol::LoadSavegame`
+(`0x41e6ee0`) past its entry (which is mostly a contract-check preamble
+referencing its own `__FUNCTION__` string -- confirms the address is
+genuinely that function):
+
+```
+41e7486: mov  r12, QWORD PTR [rip+0x39a536b]   ; r12 = *(bg3+0x7b8c7f8) -- a real global pointer, EoCServer*
+41e748d: lea  rdi, [r12+0xd0]                  ; rdi = EoCServer + 0xD0 == ModManager (matches offsetof exactly)
+41e7495: mov  rsi, r15
+41e7498: call 0x4285940
+41e749d: add  r12, 0x268                       ; r12 = EoCServer + 0x268 == ModManager+0xD0+Settings+0x198, i.e. &ModuleSettings
+41e74a4: test r14, r14                         ; r14 = the settings-argument (often NULL, see below)
+41e74a7: cmovne r12, r14                       ; ...only overridden when a non-null one was actually passed in
+```
+
+`0xD0 + 0x198 = 0x268` exactly, so this independently confirms
+`offsetof(EoCServer, ModManager) = 0xD0` and `offsetof(ModManager, Settings) =
+0x198` from `tools/offset_dump.cpp` (see below) -- the vendored struct
+layouts are correct for this binary; the earlier failure was purely a wrong
+`self` pointer, not a wrong offset.
+
+**`bg3+0x7b8c7f8` (add the session's load bias) holds a live, dereferenceable
+`EoCServer*`, independent of any hook.** Verified end-to-end from the debug
+console with no gdb involved, just `/proc/self/mem` reads from Lua:
+
+```
+g_root_loc = bias + 0x7b8c7f8
+eocserver  = *(u64*)g_root_loc
+modsettings = eocserver + 0x268
+mods_buf   = *(u64*)(modsettings + 8)     -- Array<ModuleShortDesc>::buf
+mods_count = *(u32*)(modsettings + 16)    -- Array<ModuleShortDesc>::size
+```
+
+Result on this machine, in an active session: `mods_count = 12`. Dumping the
+96-byte `ModuleShortDesc` entries (`Guid ModuleUUID` at `entry+8`, matching
+`offsetof(ModuleShortDesc, ModuleUUID) = 8`; `STDString Name` follows at
+`entry+24`, readable inline via libc++ SSO for short names) shows real,
+sane data -- entry 0 is `GustavX` (an official module), entry 3 is
+`FaerunColors` (an actual installed Nexus mod on this machine). This is
+about as strong a confirmation as static analysis can give without a
+debugger: the whole `EoCServer -> ModManager -> Settings -> Mods` chain is
+real and correctly offset.
+
+`tools/offset_dump.cpp` (new, throwaway, not part of the CMake build) gets
+these numbers straight from the vendored headers via a deliberate
+`Show<offsetof(...)>` template-instantiation error, sidestepping the link
+failure `GameState.h`'s Noesis dependency causes in a standalone TU:
+
+```
+sizeof(esv::EoCServer) = 696         EoCServer::EntityWorld  = 648
+EoCServer::GameServer  = 168         sizeof(ModManager)      = 432
+EoCServer::GameStateMachine = 160    ModManager::Settings    = 408 (0x198)
+EoCServer::ModManager  = 208 (0xD0)  ModManager::BaseModule  = 56
+sizeof(ModuleSettings) = 24          ModuleSettings::Mods    = 8
+sizeof(ModuleShortDesc) = 96         ModuleShortDesc::ModuleUUID = 8
+```
+
+## What did *not* work: catching the actual read/comparison live
+
+Wanted a hardware watchpoint or breakpoint to catch the code that actually
+computes "is this session modded" red-handed, instead of guessing at the
+byte pattern. None of the following fired, across a real, active game
+session with `sudo gdb -p <pid>`:
+
+- **`rwatch`** on the static official-GUID table entry found earlier (the
+  hashmap/tree-node-shaped live copy of `d65cf1b6-...`, found by a chunked
+  `/proc/self/mem` scan for its raw 16-byte encoding rather than the far too
+  common ASCII "Gustav") -- survived opening the save/load menu and a Quick
+  Save untouched.
+- **`rwatch`** on the live `Mods.count` field itself (`modsettings+16`) --
+  survived two Quick Saves.
+- **`break`** on `esv::LoadProtocol::LoadSavegame` (`0x41e6ee0`) -- fired
+  twice (once from an in-session Load, once from a cold main-menu Load), but
+  its third argument (the nullable `ModuleSettings const*` override, `r14` in
+  the disassembly above) was `NULL` both times, meaning this call site relies
+  on the `EoCServer`-derived default rather than passing settings explicitly.
+- **`break`** on `esv::LoadProtocol::LoadModule` (`0x6efd8b0`) -- never fired,
+  neither for a cold main-menu Load nor for opening the in-game Mods screen
+  (which does visibly spawn ~16 worker threads, so it does real work, just
+  not through this address).
+
+Working theory: whatever produces the modded/not-modded verdict runs once,
+early, at true session bootstrap (first load after the process starts, or
+character creation) and the result gets cached -- reloading the *same*
+already-established session, or browsing the Mods screen, doesn't
+recompute it. Everything tried above was against an already-running,
+already-loaded session.
+
 ## Next step
 
-Same technique as `ecs_world.cpp`'s `EntityStorageContainer` capture: find a
-stable instruction pattern that reaches `EoCServer` (or `ModManager`
-directly) and hook/capture it once, the way the entity-storage lookup was
-found by disassembling a known caller. Candidates to disassemble from:
-`esv::LoadProtocol::LoadModule` (`0x6efd8b0`) definitely receives a
-`ModuleSettings const&`, so tracing its caller chain backwards is one route
-in; the "server tick" hook already installed (`preload.cpp`) is another
-possible anchor if its argument turns out to be (or lead to) `EoCServer`.
+Relaunch the game fresh and set the `LoadModule` breakpoint (or an `rwatch`
+on `Mods.count`) *before* loading anything at all -- i.e. catch the very
+first module load of the process's life, at the main menu's initial
+"Continue"/"Load", rather than a reload of an already-active session. If
+that still doesn't fire, `HandleModuleLoaded` (`0x40150b0`) and
+`LoadModuleAndLevel` (`0x41e7760`) are the two remaining named candidates
+that take `ModuleSettings const&`. Now that `bg3+0x7b8c7f8` gives a reliable,
+hook-free `EoCServer*`, a `rwatch` on `*(EoCServer+0x268+16)` (the live
+`Mods.count`, computed fresh each session since the bias changes) is the
+most direct version of this to set up next time, ahead of that first load.
