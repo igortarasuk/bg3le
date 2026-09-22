@@ -2891,7 +2891,71 @@ local function read_attribute(addr, i)
   return name, value, STAT_KIND[kind] or "Unknown", typeName, raw
 end
 
--- Ext.Stats.Get(name) -> table of attributes, or nil plus a reason
+-- A stat object, shaped the way upstream shapes one.
+--
+-- Upstream returns a userdata proxy carrying bound methods and mod
+-- provenance, not a plain table, and a mod written against it may call
+-- stat:Sync() or read stat.ModId. Returning a table would make those fail
+-- with "attempt to call a nil value", so this is a proxy with a metatable:
+-- the attributes read through __index, the methods exist, and __pairs
+-- enumerates both so a dump looks like upstream's.
+--
+-- The methods raise rather than pretend. Writing a stat needs
+-- RPGStats::SyncWithPrototypeManager and the parse buffers behind it, none
+-- of which bg3le reaches yet, and a silent no-op would be worse than an
+-- error a mod author can read.
+local STAT_NOT_WRITABLE =
+  "bg3le cannot write stats yet; %s needs the engine's stat sync path, " ..
+  "which is not implemented"
+
+local function stat_method(name)
+  return function() error(string.format(STAT_NOT_WRITABLE, name), 2) end
+end
+
+local STAT_METHODS = {
+  Sync = stat_method("Sync"),
+  SetPersistence = stat_method("SetPersistence"),
+  SetRawAttribute = stat_method("SetRawAttribute"),
+  CopyFrom = stat_method("CopyFrom"),
+}
+
+local stat_proxy = {}
+stat_proxy.__index = function(self, key)
+  local m = STAT_METHODS[key]
+  if m ~= nil then return m end
+  return rawget(self, "__fields")[key]
+end
+
+stat_proxy.__newindex = function(_, key, _)
+  error(string.format(STAT_NOT_WRITABLE, "assigning " .. tostring(key)), 2)
+end
+
+-- Enumerates methods alongside fields, which is what makes a dump match:
+-- upstream prints Sync, SetPersistence, SetRawAttribute and CopyFrom as
+-- function entries next to the attributes.
+stat_proxy.__pairs = function(self)
+  local fields = rawget(self, "__fields")
+  local keys = {}
+  for k in pairs(fields) do keys[#keys + 1] = k end
+  for k in pairs(STAT_METHODS) do keys[#keys + 1] = k end
+  table.sort(keys)
+
+  local i = 0
+  return function()
+    i = i + 1
+    local k = keys[i]
+    if k == nil then return nil end
+    return k, STAT_METHODS[k] or fields[k]
+  end
+end
+
+stat_proxy.__name = "Stat"
+
+local function make_stat(fields)
+  return setmetatable({__fields = fields}, stat_proxy)
+end
+
+-- Ext.Stats.Get(name) -> stat object, or nil plus a reason
 function Ext.Stats.Get(name)
   if type(name) ~= "string" then
     return nil, "Ext.Stats.Get takes a stat name"
@@ -2900,31 +2964,33 @@ function Ext.Stats.Get(name)
   local addr, err = Ext._Internal.StatsFind(name)
   if addr == nil then return nil, err end
 
-  local out = {Name = name}
+  local fields = {Name = name}
   local n = Ext._Internal.StatsAttrCount(addr)
   for i = 0, n - 1 do
     local attr, value = read_attribute(addr, i)
-    if attr ~= nil then out[attr] = value end
+    if attr ~= nil then fields[attr] = value end
   end
 
   -- An empty attribute set means the discovery did not land, which is worth
   -- saying rather than returning a lone name that looks complete.
   if n == 0 then
-    out.AttributesUnavailable =
+    fields.AttributesUnavailable =
       "no attributes readable; see the stats lines in the extender log"
-    return out
+    return make_stat(fields)
   end
 
   -- Fields upstream puts alongside the attributes. Names and shapes follow
   -- reference/stats-weapon.txt rather than being chosen here.
-  out.ModifierList = Ext._Internal.StatsType(addr)
-  out.ModifierListIndex = Ext._Internal.StatsListIndex(addr)
-  out.Using = Ext._Internal.StatsUsing(addr) or ""
-  -- Sets on the object itself, which are not located yet; upstream reports
-  -- them as arrays and they are empty far more often than not.
-  out.ComboCategories = {}
-  out.ComboProperties = {}
-  return out
+  --
+  -- ModId and OriginalModId are absent on purpose: they are real mod GUIDs
+  -- upstream, bg3le has no mod manager yet, and an empty string would be a
+  -- wrong answer rather than a missing one.
+  fields.ModifierList = Ext._Internal.StatsType(addr)
+  fields.ModifierListIndex = Ext._Internal.StatsListIndex(addr)
+  fields.Using = Ext._Internal.StatsUsing(addr) or ""
+  fields.ComboCategories = {}
+  fields.ComboProperties = {}
+  return make_stat(fields)
 end
 
 -- Ext.Stats.GetTypes(name) -> { attribute = type, ... }
