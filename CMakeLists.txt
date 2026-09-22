@@ -243,6 +243,7 @@ add_library(bg3le SHARED
     src/fast_alloc.cpp
     src/win_compat.cpp
     src/affinity.cpp
+    src/vulkan_memory.cpp
 )
 # vulkan and SDL2 resolve from the host process, which has both loaded before
 # bg3le is.
