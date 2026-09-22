@@ -1147,6 +1147,14 @@ extern "C" char const* bg3le_stats_using(void const* object) {
     return bg3le_stats_name(parent);
 }
 
+// Where ModifierListIndex sits on an Object, as derived from the value
+// counts. stats_functors.cpp checks this against the property maps before
+// trusting the rest of the member walk.
+extern "C" std::size_t bg3le_stats_list_index_offset() {
+    Found const& f = state();
+    return f.Attributes ? f.ListIndexOffset : 0;
+}
+
 // The index of the modifier list this stat uses, or -1.
 extern "C" int bg3le_stats_list_index(void const* object) {
     Found const& f = state();

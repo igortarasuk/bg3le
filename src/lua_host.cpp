@@ -821,11 +821,19 @@ bool push_enum(lua_State* L, void const* meta, const char* path,
             matched |= value;
         }
     }
-    // Any bits the table does not describe are reported as a leftover number,
-    // so a flag the metadata is missing does not vanish.
+    // Bits the table does not name are dropped, because upstream drops
+    // them: a functor whose Flags byte is 112 reports an empty array there,
+    // since FunctorFlags only names 1, 2 and 4. Appending the leftover as a
+    // number kept the information but put an element in the array that no
+    // mod written against bg3se expects. Logged once instead, so it is not
+    // lost either.
     if ((raw & ~matched) != 0) {
-        lua_pushinteger(L, (lua_Integer)(raw & ~matched));
-        lua_rawseti(L, -2, ++n);
+        static std::uint64_t reported = 0;
+        if ((raw & ~matched & ~reported) != 0) {
+            reported |= raw & ~matched;
+            logf("meta: %s has bits %#llx that its enumeration does not "
+                 "name", path, (unsigned long long)(raw & ~matched));
+        }
     }
     return true;
 }
@@ -1069,6 +1077,25 @@ extern "C" char const* bg3le_stats_attr_string(int raw);
 extern "C" char const* bg3le_stats_attr_translated(int raw);
 extern "C" char const* bg3le_stats_attr_condition(int raw);
 extern "C" char const* bg3le_stats_ai_flags(void const* object);
+extern "C" int bg3le_stats_functor_groups(void const* object,
+                                          char const* attribute);
+extern "C" bool bg3le_stats_functor_group_at(void const* object,
+                                             char const* attribute,
+                                             int index,
+                                             char const** textKeyOut,
+                                             void** functorsOut);
+extern "C" int bg3le_stats_functor_count(void const* functors);
+extern "C" void* bg3le_stats_functor_at(void const* functors, int index);
+extern "C" char const* bg3le_stats_functor_class(void const* functor);
+extern "C" char const* bg3le_stats_object_condition(void const* object,
+                                                    char const* className,
+                                                    char const* field);
+extern "C" void* bg3le_stats_object_expression(void const* object,
+                                               char const* className,
+                                               char const* field);
+extern "C" char const* bg3le_stats_expression_code(void const* pooled);
+extern "C" bool bg3le_stats_expression_refcount(void const* pooled,
+                                                int* out);
 extern "C" int bg3le_stats_roll_condition_count(void const* object,
                                                 char const* attribute);
 extern "C" bool bg3le_stats_roll_condition_at(void const* object,
@@ -1529,6 +1556,87 @@ int l_stats_attr_condition(lua_State* L) {
         bg3le_stats_attr_condition((int)luaL_checkinteger(L, 1));
     if (text == nullptr) return 0;
     lua_pushstring(L, text);
+    return 1;
+}
+
+// Ext._Internal.ObjectCondition(address, class, field) -> expression text
+int l_object_condition(lua_State* L) {
+    auto const* object =
+        (void const*)(std::uintptr_t)luaL_checkinteger(L, 1);
+    char const* text = bg3le_stats_object_condition(
+        object, luaL_checkstring(L, 2), luaL_checkstring(L, 3));
+    if (text == nullptr) return 0;
+    lua_pushstring(L, text);
+    return 1;
+}
+
+// Ext._Internal.ObjectExpression(address, class, field)
+//   -> pooled address, code, refcount
+int l_object_expression(lua_State* L) {
+    auto const* object =
+        (void const*)(std::uintptr_t)luaL_checkinteger(L, 1);
+    void* pooled = bg3le_stats_object_expression(
+        object, luaL_checkstring(L, 2), luaL_checkstring(L, 3));
+    if (pooled == nullptr) return 0;
+
+    char const* code = bg3le_stats_expression_code(pooled);
+    int refCount = 0;
+    if (code == nullptr || !bg3le_stats_expression_refcount(pooled,
+                                                            &refCount)) {
+        return 0;
+    }
+
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)pooled);
+    lua_pushstring(L, code);
+    lua_pushinteger(L, refCount);
+    return 3;
+}
+
+// Ext._Internal.StatsFunctorGroups(address, attribute)
+//   -> { {TextKey, Functors}, ... } where Functors is a list of
+//      {address, class} pairs for the prelude to read reflectively.
+//
+// nil when the attribute carries no functors, which upstream reports as
+// null rather than as an empty list.
+int l_stats_functor_groups(lua_State* L) {
+    auto const* object =
+        (void const*)(std::uintptr_t)luaL_checkinteger(L, 1);
+    char const* attribute = luaL_checkstring(L, 2);
+
+    const int groups = bg3le_stats_functor_groups(object, attribute);
+    if (groups < 0) return 0;
+
+    lua_createtable(L, groups, 0);
+    for (int g = 0; g < groups; ++g) {
+        char const* textKey = nullptr;
+        void* functors = nullptr;
+        if (!bg3le_stats_functor_group_at(object, attribute, g, &textKey,
+                                          &functors)) {
+            continue;
+        }
+
+        lua_createtable(L, 0, 2);
+        lua_pushstring(L, textKey != nullptr ? textKey : "");
+        lua_setfield(L, -2, "TextKey");
+
+        const int count = bg3le_stats_functor_count(functors);
+        lua_createtable(L, count < 0 ? 0 : count, 0);
+        for (int i = 0; i < count; ++i) {
+            void* functor = bg3le_stats_functor_at(functors, i);
+            char const* className = bg3le_stats_functor_class(functor);
+            if (functor == nullptr || className == nullptr) continue;
+
+            lua_createtable(L, 0, 2);
+            lua_pushinteger(L, (lua_Integer)(std::uintptr_t)functor);
+            lua_setfield(L, -2, "Address");
+            lua_pushstring(L, className);
+            lua_setfield(L, -2, "Class");
+            lua_rawseti(L, -2, i + 1);
+        }
+        lua_setfield(L, -2, "Functors");
+
+        lua_rawseti(L, -2, g + 1);
+    }
     return 1;
 }
 
@@ -2463,6 +2571,12 @@ void lua_init() {
     lua_setfield(g_lua, -2, "StatsAttrTranslated");
     lua_pushcfunction(g_lua, l_stats_attr_condition);
     lua_setfield(g_lua, -2, "StatsAttrCondition");
+    lua_pushcfunction(g_lua, l_object_condition);
+    lua_setfield(g_lua, -2, "ObjectCondition");
+    lua_pushcfunction(g_lua, l_object_expression);
+    lua_setfield(g_lua, -2, "ObjectExpression");
+    lua_pushcfunction(g_lua, l_stats_functor_groups);
+    lua_setfield(g_lua, -2, "StatsFunctorGroups");
     lua_pushcfunction(g_lua, l_stats_ai_flags);
     lua_setfield(g_lua, -2, "StatsAIFlags");
     lua_pushcfunction(g_lua, l_stats_roll_conditions);
@@ -3178,6 +3292,33 @@ local STAT_KIND = {
 Ext.Stats = {}
 
 -- One attribute, decoded as far as its type allows.
+-- A functor, with the two field types the property maps mark unsupported
+-- filled in: a ConditionId resolves against the condition pool, and a
+-- StatsExpressionRef is a pointer to a pooled expression whose Code,
+-- Params and RefCount upstream reports as a table.
+local function read_functor(address, class)
+  local out = Ext._Internal.ReadObject(address, class, "", {})
+  for field, value in pairs(out) do
+    if value == "<unsupported>" then
+      local condition = Ext._Internal.ObjectCondition(address, class, field)
+      if condition ~= nil then
+        out[field] = condition
+      else
+        local pooled, code, refCount =
+          Ext._Internal.ObjectExpression(address, class, field)
+        if pooled ~= nil then
+          local expression = Ext._Internal.ReadObject(
+            pooled, "StatsExpressionPooled", "", {})
+          expression.Code = code
+          expression.RefCount = refCount
+          out[field] = expression
+        end
+      end
+    end
+  end
+  return out
+end
+
 local function read_attribute(addr, i)
   local name, typeName, kind, raw = Ext._Internal.StatsAttrAt(addr, i)
   if name == nil then return nil end
@@ -3232,7 +3373,24 @@ local function read_attribute(addr, i)
     -- value for a stat with no requirements, which most have.
     value = {}
   elseif kind == 7 then
-    value = nil                      -- StatsFunctors: not read yet
+    -- Each group is a text key and a list of functors. A functor is a
+    -- polymorphic engine object, and its concrete class is in the same
+    -- property maps the resource reader uses, so the fields come out the
+    -- same way rather than being special-cased here.
+    local groups = Ext._Internal.StatsFunctorGroups(addr, name)
+    if groups == nil then
+      value = nil
+    else
+      local out = {}
+      for gi, group in ipairs(groups) do
+        local functors = {}
+        for fi, f in ipairs(group.Functors) do
+          functors[fi] = read_functor(f.Address, f.Class)
+        end
+        out[gi] = {TextKey = group.TextKey, Functors = functors}
+      end
+      value = out
+    end
   elseif kind == 8 then
     -- Conditions, TargetConditions and UseConditions index the condition
     -- pool. Upstream's Object::GetString falls back to "" when the lookup
@@ -3440,40 +3598,65 @@ function Ext._Internal.StatsTotal() return Ext._Internal.StatsCount() end
 -- only the base address comes from elsewhere. A kind bg3le cannot convert
 -- arrives as a marker rather than being dropped, for the reason it does
 -- everywhere else.
-local function read_object(addr, class, prefix, out)
+local read_object
+
+-- One value at a path inside a reflected object.
+--
+-- Split out of read_object so that array elements go through the same
+-- resolution as fields do. That is what makes a variant readable: an
+-- element of StatsExpressionPooled.Params is a variant, and only its live
+-- alternative has bytes, so which one that is has to be asked for at
+-- runtime rather than derived.
+local function read_object_path(addr, class, path, kind)
+  if kind == "variant" or kind == "unsupported" then
+    -- Only the alternative a variant currently holds has bytes, so which
+    -- one that is gets asked for at runtime rather than derived. An
+    -- out-of-range answer means the metadata and the object disagree, and
+    -- nil is the safe reading -- better than decoding the bytes as an
+    -- alternative they are not.
+    local active, count = Ext._Internal.ObjectVariantIndex(addr, class, path)
+    if active == nil then return "<unsupported>" end
+    if active >= count then return nil end   -- a valueless variant
+    return read_object_path(addr, class, path .. "[" .. active .. "]",
+                            Ext._Internal.ObjectFieldInfo(class,
+                              path .. "[" .. active .. "]"))
+  end
+
+  if kind == "struct" then
+    return read_object(addr, class, path, {})
+  end
+
+  if kind == "array" then
+    local count = Ext._Internal.ObjectArrayInfo(addr, class, path)
+    local items = {}
+    for i = 0, (count or 0) - 1 do
+      local element = path .. "[" .. i .. "]"
+      items[i + 1] = read_object_path(addr, class, element,
+                                      Ext._Internal.ObjectFieldInfo(
+                                        class, element))
+    end
+    return items
+  end
+
+  local value, err = Ext._Internal.ObjectGetField(addr, class, path)
+  if value == nil and err ~= nil then return "<unreadable>" end
+  return value
+end
+
+function read_object(addr, class, prefix, out)
   local fields, err = Ext._Internal.ObjectFields(class, prefix)
   if fields == nil then error("bg3le: " .. tostring(err), 0) end
 
   for name, kind in pairs(fields) do
     local path = (prefix == "") and name or (prefix .. "." .. name)
-    if kind == "unsupported" then
-      out[name] = "<unsupported>"
-    elseif kind == "struct" then
-      out[name] = read_object(addr, class, path, {})
-    elseif kind == "array" then
-      local count = Ext._Internal.ObjectArrayInfo(addr, class, path)
-      local items = {}
-      for i = 0, (count or 0) - 1 do
-        local value, ferr = Ext._Internal.ObjectGetField(
-          addr, class, path .. "[" .. i .. "]")
-        if value == nil and ferr ~= nil then
-          items[i + 1] = "<unreadable>"
-        else
-          items[i + 1] = value
-        end
-      end
-      out[name] = items
-    else
-      local value, ferr = Ext._Internal.ObjectGetField(addr, class, path)
-      if value == nil and ferr ~= nil then
-        out[name] = "<unreadable>"
-      else
-        out[name] = value
-      end
-    end
+    out[name] = read_object_path(addr, class, path, kind)
   end
   return out
 end
+
+-- Published so the stats code can reach it. The prelude is compiled in more
+-- than one chunk, so a local here is not in scope there.
+Ext._Internal.ReadObject = read_object
 
 Ext.StaticData = {}
 
