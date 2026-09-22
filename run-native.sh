@@ -76,6 +76,14 @@ fi
 # breaks perf symbolization and DWARF unwinding -- the reason several profiles
 # this session could not name a single frame. GameMode also cannot find
 # libgamemode.so or the session bus in there.
+# CONTINUE=1 loads the last save straight from the launch rather than
+# stopping at the main menu. The debugger only reaches the story thread once
+# a save is up, so anything driving bg3lua from a script wants this.
+args=("$@")
+if [ "${CONTINUE:-0}" = "1" ]; then
+    args=(-continueGame "${args[@]}")
+fi
+
 if [ "${SNIPER:-1}" = "0" ]; then
     COMPAT="$(cd "$HERE/.." && pwd)/compat-libs"
     if [ ! -f "$COMPAT/libssl.so.1.1" ]; then
@@ -83,9 +91,9 @@ if [ "${SNIPER:-1}" = "0" ]; then
         exit 1
     fi
     export LD_LIBRARY_PATH="$COMPAT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    launch=(./bin/bg3 "$@")
+    launch=(./bin/bg3 "${args[@]}")
 else
-    launch=("$SNIPER_DIR/run" -- ./bin/bg3 "$@")
+    launch=("$SNIPER_DIR/run" -- ./bin/bg3 "${args[@]}")
 fi
 
 # GameMode is off unless asked for, because it does not work here and says so
