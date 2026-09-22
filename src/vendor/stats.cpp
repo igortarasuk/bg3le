@@ -260,6 +260,7 @@ struct Found {
     ArrayRef Strings{};                 // RPGStats::FixedStrings
     ArrayRef Floats{};                  // RPGStats::Floats
     ArrayRef Guids{};                   // RPGStats::GUIDs
+    ArrayRef Int64s{};                  // RPGStats::Int64s
     bool Attributes{false};             // whether all of the above landed
 };
 
@@ -391,6 +392,27 @@ bool find_modifier_name_offset(ArrayRef const& lists, std::size_t* out,
         }
     }
     logf("stats: could not place Modifier::Name; attributes stay unavailable");
+    return false;
+}
+
+// The value lists upstream treats as flag sets rather than plain
+// enumerations (RPGEnumeration::IsFlagType). A flags value is an index into
+// the Int64s pool whose contents are a bitmask, not a label index, which is
+// why an exact label lookup finds nothing for them.
+constexpr char const* kFlagTypes[] = {
+    "AttributeFlags",      "WeaponFlags",       "ResistanceFlags",
+    "PassiveFlags",        "SpellFlagList",     "StatusEvent",
+    "StatusPropertyFlags", "ProficiencyGroupFlags",
+    "CinematicArenaFlags", "LineOfSightFlags",  "SpellCategoryFlags",
+    "StatsFunctorContext"};
+constexpr std::size_t kFlagTypeCount =
+    sizeof(kFlagTypes) / sizeof(kFlagTypes[0]);
+
+bool is_flag_type(char const* name) {
+    if (name == nullptr) return false;
+    for (std::size_t i = 0; i < kFlagTypeCount; ++i) {
+        if (std::strcmp(name, kFlagTypes[i]) == 0) return true;
+    }
     return false;
 }
 
@@ -537,8 +559,20 @@ void find_value_pools(unsigned long long poolAddr, Found* f) {
     // time looks exactly like non-zero guids. The order is
     // FixedStrings, Int64s, GUIDs, Floats, and floats landing at +48 on the
     // first run is what confirms it.
+    // Int64s comes first in the member order, and it is what flag values
+      // index into -- upstream's Object::GetFlags reads
+      // GetStats()->GetInt64(index) and treats the result as a bitmask.
+    constexpr std::size_t kInt64sAt = 16;
     constexpr std::size_t kGuidsAt = 32;
     constexpr std::size_t kFloatsAt = 48;
+
+    ArrayRef int64s{};
+    if (array_header_at((void const*)(poolAddr + kInt64sAt), &int64s)
+        && int64s.Size > 0) {
+        f->Int64s = int64s;
+        logf("stats: int64 pool at pool+%zu, %u entries", kInt64sAt,
+             int64s.Size);
+    }
 
     ArrayRef guids{};
     if (array_header_at((void const*)(poolAddr + kGuidsAt), &guids)
@@ -923,7 +957,7 @@ int property_type(void const* enumeration) {
     if (std::strcmp(text, "Requirements") == 0) return 10;
     if (std::strcmp(text, "MemorizationRequirements") == 0) return 11;
     if (std::strcmp(text, "TranslatedString") == 0) return 12;
-    return 4;                                                    // Enumeration
+    return is_flag_type(text) ? 5 : 4;         // Flags or Enumeration
 }
 
 }  // namespace
@@ -1012,6 +1046,58 @@ extern "C" char const* bg3le_stats_attr_label(void const* object,
         if (pair.Value == raw) return text_of(pair.Key);
     }
     return nullptr;
+}
+
+// A flag set's labels, joined by semicolons.
+//
+// Straight from upstream's Object::GetFlags: the attribute's raw value is an
+// index into the Int64s pool, whose entry is a pointer to the mask, and a
+// label belongs in the set when bit (value - 1) is set. The minus one is the
+// part no amount of staring at the numbers would have produced -- decomposing
+// the raw value as a bitmask over the label values gave a longsword
+// proficient in clubs and light armour.
+extern "C" bool bg3le_stats_attr_flags(void const* object, std::size_t index,
+                                       int raw, char* out,
+                                       std::size_t capacity) {
+    Found const& f = state();
+    if (out == nullptr || capacity == 0) return false;
+    out[0] = '\0';
+    if (raw < 0 || f.Int64s.Buffer == nullptr) return false;
+    if ((std::size_t)raw >= f.Int64s.Size) return false;
+
+    std::int64_t const* slot = nullptr;
+    if (!read_as((char const*)f.Int64s.Buffer + (std::size_t)raw
+                     * sizeof(void*), &slot)) {
+        return false;
+    }
+    if (slot == nullptr) return false;
+    std::uint64_t mask = 0;
+    if (!read_as(slot, &mask)) return false;
+
+    void const* mod = modifier_at(object, index);
+    void const* en = enumeration_for(mod);
+    if (en == nullptr) return false;
+
+    auto const* map = (bg3se::LegacyMap<bg3se::FixedString, std::int32_t> const*)
+        ((char const*)en + f.ValueNameOffset + 8);
+
+    std::size_t used = 0;
+    for (auto const& pair : *map) {
+        // Value zero is an entry like "None = 0" and never belongs in a set.
+        if (pair.Value == 0) continue;
+        if ((mask & (1ull << (pair.Value - 1))) == 0) continue;
+        char const* label = text_of(pair.Key);
+        if (label == nullptr) continue;
+
+        const std::size_t len = std::strlen(label);
+        const std::size_t need = used == 0 ? len : len + 1;
+        if (used + need + 1 > capacity) break;
+        if (used != 0) out[used++] = ';';
+        std::memcpy(out + used, label, len);
+        used += len;
+        out[used] = '\0';
+    }
+    return used > 0;
 }
 
 // A Float attribute's value, from the float pool.

@@ -1050,6 +1050,10 @@ extern "C" char const* bg3le_stats_attr_string(int raw);
 extern "C" bool bg3le_stats_attr_float(int raw, double* out);
 extern "C" bool bg3le_stats_attr_guid(int raw, char* out,
                                       std::size_t capacity);
+extern "C" bool bg3le_stats_attr_flags(void const* object,
+                                       std::size_t index, int raw,
+                                       char* out,
+                                       std::size_t capacity);
 
 extern "C" void* bg3le_resource_manager();
 extern "C" std::size_t bg3le_resource_bank_count();
@@ -1458,6 +1462,17 @@ int l_stats_attr_float(lua_State* L) {
     double v = 0.0;
     if (!bg3le_stats_attr_float(raw, &v)) return 0;
     lua_pushnumber(L, v);
+    return 1;
+}
+
+// Ext._Internal.StatsAttrFlags(address, index, raw) -> "A;B;C"
+int l_stats_attr_flags(lua_State* L) {
+    auto* obj = (void*)(std::uintptr_t)luaL_checkinteger(L, 1);
+    const auto i = (std::size_t)luaL_checkinteger(L, 2);
+    const int raw = (int)luaL_checkinteger(L, 3);
+    char text[1024];
+    if (!bg3le_stats_attr_flags(obj, i, raw, text, sizeof(text))) return 0;
+    lua_pushstring(L, text);
     return 1;
 }
 
@@ -2187,6 +2202,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "StatsAttrFloat");
     lua_pushcfunction(g_lua, l_stats_attr_guid);
     lua_setfield(g_lua, -2, "StatsAttrGuid");
+    lua_pushcfunction(g_lua, l_stats_attr_flags);
+    lua_setfield(g_lua, -2, "StatsAttrFlags");
     lua_pushcfunction(g_lua, l_resource_banks);
     lua_setfield(g_lua, -2, "ResourceBanks");
     lua_pushcfunction(g_lua, l_resource_get);
@@ -2798,17 +2815,15 @@ local function read_attribute(addr, i)
     -- empty, not the number nought.
     value = Ext._Internal.StatsAttrString(raw) or ""
   elseif kind == 4 or kind == 5 then
-    -- An exact match is reported; anything else is reported as raw.
-    --
-    -- Treating an unmatched value as a bitmask and naming each bit was
-    -- tried and produced confident nonsense: a longsword's proficiency came
-    -- out as "Clubs;Darts;LightArmor;Shortswords;256;1024" and its
-    -- properties as "Light;Heavy;NoDualWield", when they should be
-    -- Longswords/Martial and Versatile. So a flags value is not a bitmask
-    -- over these labels, and until what it actually is has been worked out,
-    -- the number is reported as a number rather than dressed up as names.
-    local exact = Ext._Internal.StatsAttrLabel(addr, i, raw)
-    value = exact or {Raw = raw, Unresolved = "flag set, not yet decoded"}
+    -- An enumeration matches one label exactly; a flag set indexes the
+    -- int64 pool for a bitmask and may name several. Guessing at the latter
+    -- produced a longsword proficient in clubs and light armour, so both
+    -- paths now follow upstream's Object::GetFlags.
+    if kind == 5 then
+      value = Ext._Internal.StatsAttrFlags(addr, i, raw) or ""
+    else
+      value = Ext._Internal.StatsAttrLabel(addr, i, raw) or raw
+    end
   else
     -- Functors, conditions, requirements and translated strings are stored
     -- elsewhere on the object; the raw handle is reported rather than guessed
