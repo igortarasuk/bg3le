@@ -1147,6 +1147,143 @@ extern "C" char const* bg3le_stats_using(void const* object) {
     return bg3le_stats_name(parent);
 }
 
+// A value list by name, for the enumeration helpers.
+void const* value_list_named(char const* name) {
+    Found const& f = state();
+    if (name == nullptr || f.ValueLists.Buffer == nullptr) return nullptr;
+
+    for (std::uint32_t i = 0; i < f.ValueLists.Size; ++i) {
+        void const* list = nullptr;
+        if (!read_as((char const*)f.ValueLists.Buffer + i * sizeof(void*),
+                     &list)) {
+            continue;
+        }
+        if (list == nullptr) continue;
+
+        bg3se::FixedString listName{};
+        if (!read_as((char const*)list + f.ValueNameOffset, &listName)) {
+            continue;
+        }
+        char const* text = text_of(listName);
+        if (text != nullptr && std::strcmp(text, name) == 0) return list;
+    }
+    return nullptr;
+}
+
+// The label/value map of a value list, which follows its name.
+bg3se::LegacyMap<bg3se::FixedString, std::int32_t> const* value_map(
+    void const* list) {
+    return (bg3se::LegacyMap<bg3se::FixedString, std::int32_t> const*)
+        ((char const*)list + state().ValueNameOffset + 8);
+}
+
+
+// Ext.Stats.EnumIndexToLabel(enumeration, index)
+extern "C" char const* bg3le_stats_enum_label(char const* enumeration,
+                                              int index) {
+    void const* list = value_list_named(enumeration);
+    if (list == nullptr) return nullptr;
+
+    for (auto const& pair : *value_map(list)) {
+        if (pair.Value == index) return text_of(pair.Key);
+    }
+    return nullptr;
+}
+
+// Ext.Stats.EnumLabelToIndex(enumeration, label)
+extern "C" bool bg3le_stats_enum_index(char const* enumeration,
+                                       char const* label, int* out) {
+    void const* list = value_list_named(enumeration);
+    if (list == nullptr || label == nullptr) return false;
+
+    for (auto const& pair : *value_map(list)) {
+        char const* text = text_of(pair.Key);
+        if (text != nullptr && std::strcmp(text, label) == 0) {
+            if (out != nullptr) *out = pair.Value;
+            return true;
+        }
+    }
+    return false;
+}
+
+// The attribute names a modifier list declares, which is what
+// Ext.Stats.GetModifierAttributes reports.
+extern "C" std::size_t bg3le_stats_list_attr_count(char const* listName) {
+    Found const& f = state();
+    if (!f.Attributes || listName == nullptr) return 0;
+
+    for (std::uint32_t i = 0; i < f.Lists.Size; ++i) {
+        void const* list = nullptr;
+        if (!read_as((char const*)f.Lists.Buffer + i * sizeof(void*),
+                     &list) || list == nullptr) {
+            continue;
+        }
+        bg3se::FixedString name{};
+        if (!read_as((char const*)list + f.ListNameOffset, &name)) continue;
+        char const* text = text_of(name);
+        if (text == nullptr || std::strcmp(text, listName) != 0) continue;
+
+        ArrayRef attrs{};
+        if (!array_header_at((char const*)list + f.AttrsOffset, &attrs)) {
+            return 0;
+        }
+        return attrs.Size;
+    }
+    return 0;
+}
+
+extern "C" bool bg3le_stats_list_attr_at(char const* listName,
+                                         std::size_t index,
+                                         char const** nameOut,
+                                         char const** typeOut) {
+    Found const& f = state();
+    if (!f.Attributes || listName == nullptr) return false;
+
+    for (std::uint32_t i = 0; i < f.Lists.Size; ++i) {
+        void const* list = nullptr;
+        if (!read_as((char const*)f.Lists.Buffer + i * sizeof(void*),
+                     &list) || list == nullptr) {
+            continue;
+        }
+        bg3se::FixedString name{};
+        if (!read_as((char const*)list + f.ListNameOffset, &name)) continue;
+        char const* text = text_of(name);
+        if (text == nullptr || std::strcmp(text, listName) != 0) continue;
+
+        ArrayRef attrs{};
+        if (!array_header_at((char const*)list + f.AttrsOffset, &attrs)
+            || index >= attrs.Size) {
+            return false;
+        }
+
+        void const* modifier = nullptr;
+        if (!read_as((char const*)attrs.Buffer + index * sizeof(void*),
+                     &modifier) || modifier == nullptr) {
+            return false;
+        }
+
+        bg3se::FixedString attrName{};
+        if (!read_as((char const*)modifier + f.ModifierNameOffset,
+                     &attrName)) {
+            return false;
+        }
+        if (nameOut != nullptr) *nameOut = text_of(attrName);
+
+        if (typeOut != nullptr) {
+            void const* en = enumeration_for(modifier);
+            bg3se::FixedString typeName{};
+            if (en != nullptr
+                && read_as((char const*)en + f.ValueNameOffset, &typeName)) {
+                *typeOut = text_of(typeName);
+            } else {
+                *typeOut = nullptr;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 // Where ModifierListIndex sits on an Object, as derived from the value
 // counts. stats_functors.cpp checks this against the property maps before
 // trusting the rest of the member walk.

@@ -1080,6 +1080,15 @@ extern "C" char const* bg3le_stats_attr_string(int raw);
 extern "C" char const* bg3le_stats_attr_translated(int raw);
 extern "C" char const* bg3le_stats_attr_condition(int raw);
 extern "C" char const* bg3le_stats_ai_flags(void const* object);
+extern "C" char const* bg3le_stats_enum_label(char const* enumeration,
+                                              int index);
+extern "C" bool bg3le_stats_enum_index(char const* enumeration,
+                                       char const* label, int* out);
+extern "C" std::size_t bg3le_stats_list_attr_count(char const* listName);
+extern "C" bool bg3le_stats_list_attr_at(char const* listName,
+                                         std::size_t index,
+                                         char const** nameOut,
+                                         char const** typeOut);
 extern "C" int bg3le_stats_functor_groups(void const* object,
                                           char const* attribute);
 extern "C" bool bg3le_stats_functor_group_at(void const* object,
@@ -1671,6 +1680,68 @@ int l_object_expression(lua_State* L) {
     lua_pushstring(L, code);
     lua_pushinteger(L, refCount);
     return 3;
+}
+
+// Ext._Internal.StatsEnumLabel(enumeration, index) -> label
+int l_stats_enum_label(lua_State* L) {
+    char const* label = bg3le_stats_enum_label(luaL_checkstring(L, 1),
+                                               (int)luaL_checkinteger(L, 2));
+    if (label == nullptr) return 0;
+    lua_pushstring(L, label);
+    return 1;
+}
+
+// Ext._Internal.StatsEnumIndex(enumeration, label) -> index
+int l_stats_enum_index(lua_State* L) {
+    int value = 0;
+    if (!bg3le_stats_enum_index(luaL_checkstring(L, 1),
+                                luaL_checkstring(L, 2), &value)) {
+        return 0;
+    }
+    lua_pushinteger(L, value);
+    return 1;
+}
+
+// Ext._Internal.StatsListAttrs(modifierList) -> { {name, type}, ... }
+int l_stats_list_attrs(lua_State* L) {
+    char const* list = luaL_checkstring(L, 1);
+    const std::size_t count = bg3le_stats_list_attr_count(list);
+    if (count == 0) return 0;
+
+    lua_createtable(L, (int)count, 0);
+    for (std::size_t i = 0; i < count; ++i) {
+        char const* name = nullptr;
+        char const* type = nullptr;
+        if (!bg3le_stats_list_attr_at(list, i, &name, &type)) continue;
+        if (name == nullptr) continue;
+
+        lua_createtable(L, 0, 2);
+        lua_pushstring(L, name);
+        lua_setfield(L, -2, "Name");
+        lua_pushstring(L, type != nullptr ? type : "");
+        lua_setfield(L, -2, "Type");
+        lua_rawseti(L, -2, (int)i + 1);
+    }
+    return 1;
+}
+
+// Ext._Internal.ComponentTypeNames() -> every component bg3le can read.
+int l_component_type_names(lua_State* L) {
+    const std::size_t count = bg3le_meta_class_count();
+    lua_newtable(L);
+
+    int n = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        void const* cls = bg3le_meta_class_at(i);
+        if (cls == nullptr) continue;
+        char const* engine = bg3le_meta_engine_class(cls);
+        char const* name = bg3le_meta_class_name(cls);
+        if (engine == nullptr || name == nullptr) continue;
+
+        lua_pushstring(L, name);
+        lua_rawseti(L, -2, ++n);
+    }
+    return 1;
 }
 
 // Ext._Internal.TypeNames() -> every reflected class name, for Ext.Types.
@@ -2687,6 +2758,14 @@ void lua_init() {
     lua_setfield(g_lua, -2, "ObjectCondition");
     lua_pushcfunction(g_lua, l_object_expression);
     lua_setfield(g_lua, -2, "ObjectExpression");
+    lua_pushcfunction(g_lua, l_stats_enum_label);
+    lua_setfield(g_lua, -2, "StatsEnumLabel");
+    lua_pushcfunction(g_lua, l_stats_enum_index);
+    lua_setfield(g_lua, -2, "StatsEnumIndex");
+    lua_pushcfunction(g_lua, l_stats_list_attrs);
+    lua_setfield(g_lua, -2, "StatsListAttrs");
+    lua_pushcfunction(g_lua, l_component_type_names);
+    lua_setfield(g_lua, -2, "ComponentTypeNames");
     lua_pushcfunction(g_lua, l_type_names);
     lua_setfield(g_lua, -2, "TypeNames");
     lua_pushcfunction(g_lua, l_type_component);
@@ -3295,6 +3374,19 @@ function Ext._Internal.FireOsirisListener(name, arity, event, ...)
   end
 end
 
+-- ---- what still needs the engine ----
+--
+-- These names exist because a mod calls them by name and a missing one is
+-- "attempt to call a nil value" with nothing to act on. Each says what is
+-- missing rather than returning an empty result, because an empty result
+-- is indistinguishable from a real answer and would send a mod author
+-- looking in the wrong place.
+local function needs(what)
+  return function()
+    error("bg3le: " .. what, 2)
+  end
+end
+
 -- ---- Ext.Types ----
 --
 -- bg3se's type registry, over the same property maps bg3le already
@@ -3789,9 +3881,11 @@ function Ext.IsClient() return false end
 -- "Loca" rather than "Localization" -- the latter is not a module bg3se
 -- has, so a mod asking for Ext.Loca got a nil index instead of the error
 -- the stub exists to give.
+-- Plain tables rather than stubs: every one of these is filled in at the
+-- end of the prelude, and a stub's __index would shadow what is put there.
 for _, name in ipairs({"Entity", "Stats", "Level", "StaticData", "Mod",
                        "Loca", "Events", "Resource", "Template"}) do
-  if Ext[name] == nil then Ext[name] = stub(name) end
+  if Ext[name] == nil then Ext[name] = {} end
 end
 Ext.Definition = Ext.StaticData
 Mods = {}
@@ -4757,99 +4851,6 @@ end
 
 -- Published so the stats code can reach it. The prelude is compiled in more
 -- than one chunk, so a local here is not in scope there.
--- ---- Ext.Server* and Ext.Client* ----
---
--- bg3se exposes most modules three times: under a plain name, and under a
--- Server and a Client name. They are the same functions -- a mod picks the
--- name that says which side it means to run on -- except that a few are
--- only on the plain one.
---
--- The table below is generated from the captured surface by
--- tools/gen-context-aliases.py rather than written out, because getting a
--- single name wrong here is a mod that does not run and nothing that says
--- so. A view forwards to the base rather than copying it, so a function
--- added to the base later appears in both twins without being listed twice.
-local CONTEXT_MODULES = {
-  {"ClientDebug", "Debug"},
-  {"ClientEntity", "Entity", {GetEntitiesOnTile = true}},
-  {"ClientIO", "IO"},
-  {"ClientJson", "Json"},
-  {"ClientLoca", "Loca"},
-  {"ClientLog", "Log"},
-  {"ClientMath", "Math"},
-  {"ClientMod", "Mod"},
-  {"ClientResource", "Resource"},
-  {"ClientStaticData", "StaticData"},
-  {"ClientStats", "Stats", {LoadStatsFile = true}},
-  {"ClientTable", "Table"},
-  {"ClientTimer", "Timer"},
-  {"ClientTypes", "Types", {GenerateIdeHelpers = true}},
-  {"ClientUtils", "Utils", {GameTime = true, LoadTestLibrary = true, MicrosecTime = true, MonotonicTime = true, Print = true, PrintError = true, PrintWarning = true, Profile = true, ProfileNamed = true, Random = true, Round = true}},
-  {"ClientVars", "Vars"},
-  {"ServerDebug", "Debug"},
-  {"ServerEntity", "Entity", {GetEntitiesOnTile = true}},
-  {"ServerIO", "IO"},
-  {"ServerJson", "Json"},
-  {"ServerLevel", "Level"},
-  {"ServerLoca", "Loca"},
-  {"ServerLog", "Log"},
-  {"ServerMath", "Math"},
-  {"ServerMod", "Mod"},
-  {"ServerNet", "Net"},
-  {"ServerResource", "Resource"},
-  {"ServerStaticData", "StaticData"},
-  {"ServerStats", "Stats", {LoadStatsFile = true}},
-  {"ServerTable", "Table"},
-  {"ServerTemplate", "Template"},
-  {"ServerTimer", "Timer"},
-  {"ServerTypes", "Types", {GenerateIdeHelpers = true}},
-  {"ServerUtils", "Utils", {GameTime = true, LoadTestLibrary = true, MicrosecTime = true, MonotonicTime = true, Print = true, PrintError = true, PrintWarning = true, Profile = true, ProfileNamed = true, Random = true, Round = true}},
-  {"ServerVars", "Vars"},
-}
-
-local function context_view(base, omit)
-  local function visible(key)
-    if omit ~= nil and omit[key] then return false end
-    return base[key] ~= nil
-  end
-
-  return setmetatable({}, {
-    __index = function(_, key)
-      if not visible(key) then return nil end
-      return base[key]
-    end,
-
-    -- Iterating a module is how a mod discovers what is there, and how
-    -- tools/api-coverage.lua counts, so the view has to enumerate as the
-    -- real one does.
-    __pairs = function()
-      local keys = {}
-      for key in pairs(base) do
-        if visible(key) then keys[#keys + 1] = key end
-      end
-      table.sort(keys)
-
-      local i = 0
-      return function()
-        i = i + 1
-        local key = keys[i]
-        if key == nil then return nil end
-        return key, base[key]
-      end
-    end,
-
-    __newindex = function(_, key)
-      error("Ext context modules mirror their base; set Ext.<module>."
-            .. tostring(key) .. " instead", 2)
-    end,
-  })
-end
-
-for _, entry in ipairs(CONTEXT_MODULES) do
-  local name, from, omit = entry[1], entry[2], entry[3]
-  if Ext[from] ~= nil then Ext[name] = context_view(Ext[from], omit) end
-end
-
 Ext._Internal.ReadObject = read_object
 
 Ext.StaticData = {}
@@ -4965,6 +4966,451 @@ function Ext._Internal.LoadMods()
     end
   end
 end
+-- Everything below runs last, once every module it touches exists.
+-- An earlier version ran here from further up, which meant it bound
+-- to tables that Ext.StaticData and others later replaced: the
+-- context views kept pointing at the discarded table, and the
+-- additions were simply lost.
+
+-- ---- the rest of Ext.Stats ----
+
+-- The enumerations stats are written in terms of: "Damage Type",
+-- "AbilityType" and so on, each a value list the engine parsed.
+function Ext.Stats.EnumIndexToLabel(enumeration, index)
+  return Ext._Internal.StatsEnumLabel(enumeration, index)
+end
+
+function Ext.Stats.EnumLabelToIndex(enumeration, label)
+  return Ext._Internal.StatsEnumIndex(enumeration, label)
+end
+
+-- The attributes a modifier list declares, as name to type. This is what
+-- says which keys a stat of that type can carry.
+function Ext.Stats.GetModifierAttributes(modifierList)
+  local attrs = Ext._Internal.StatsListAttrs(modifierList)
+  if attrs == nil then return nil end
+  local out = {}
+  for _, a in ipairs(attrs) do out[a.Name] = a.Type end
+  return out
+end
+
+function Ext.Stats.GetStatsManager()
+  local addr = Ext._Internal.StatsManagerAddress
+        and Ext._Internal.StatsManagerAddress() or nil
+  return {
+    Address = addr,
+    -- Upstream hands back the RPGStats object itself. bg3le reads that
+    -- object through located offsets rather than a mapped struct, so what
+    -- it can offer is the counts and the entry points that read it.
+    StatsCount = Ext._Internal.StatsCount(),
+    ExtraData = {},
+  }
+end
+
+-- Every stat that a mod loading before the named one could have seen.
+-- Upstream walks its load-order bookkeeping; bg3le has the same
+-- information from the archives, so this is a real answer rather than an
+-- approximation.
+function Ext.Stats.GetStatsLoadedBefore(modId)
+  if type(modId) ~= "string" then
+    error("Ext.Stats.GetStatsLoadedBefore expects a mod uuid", 2)
+  end
+
+  local order = Ext.Mod.GetLoadOrder()
+  local rank, found = {}, false
+  for i, uuid in ipairs(order) do
+    rank[uuid] = i
+    if uuid == modId then found = true end
+  end
+  if not found then
+    Ext.Log.PrintError("Couldn't fetch stat entry list - mod " .. modId
+                       .. " is not loaded.")
+    return {}
+  end
+
+  local limit = rank[modId]
+  local out = {}
+  for _, name in ipairs(Ext.Stats.GetStats()) do
+    local owner = select(1, Ext._Internal.StatOrigin(name))
+    if owner ~= nil and rank[owner] ~= nil and rank[owner] <= limit then
+      out[#out + 1] = name
+    end
+  end
+  return out
+end
+
+Ext.Stats.Create = needs(
+  "Ext.Stats.Create needs the engine's stat allocation and sync path")
+Ext.Stats.AddAttribute = needs(
+  "Ext.Stats.AddAttribute needs to extend a modifier list, which is "
+  .. "parsed once at load")
+Ext.Stats.AddEnumerationValue = needs(
+  "Ext.Stats.AddEnumerationValue needs to extend a value list, which is "
+  .. "parsed once at load")
+Ext.Stats.LoadStatsFile = needs(
+  "Ext.Stats.LoadStatsFile needs the engine's stat parser")
+Ext.Stats.ExecuteFunctor = needs(
+  "Ext.Stats.ExecuteFunctor needs the engine's functor execution context")
+Ext.Stats.ExecuteFunctors = Ext.Stats.ExecuteFunctor
+Ext.Stats.PrepareFunctorParams = needs(
+  "Ext.Stats.PrepareFunctorParams needs the engine's functor execution "
+  .. "context")
+
+for _, kind in ipairs({"Spell", "Status", "Passive", "Boost", "Interrupt"}) do
+  Ext.Stats["GetCached" .. kind] = needs(
+    "Ext.Stats.GetCached" .. kind .. " needs the engine's " .. kind
+    .. " prototype manager, which bg3le has not located")
+end
+
+-- ---- the rest of Ext.Entity ----
+
+-- Every component bg3le can read by name, which is what a mod asks for
+-- before deciding whether a component is worth looking at.
+function Ext.Entity.GetRegisteredComponentTypes()
+  return Ext._Internal.ComponentTypeNames()
+end
+
+-- Subscriptions. The registry and dispatch are real, so a mod's handlers
+-- are held and fire when bg3le raises the event; what is missing is the
+-- engine-side change detection that would raise them on its own. Nothing
+-- is dropped silently -- Ext._Internal.FireEntityEvent is the seam, and it
+-- is what the tick and the ECS hooks will call as they are written.
+local entity_subs = {}
+local next_sub = 1
+
+local function subscribe(kind, component, handler, entity, once)
+  if type(handler) ~= "function" then
+    error("Ext.Entity subscriptions expect a handler function", 3)
+  end
+  local id = next_sub
+  next_sub = next_sub + 1
+  entity_subs[id] = {
+    Kind = kind, Component = component, Handler = handler,
+    Entity = entity, Once = once or false,
+  }
+  return id
+end
+
+function Ext.Entity.Subscribe(component, handler, entity)
+  return subscribe("change", component, handler, entity, false)
+end
+
+function Ext.Entity.OnCreate(component, handler, entity)
+  return subscribe("create", component, handler, entity, false)
+end
+
+function Ext.Entity.OnCreateOnce(component, handler, entity)
+  return subscribe("create", component, handler, entity, true)
+end
+
+function Ext.Entity.OnCreateDeferred(component, handler, entity)
+  return subscribe("create-deferred", component, handler, entity, false)
+end
+
+function Ext.Entity.OnCreateDeferredOnce(component, handler, entity)
+  return subscribe("create-deferred", component, handler, entity, true)
+end
+
+function Ext.Entity.OnDestroy(component, handler, entity)
+  return subscribe("destroy", component, handler, entity, false)
+end
+
+function Ext.Entity.OnDestroyOnce(component, handler, entity)
+  return subscribe("destroy", component, handler, entity, true)
+end
+
+function Ext.Entity.OnDestroyDeferred(component, handler, entity)
+  return subscribe("destroy-deferred", component, handler, entity, false)
+end
+
+function Ext.Entity.OnDestroyDeferredOnce(component, handler, entity)
+  return subscribe("destroy-deferred", component, handler, entity, true)
+end
+
+function Ext.Entity.OnChange(component, handler, entity)
+  return subscribe("change", component, handler, entity, false)
+end
+
+function Ext.Entity.OnSystemUpdate(system, handler, once)
+  return subscribe("system-update", system, handler, nil, once)
+end
+
+function Ext.Entity.OnSystemPostUpdate(system, handler, once)
+  return subscribe("system-post-update", system, handler, nil, once)
+end
+
+function Ext.Entity.Unsubscribe(id)
+  if entity_subs[id] == nil then return false end
+  entity_subs[id] = nil
+  return true
+end
+
+-- Raised by bg3le when it detects one of these; the ECS-side detection is
+-- still to be written, so today it fires only for what bg3le itself does.
+function Ext._Internal.FireEntityEvent(kind, component, entity, ...)
+  for id, sub in pairs(entity_subs) do
+    if sub.Kind == kind and sub.Component == component
+       and (sub.Entity == nil or sub.Entity == entity) then
+      if sub.Once then entity_subs[id] = nil end
+      local ok, err = pcall(sub.Handler, entity, component, ...)
+      if not ok then
+        Ext.Log.PrintError("entity subscription failed: " .. tostring(err))
+      end
+    end
+  end
+end
+
+Ext.Entity.GetAllEntities = needs(
+  "Ext.Entity.GetAllEntities needs to walk the ECS entity storage, which "
+  .. "bg3le reads component-wise but cannot yet enumerate")
+Ext.Entity.GetAllEntitiesWithComponent = needs(
+  "Ext.Entity.GetAllEntitiesWithComponent needs to walk the ECS entity "
+  .. "storage, which bg3le reads component-wise but cannot yet enumerate")
+Ext.Entity.GetAllEntitiesWithUuid = needs(
+  "Ext.Entity.GetAllEntitiesWithUuid needs to walk the ECS entity storage")
+Ext.Entity.GetEntitiesAroundPosition = needs(
+  "Ext.Entity.GetEntitiesAroundPosition needs the engine's spatial index")
+Ext.Entity.GetEntitiesOnTile = needs(
+  "Ext.Entity.GetEntitiesOnTile needs the level's tile grid")
+Ext.Entity.Create = needs(
+  "Ext.Entity.Create needs the ECS entity allocator")
+Ext.Entity.Destroy = needs(
+  "Ext.Entity.Destroy needs the ECS entity allocator")
+Ext.Entity.SetupTracing = needs(
+  "Ext.Entity.SetupTracing needs the ECS change journal")
+Ext.Entity.EnableTracing = Ext.Entity.SetupTracing
+Ext.Entity.GetTrace = Ext.Entity.SetupTracing
+Ext.Entity.ClearTrace = Ext.Entity.SetupTracing
+
+-- ---- the rest of Ext.StaticData, and Ext.Definition ----
+
+for _, name in ipairs({"ClearResourceBank", "SyncResourceBank", "Create"}) do
+  Ext.StaticData[name] = needs(
+    "Ext.StaticData." .. name .. " writes to a GUID resource bank, which "
+    .. "bg3le reads but does not modify")
+end
+
+for _, name in ipairs({"GetIconAtlas", "GetIconUVs", "GetTextureAtlasManager"}) do
+  Ext.StaticData[name] = needs(
+    "Ext.StaticData." .. name .. " needs the texture atlas manager, which "
+    .. "bg3le has not located")
+end
+
+Ext.StaticData.GetByModId = needs(
+  "Ext.StaticData.GetByModId needs the resource-to-mod mapping the engine "
+  .. "keeps per bank, which bg3le has not located")
+Ext.StaticData.GetSources = needs(
+  "Ext.StaticData.GetSources needs the resource bank's source list")
+
+-- Upstream's Ext.Definition is Ext.StaticData under another name. It was
+-- aliased further up, before Ext.StaticData existed, so it picked up the
+-- stub instead; taken again here now that the real one is in place.
+Ext.Definition = Ext.StaticData
+
+-- ---- Ext.Resource ----
+--
+-- The other resource system: banks keyed by ResourceBankType, holding
+-- visuals, animations and effects rather than GUID resources.
+for _, name in ipairs({"Get", "GetAll"}) do
+  Ext.Resource[name] = needs(
+    "Ext.Resource." .. name .. " needs the engine's ResourceManager, "
+    .. "which is a different manager from the GUID resource banks "
+    .. "Ext.StaticData reads and has not been located")
+end
+
+-- ---- Ext.Loca ----
+for _, name in ipairs({"GetTranslatedString", "GetTranslatedStringKey",
+                       "UpdateTranslatedString", "UpdateTranslatedStringKey",
+                       "GetAllTranslatedStringKeys"}) do
+  Ext.Loca[name] = needs(
+    "Ext.Loca." .. name .. " needs ls::TranslatedStringRepository, which "
+    .. "bg3le has not located; Ext.Stats reports loca handles but cannot "
+    .. "resolve them to text")
+end
+
+-- ---- Ext.Template ----
+for _, name in ipairs({"GetTemplate", "GetRootTemplate", "GetLocalTemplate",
+                       "GetCacheTemplate", "GetLocalCacheTemplate",
+                       "GetAllRootTemplates", "GetAllLocalTemplates",
+                       "GetAllCacheTemplates", "GetAllLocalCacheTemplates"}) do
+  Ext.Template[name] = needs(
+    "Ext.Template." .. name .. " needs the engine's template managers, "
+    .. "which bg3le has not located")
+end
+
+-- ---- Ext.Level ----
+--
+-- Raycasts, sweeps and pathfinding all go through the level's physics
+-- scene and pathfinder.
+for _, name in ipairs({"RaycastAll", "RaycastAny", "RaycastClosest",
+                       "SweepBoxAll", "SweepBoxClosest", "SweepCapsuleAll",
+                       "SweepCapsuleClosest", "SweepSphereAll",
+                       "SweepSphereClosest", "TestBox", "TestSphere",
+                       "GetHeightsAt", "GetTileDebugInfo",
+                       "GetEntitiesOnTile"}) do
+  Ext.Level[name] = needs(
+    "Ext.Level." .. name .. " needs the level's physics scene, which "
+    .. "bg3le has not located")
+end
+
+for _, name in ipairs({"FindPath", "BeginPathfinding",
+                       "BeginPathfindingImmediate", "GetPathById",
+                       "ReleasePath", "GetActivePathfindingRequests"}) do
+  Ext.Level[name] = needs(
+    "Ext.Level." .. name .. " needs the engine's pathfinder")
+end
+
+for _, name in ipairs({"CreateSurfaceAction", "ExecuteSurfaceAction",
+                       "AddActivePersistentLevelTemplate", "GetLevelInfo"}) do
+  Ext.Level[name] = needs(
+    "Ext.Level." .. name .. " needs the server level manager, which "
+    .. "bg3le has not located")
+end
+
+-- ---- Ext.Server* and Ext.Client* ----
+--
+-- bg3se exposes most modules three times: under a plain name, and under a
+-- Server and a Client name. They are the same functions -- a mod picks the
+-- name that says which side it means to run on -- except that a few are
+-- only on the plain one.
+--
+-- The table below is generated from the captured surface by
+-- tools/gen-context-aliases.py rather than written out, because getting a
+-- single name wrong here is a mod that does not run and nothing that says
+-- so. A view forwards to the base rather than copying it, so a function
+-- added to the base later appears in both twins without being listed twice.
+local CONTEXT_MODULES = {
+  {"ClientDebug", "Debug"},
+  {"ClientEntity", "Entity", {GetEntitiesOnTile = true}},
+  {"ClientIO", "IO"},
+  {"ClientJson", "Json"},
+  {"ClientLoca", "Loca"},
+  {"ClientLog", "Log"},
+  {"ClientMath", "Math"},
+  {"ClientMod", "Mod"},
+  {"ClientResource", "Resource"},
+  {"ClientStaticData", "StaticData"},
+  {"ClientStats", "Stats", {LoadStatsFile = true}},
+  {"ClientTable", "Table"},
+  {"ClientTimer", "Timer"},
+  {"ClientTypes", "Types", {GenerateIdeHelpers = true}},
+  {"ClientUtils", "Utils", {GameTime = true, LoadTestLibrary = true, MicrosecTime = true, MonotonicTime = true, Print = true, PrintError = true, PrintWarning = true, Profile = true, ProfileNamed = true, Random = true, Round = true}},
+  {"ClientVars", "Vars"},
+  {"ServerDebug", "Debug"},
+  {"ServerEntity", "Entity", {GetEntitiesOnTile = true}},
+  {"ServerIO", "IO"},
+  {"ServerJson", "Json"},
+  {"ServerLevel", "Level"},
+  {"ServerLoca", "Loca"},
+  {"ServerLog", "Log"},
+  {"ServerMath", "Math"},
+  {"ServerMod", "Mod"},
+  {"ServerNet", "Net"},
+  {"ServerResource", "Resource"},
+  {"ServerStaticData", "StaticData"},
+  {"ServerStats", "Stats", {LoadStatsFile = true}},
+  {"ServerTable", "Table"},
+  {"ServerTemplate", "Template"},
+  {"ServerTimer", "Timer"},
+  {"ServerTypes", "Types", {GenerateIdeHelpers = true}},
+  {"ServerUtils", "Utils", {GameTime = true, LoadTestLibrary = true, MicrosecTime = true, MonotonicTime = true, Print = true, PrintError = true, PrintWarning = true, Profile = true, ProfileNamed = true, Random = true, Round = true}},
+  {"ServerVars", "Vars"},
+}
+
+-- ---- Ext.Server* and Ext.Client* ----
+--
+-- bg3se exposes most modules three times: under a plain name, and under a
+-- Server and a Client name. They are the same functions -- a mod picks the
+-- name that says which side it means to run on -- except that a few are
+-- only on the plain one.
+--
+-- The table below is generated from the captured surface by
+-- tools/gen-context-aliases.py rather than written out, because getting a
+-- single name wrong here is a mod that does not run and nothing that says
+-- so. A view forwards to the base rather than copying it, so a function
+-- added to the base later appears in both twins without being listed twice.
+local CONTEXT_MODULES = {
+  {"ClientDebug", "Debug"},
+  {"ClientEntity", "Entity", {GetEntitiesOnTile = true}},
+  {"ClientIO", "IO"},
+  {"ClientJson", "Json"},
+  {"ClientLoca", "Loca"},
+  {"ClientLog", "Log"},
+  {"ClientMath", "Math"},
+  {"ClientMod", "Mod"},
+  {"ClientResource", "Resource"},
+  {"ClientStaticData", "StaticData"},
+  {"ClientStats", "Stats", {LoadStatsFile = true}},
+  {"ClientTable", "Table"},
+  {"ClientTimer", "Timer"},
+  {"ClientTypes", "Types", {GenerateIdeHelpers = true}},
+  {"ClientUtils", "Utils", {GameTime = true, LoadTestLibrary = true, MicrosecTime = true, MonotonicTime = true, Print = true, PrintError = true, PrintWarning = true, Profile = true, ProfileNamed = true, Random = true, Round = true}},
+  {"ClientVars", "Vars"},
+  {"ServerDebug", "Debug"},
+  {"ServerEntity", "Entity", {GetEntitiesOnTile = true}},
+  {"ServerIO", "IO"},
+  {"ServerJson", "Json"},
+  {"ServerLevel", "Level"},
+  {"ServerLoca", "Loca"},
+  {"ServerLog", "Log"},
+  {"ServerMath", "Math"},
+  {"ServerMod", "Mod"},
+  {"ServerNet", "Net"},
+  {"ServerResource", "Resource"},
+  {"ServerStaticData", "StaticData"},
+  {"ServerStats", "Stats", {LoadStatsFile = true}},
+  {"ServerTable", "Table"},
+  {"ServerTemplate", "Template"},
+  {"ServerTimer", "Timer"},
+  {"ServerTypes", "Types", {GenerateIdeHelpers = true}},
+  {"ServerUtils", "Utils", {GameTime = true, LoadTestLibrary = true, MicrosecTime = true, MonotonicTime = true, Print = true, PrintError = true, PrintWarning = true, Profile = true, ProfileNamed = true, Random = true, Round = true}},
+  {"ServerVars", "Vars"},
+}
+
+local function context_view(base, omit)
+  local function visible(key)
+    if omit ~= nil and omit[key] then return false end
+    return base[key] ~= nil
+  end
+
+  return setmetatable({}, {
+    __index = function(_, key)
+      if not visible(key) then return nil end
+      return base[key]
+    end,
+
+    -- Iterating a module is how a mod discovers what is there, and how
+    -- tools/api-coverage.lua counts, so the view has to enumerate as the
+    -- real one does.
+    __pairs = function()
+      local keys = {}
+      for key in pairs(base) do
+        if visible(key) then keys[#keys + 1] = key end
+      end
+      table.sort(keys)
+
+      local i = 0
+      return function()
+        i = i + 1
+        local key = keys[i]
+        if key == nil then return nil end
+        return key, base[key]
+      end
+    end,
+
+    __newindex = function(_, key)
+      error("Ext context modules mirror their base; set Ext.<module>."
+            .. tostring(key) .. " instead", 2)
+    end,
+  })
+end
+
+for _, entry in ipairs(CONTEXT_MODULES) do
+  local name, from, omit = entry[1], entry[2], entry[3]
+  if Ext[from] ~= nil then Ext[name] = context_view(Ext[from], omit) end
+end
+
+
 )LUA";
     if (luaL_dostring(g_lua, kPrelude) != LUA_OK) {
         logf("lua: prelude failed: %s", lua_tostring(g_lua, -1));
