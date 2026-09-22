@@ -162,5 +162,31 @@ std::size_t count(Context context) {
     return registry().by_context[static_cast<std::size_t>(context)].size();
 }
 
+// These walk the context rather than keeping a reverse map, because the
+// indices are read live: a cached reverse map would go stale the moment the
+// engine assigned one. They are for identifying a structure once, not for a
+// hot path.
+bool has_index(Context context, std::int32_t index) {
+    if (index < 0) return false;
+    const auto& m = registry().by_context[static_cast<std::size_t>(context)];
+    for (const auto& entry : m) {
+        std::int32_t value = 0;
+        if (!safe_read(entry.second, &value, sizeof(value))) continue;
+        if (value == index) return true;
+    }
+    return false;
+}
+
+std::optional<std::string> name_of(Context context, std::int32_t index) {
+    if (index < 0) return std::nullopt;
+    const auto& m = registry().by_context[static_cast<std::size_t>(context)];
+    for (const auto& entry : m) {
+        std::int32_t value = 0;
+        if (!safe_read(entry.second, &value, sizeof(value))) continue;
+        if (value == index) return entry.first;
+    }
+    return std::nullopt;
+}
+
 }  // namespace ecs
 }  // namespace bg3le

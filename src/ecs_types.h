@@ -48,6 +48,18 @@ std::optional<std::int32_t> index_of(Context context, const std::string& name);
 // Number of types recorded in a context.
 std::size_t count(Context context);
 
+// Whether any type in the context currently holds this index.
+//
+// For identifying an engine structure by the indices it contains: the static
+// data registry is 121 named types, so a table whose keys are all drawn from
+// that set is that registry rather than a coincidence. Read live, like
+// index_of, because the engine assigns the values during startup.
+bool has_index(Context context, std::int32_t index);
+
+// The name a context assigned to an index, or nothing. Linear in the number of
+// types in the context, so this is for diagnostics rather than for lookups.
+std::optional<std::string> name_of(Context context, std::int32_t index);
+
 // For diagnostics: the name of a context.
 const char* context_name(Context context);
 

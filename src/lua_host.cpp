@@ -1023,6 +1023,50 @@ int l_array_info(lua_State* L) {
     return 2;
 }
 
+extern "C" void* bg3le_resource_manager();
+extern "C" std::size_t bg3le_resource_bank_count();
+extern "C" bool bg3le_resource_bank_at(std::size_t i, std::int32_t* typeIndex,
+                                       void** bank);
+
+// Ext._Internal.ResourceBanks() -> { Manager, Banks = { {...}, ... } }
+//
+// Every bank the resource manager holds, with the name the symbol table gives
+// its type index. That naming is the check on the search: the manager is found
+// by looking for a table whose keys are all static data indices bg3le already
+// knows, so if the names come back as real resource types rather than as gaps,
+// the structure found is the right one.
+int l_resource_banks(lua_State* L) {
+    lua_newtable(L);
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)bg3le_resource_manager());
+    lua_setfield(L, -2, "Manager");
+    lua_pushinteger(L, (lua_Integer)ecs::count(ecs::Context::ImmutableData));
+    lua_setfield(L, -2, "RegisteredTypes");
+
+    const std::size_t count = bg3le_resource_bank_count();
+    lua_createtable(L, (int)count, 0);
+    for (std::size_t i = 0; i < count; ++i) {
+        std::int32_t typeIndex = 0;
+        void* bank = nullptr;
+        if (!bg3le_resource_bank_at(i, &typeIndex, &bank)) break;
+
+        lua_newtable(L);
+        lua_pushinteger(L, typeIndex);
+        lua_setfield(L, -2, "TypeIndex");
+        const auto name = ecs::name_of(ecs::Context::ImmutableData, typeIndex);
+        if (name.has_value()) {
+            lua_pushstring(L, name->c_str());
+        } else {
+            lua_pushstring(L, "<not in the registry>");
+        }
+        lua_setfield(L, -2, "Name");
+        lua_pushinteger(L, (lua_Integer)(std::uintptr_t)bank);
+        lua_setfield(L, -2, "Bank");
+        lua_rawseti(L, -2, (int)i + 1);
+    }
+    lua_setfield(L, -2, "Banks");
+    return 1;
+}
+
 // Ext._Internal.VariantIndex(handle, component, path) -> active, count
 //
 // active is zero-based, and equals count when the variant holds nothing.
@@ -1679,6 +1723,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "MapKey");
     lua_pushcfunction(g_lua, l_variant_index);
     lua_setfield(g_lua, -2, "VariantIndex");
+    lua_pushcfunction(g_lua, l_resource_banks);
+    lua_setfield(g_lua, -2, "ResourceBanks");
     lua_pushcfunction(g_lua, l_field_address);
     lua_setfield(g_lua, -2, "FieldAddress");
     lua_pushcfunction(g_lua, l_field_bytes);

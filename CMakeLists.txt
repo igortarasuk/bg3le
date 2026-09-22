@@ -131,7 +131,8 @@ list(APPEND VENDOR_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/noesis_rtti_linux.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/entity_bridge.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/component_meta.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/fixed_string.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/fixed_string.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/static_data.cpp)
 
 # Kept in step with tools/vendor-exclude.txt.
 set(VENDOR_EXCLUDE
