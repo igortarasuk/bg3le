@@ -36,7 +36,9 @@
 #include <Lua/Shared/Proxies/PropertyMapDependencies.h>
 
 #include <cstring>
+#include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -437,10 +439,37 @@ constexpr FieldDesc make_field(char const* name, std::size_t offset) {
 // bg3le's symbol-table registry is keyed by. ComponentName is bg3se's short
 // name ("Health"), which is what its Lua API exposes -- so carrying it means
 // entity.Health resolves generically instead of through a hardcoded map.
+//
+// A resource declares EngineClass as well -- "eoc::ActionResourceTypes" for
+// resource::ActionResource -- and bg3se's own static data binding reads it from
+// exactly there, so this asks for the member rather than for componenthood.
+// Gating it on IsComponentType left every resource with a null engine class,
+// which is what made Ext.StaticData.Get fail before it reached a bank.
+// A resource is recognised by ResourceManagerType, which only the static data
+// types declare. Asking merely for an EngineClass member is too broad: 682
+// other bg3se types -- systems, singletons -- declare one too, and pulling
+// those in makes every count over "things with an engine name" mean something
+// different from what it says.
+template <class T, class = void>
+constexpr bool kIsResourceType = false;
+template <class T>
+constexpr bool kIsResourceType<T, std::void_t<decltype(T::ResourceManagerType)>> =
+    true;
+
 template <class T>
 constexpr char const* engine_class_of() {
     if constexpr (IsComponentType<T>) return T::EngineClass;
+    else if constexpr (kIsResourceType<T>) return T::EngineClass;
     else return nullptr;
+}
+
+// Whether this is an ECS component, as opposed to a resource that merely also
+// has an engine name. Separate so the component count stays a count of
+// components.
+template <class T>
+constexpr bool is_component_class() {
+    if constexpr (IsComponentType<T>) return true;
+    else return false;
 }
 
 template <class T>
@@ -492,6 +521,9 @@ struct ClassFields {
     // Whether the component lives in a per-storage pool instead of the entity
     // page, in which case the page path does not apply to it at all.
     bool IsOneFrame;
+    // Whether this is an ECS component at all. A resource has an engine name
+    // but no place in the entity world.
+    bool IsComponent;
 };
 
 template <class T>
@@ -712,6 +744,7 @@ inline constexpr ClassFields kClassFields{
     sizeof(T),
     is_proxy_component<T>(),
     is_one_frame_component<T>(),
+    is_component_class<T>(),
 };
 
 // Every class table, collected the way upstream collects its own.
@@ -1714,7 +1747,7 @@ extern "C" void const* bg3le_meta_class_at(std::size_t index) {
 extern "C" std::size_t bg3le_meta_component_count() {
     std::size_t n = 0;
     for (auto const* cls : kAllClasses) {
-        if (cls->EngineClass != nullptr) ++n;
+        if (cls->IsComponent && cls->EngineClass != nullptr) ++n;
     }
     return n;
 }
@@ -1809,6 +1842,15 @@ extern "C" bool bg3le_meta_parse_guid(char const* text, void* out) {
 extern "C" void const* bg3le_meta_class(char const* className) {
     if (className == nullptr) return nullptr;
     auto it = by_class_name().find(className);
+    if (it != by_class_name().end()) return it->second;
+
+    // A script names a resource the way bg3se's Lua API does, by the
+    // ExtResourceManagerType label: "ActionResource", not
+    // "resource::ActionResource". The labels and the class names agree
+    // one-for-one, so qualification is the only difference, and retrying with
+    // it is exact rather than a search for a matching suffix.
+    const std::string qualified = std::string("resource::") + className;
+    it = by_class_name().find(qualified);
     return it != by_class_name().end() ? it->second : nullptr;
 }
 
