@@ -134,7 +134,8 @@ list(APPEND VENDOR_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/fixed_string.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/static_data.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/stats.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/mods.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/mods.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/stat_origins.cpp)
 
 # Kept in step with tools/vendor-exclude.txt.
 set(VENDOR_EXCLUDE
@@ -246,7 +247,14 @@ add_library(bg3le SHARED
     src/win_compat.cpp
     src/affinity.cpp
     src/vulkan_memory.cpp
+    src/pak.cpp
+    # Yann Collet's LZ4, vendored rather than linked: the sniper container
+    # need not have liblz4, and a missing DT_NEEDED would stop bg3le loading
+    # at all. See vendor/NOTICE.md.
+    external/lz4/lz4.c
 )
+set_source_files_properties(external/lz4/lz4.c PROPERTIES COMPILE_FLAGS -w)
+target_include_directories(bg3le PRIVATE external/lz4)
 # vulkan and SDL2 resolve from the host process, which has both loaded before
 # bg3le is.
 target_link_libraries(bg3le PRIVATE dl lua_static bg3se_vendor vulkan SDL2)

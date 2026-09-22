@@ -84,6 +84,33 @@ if [ "${CONTINUE:-0}" = "1" ]; then
     args=(-continueGame "${args[@]}")
 fi
 
+# BG3LE_EXTRA_PRELOAD appends another library to the preload list, for
+# experiments that do not belong in the extender. Currently used to test
+# thread affinity: the engine pins each of its threads to one logical cpu,
+# while the same game under Proton runs with every thread on 0-15 because
+# Wine does not pass the affinity requests through -- and that build keeps the
+# gpu at 80% busy where the native one manages 38%.
+preload="$HERE/build/libbg3le.so"
+if [ -n "${BG3LE_EXTRA_PRELOAD:-}" ]; then
+    preload="$preload:$BG3LE_EXTRA_PRELOAD"
+fi
+
+# The preload goes on the game and nothing else. It used to be exported, so
+# every wrapper inherited it -- which broke gamescope outright, because
+# src/vulkan_memory.cpp hid the device-local host-visible memory types that
+# gamescope's own renderer needs ("findMemoryType failed", no backend).
+game=(env "LD_PRELOAD=$preload"
+      "BG3LE_LOG=${BG3LE_LOG:-/tmp/bg3le.log}"
+      ./bin/bg3 "${args[@]}")
+
+# HEADLESS=1 runs the game inside gamescope's headless backend: a real GPU
+# and a real Vulkan swapchain, but no window on the desktop. For scripted
+# runs that only talk to the debugger. SDL_VIDEODRIVER=offscreen does not
+# work -- the game initialises Vulkan and then exits with no surface.
+if [ "${HEADLESS:-0}" = "1" ]; then
+    export SDL_VIDEODRIVER=wayland
+fi
+
 if [ "${SNIPER:-1}" = "0" ]; then
     COMPAT="$(cd "$HERE/.." && pwd)/compat-libs"
     if [ ! -f "$COMPAT/libssl.so.1.1" ]; then
@@ -91,9 +118,13 @@ if [ "${SNIPER:-1}" = "0" ]; then
         exit 1
     fi
     export LD_LIBRARY_PATH="$COMPAT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    launch=(./bin/bg3 "${args[@]}")
+    launch=("${game[@]}")
 else
-    launch=("$SNIPER_DIR/run" -- ./bin/bg3 "${args[@]}")
+    launch=("$SNIPER_DIR/run" -- "${game[@]}")
+fi
+
+if [ "${HEADLESS:-0}" = "1" ]; then
+    launch=(gamescope --backend headless -W 1280 -H 720 -- "${launch[@]}")
 fi
 
 # GameMode is off unless asked for, because it does not work here and says so
@@ -114,17 +145,4 @@ if [ "${GAMEMODE:-0}" != "0" ] && command -v gamemoderun >/dev/null 2>&1; then
     launch=(gamemoderun "${launch[@]}")
 fi
 
-# BG3LE_EXTRA_PRELOAD appends another library to the preload list, for
-# experiments that do not belong in the extender. Currently used to test
-# thread affinity: the engine pins each of its threads to one logical cpu,
-# while the same game under Proton runs with every thread on 0-15 because
-# Wine does not pass the affinity requests through -- and that build keeps the
-# gpu at 80% busy where the native one manages 38%.
-preload="$HERE/build/libbg3le.so"
-if [ -n "${BG3LE_EXTRA_PRELOAD:-}" ]; then
-    preload="$preload:$BG3LE_EXTRA_PRELOAD"
-fi
-
-LD_PRELOAD="$preload" \
-BG3LE_LOG="${BG3LE_LOG:-/tmp/bg3le.log}" \
 exec "${launch[@]}"

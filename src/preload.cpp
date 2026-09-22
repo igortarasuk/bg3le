@@ -68,6 +68,7 @@ void install_game_allocator() {
 
 extern "C" void* bg3le_stats_manager();
 extern "C" std::size_t bg3le_mods_count();
+extern "C" bool bg3le_stat_origins_ready();
 
 // Finds the stats manager on a thread of our own.
 //
@@ -83,6 +84,7 @@ void warm_stats_search() {
     std::thread([] {
         bool stats = false;
         bool mods = false;
+        bool origins = false;
         for (int attempt = 0; attempt < 40; ++attempt) {
             std::this_thread::sleep_for(std::chrono::seconds(5));
             if (!stats) stats = bg3le_stats_manager() != nullptr;
@@ -90,7 +92,11 @@ void warm_stats_search() {
             // memory scans, so it warms here rather than stalling the story
             // thread on whichever Ext.Mod call happens to come first.
             if (!mods) mods = bg3le_mods_count() > 0;
-            if (stats && mods) return;
+            // Which mod defines each stat comes from the archives, which
+            // means file IO and LZ4 -- off the story thread like the rest.
+            // It needs the load order, so it follows the module search.
+            if (mods && !origins) origins = bg3le_stat_origins_ready();
+            if (stats && mods && origins) return;
         }
         logf("stats: gave up warming the search after 40 attempts");
     }).detach();

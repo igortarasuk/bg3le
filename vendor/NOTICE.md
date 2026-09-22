@@ -349,3 +349,17 @@ types out of the generated property maps, not to shim a symbol.
 - **glm, imgui, rapidjson, tinycrypt, optick, Vulkan-Headers** — fetched, each
   under its own license.
 - **protobuf, SDL2, oneTBB** — from the distribution.
+
+## LZ4 — Yann Collet
+
+`external/lz4/` is the block codec from [LZ4](https://github.com/lz4/lz4)
+v1.10.0 by **Yann Collet**, BSD 2-Clause (see `external/lz4/LICENSE`).
+
+**Thank you.** bg3le needs it to read Larian's LSPK archives, which is how it
+works out which mod defines each stat — the one thing upstream gets by
+hooking the engine and that no symbol in the Linux build allows.
+
+Vendored rather than linked against the system library: bg3le is preloaded
+into a game that may run inside the Steam sniper container, which need not
+have `liblz4.so`, and a missing `DT_NEEDED` would stop it loading at all.
+Unmodified.

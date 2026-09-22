@@ -1042,6 +1042,8 @@ extern "C" void* bg3le_mods_at(std::size_t index);
 extern "C" void* bg3le_mods_find(char const* uuid);
 extern "C" void* bg3le_mods_base();
 extern "C" std::size_t bg3le_mods_available_count();
+extern "C" bool bg3le_stat_origin(char const* name, char const** modId,
+                                  char const** originalModId);
 extern "C" void* bg3le_mods_available_at(std::size_t index);
 extern "C" bool bg3le_mod_info(void const* module, bg3le::ModInfo* out);
 extern "C" std::size_t bg3le_mod_list_count(void const* module, int list);
@@ -1500,6 +1502,29 @@ int l_mod_list(lua_State* L) {
         lua_rawseti(L, -2, (int)i + 1);
     }
     return 1;
+}
+
+// Ext._Internal.StatOrigin(name) -> modId, originalModId
+//
+// Not a field on the stat: which mod defines an entry comes from the
+// archives. See src/vendor/stat_origins.cpp.
+int l_stat_origin(lua_State* L) {
+    char const* name = luaL_checkstring(L, 1);
+    char const* modId = nullptr;
+    char const* originalModId = nullptr;
+    if (!bg3le_stat_origin(name, &modId, &originalModId)) return 0;
+
+    if (modId != nullptr) {
+        lua_pushstring(L, modId);
+    } else {
+        lua_pushnil(L);
+    }
+    if (originalModId != nullptr) {
+        lua_pushstring(L, originalModId);
+    } else {
+        lua_pushnil(L);
+    }
+    return 2;
 }
 
 // ---- Ext.Stats ----
@@ -2369,6 +2394,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "ModInfo");
     lua_pushcfunction(g_lua, l_mod_list);
     lua_setfield(g_lua, -2, "ModList");
+    lua_pushcfunction(g_lua, l_stat_origin);
+    lua_setfield(g_lua, -2, "StatOrigin");
     lua_pushcfunction(g_lua, l_stats_count);
     lua_setfield(g_lua, -2, "StatsCount");
     lua_pushcfunction(g_lua, l_stats_name_at);
@@ -3222,10 +3249,9 @@ function Ext.Stats.Get(name)
 
   -- Fields upstream puts alongside the attributes. Names and shapes follow
   -- reference/stats-weapon.txt rather than being chosen here.
-  --
-  -- ModId and OriginalModId are absent on purpose: they are real mod GUIDs
-  -- upstream, bg3le has no mod manager yet, and an empty string would be a
-  -- wrong answer rather than a missing one.
+  local modId, originalModId = Ext._Internal.StatOrigin(name)
+  fields.ModId = modId
+  fields.OriginalModId = originalModId
   fields.ModifierList = Ext._Internal.StatsType(addr)
   fields.ModifierListIndex = Ext._Internal.StatsListIndex(addr)
   fields.Using = Ext._Internal.StatsUsing(addr) or ""
