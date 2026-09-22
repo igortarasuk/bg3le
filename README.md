@@ -48,10 +48,10 @@ none of it behavioural.
 - **Most of `Ext.*`.** Around 265 functions bg3se exposes have no equivalent
   here yet. The ECS plumbing they need is done, so most are now a component
   index plus a vendored struct
-- **The last 8% of the field kinds.** 2,491 of 2,708 component fields convert
-  (92.0%, from `tools/meta-check.c`): scalars, enums and bitmasks, nested
-  structs, fixed and dynamic arrays, hash sets, hash maps, glm vectors and
-  `FixedString`. What is left is `std::variant`, `std::optional`,
+- **The last 5% of the field kinds.** 2,561 of 2,708 component fields convert
+  (94.6%, from `tools/meta-check.c`): scalars, enums and bitmasks, nested
+  structs, fixed and dynamic arrays, hash sets, hash maps, glm vectors,
+  `std::optional` and `FixedString`. What is left is `std::variant`,
   `TranslatedString` and raw pointers. Naming an unsupported field raises
   rather than returning nil, so a mod cannot mistake a missing conversion for
   a missing value

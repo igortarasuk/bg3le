@@ -19,4 +19,4 @@ export BG3LE_DUMP_DB="${BG3LE_DUMP_DB:-1}"  # temporary: structural dump
 cd "$GAME"
 LD_PRELOAD="$HERE/build/libbg3le.so" \
 BG3LE_LOG="${BG3LE_LOG:-/tmp/bg3le.log}" \
-exec "$SNIPER/run" -- ./bin/bg3 "$@"
+exec "$SNIPER/run" -- "gamemoderun ./bin/bg3" "$@"

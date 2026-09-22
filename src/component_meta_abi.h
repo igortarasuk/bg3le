@@ -48,6 +48,10 @@ enum class FieldKind : std::uint8_t {
     // slot i holds key i and value i; KeyData and Data reach them. The
     // element fields describe the values, the key fields the keys.
     Map,
+    // A value that may or may not be there. Count is nought or one and Data
+    // points at it when there is one, so it indexes like a container -- which
+    // keeps "empty" distinct from "cannot be read".
+    Optional,
     // Not a field: records that the class also has the fields of the class
     // named in Name. Classes are declared in dependency-free order, so bases
     // are resolved by name at load rather than by pointer.

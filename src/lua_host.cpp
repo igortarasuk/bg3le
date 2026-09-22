@@ -504,7 +504,7 @@ std::optional<std::int32_t> component_index(const char* name) {
 enum class FieldKind : std::uint8_t {
     Unsupported = 0, Bool, Float, Double, Int8, Uint8, Int16, Uint16,
     Int32, Uint32, Int64, Uint64, Guid, Entity, FixedString, ScalarArray,
-    Struct, DynArray, Map, Inherit,
+    Struct, DynArray, Map, Optional, Inherit,
 };
 
 extern "C" const char* bg3le_meta_kind_name(std::uint8_t kind);
@@ -2014,7 +2014,16 @@ make_map = function(handle, comp, path)
         i = i + 1
         if i >= count() then return nil end
         local k = key_at(i)
-        if k == nil then k = "<unreadable key " .. i .. ">" end
+        -- Any placeholder carries the slot number, because two keys that
+        -- cannot be read still have to be distinct: identical ones collide
+        -- into a single entry and the map reads as shorter than it is. A
+        -- placeholder always arrives bracketed, which is also what keeps it
+        -- from being mistaken for a real key.
+        if k == nil then
+          k = "<unreadable key " .. i .. ">"
+        elseif type(k) == "string" and k:sub(1, 1) == "<" and k:sub(-1) == ">" then
+          k = k:sub(1, -2) .. " at slot " .. i .. ">"
+        end
         return k, value_at(i)
       end, self, nil
     end,
@@ -2043,6 +2052,19 @@ make_fields = function(handle, comp, prefix, fields)
       end
       if kind == "map" then
         return make_map(handle, comp, path)
+      end
+      -- An optional holds nought or one. Empty reads as nil, which is the
+      -- answer bg3se gives too, and is distinct from the field being
+      -- unreadable -- that still raises. A full one reads as whatever it
+      -- holds, which is the element one index in.
+      if kind == "optional" then
+        local held, err = Ext._Internal.ArrayInfo(handle, comp, path)
+        if held == nil then
+          error("bg3le: cannot size " .. comp .. "." .. path .. ": "
+                .. tostring(err), 0)
+        end
+        if held == 0 then return nil end
+        return make_array(handle, comp, path)[1]
       end
       if kind == "struct" then
         local inner, err = Ext._Internal.ComponentFields(comp, path)

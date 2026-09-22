@@ -164,6 +164,39 @@ void* set_data_thunk(void const* container) {
     return (void*)static_cast<S const*>(container)->keys().data();
 }
 
+// std::optional is a value that may or may not be there, which is a different
+// claim from one bg3le cannot read -- and reporting it as unsupported conflated
+// the two. bg3se prints null for an empty one; saying "unsupported" instead
+// would still be wrong when it is full.
+//
+// Read through has_value() and operator* rather than by guessing at where the
+// engaged flag sits. The engine is built against libc++ and so is bg3le, which
+// is already a requirement for std::string, so the layouts agree -- but going
+// through the accessors means not depending on that here.
+template <class T>
+struct OptionalTraits {
+    static constexpr bool kIsOptional = false;
+    using Elem = void;
+};
+
+template <class T>
+struct OptionalTraits<std::optional<T>> {
+    static constexpr bool kIsOptional = true;
+    using Elem = T;
+};
+
+template <class O>
+std::size_t optional_count_thunk(void const* opt) {
+    return static_cast<O const*>(opt)->has_value() ? 1 : 0;
+}
+
+template <class O>
+void* optional_data_thunk(void const* opt) {
+    auto const* o = static_cast<O const*>(opt);
+    if (!o->has_value()) return nullptr;
+    return (void*)&**o;
+}
+
 // A hash map keeps its keys and its values in two parallel contiguous runs,
 // so slot i holds key i alongside value i -- which is what makes it
 // presentable without hashing anything: iteration is a walk over both runs.
@@ -230,13 +263,15 @@ constexpr FieldKind scalar_kind_of() {
 // is the honest answer until they are handled.
 template <class T>
 constexpr FieldKind kind_of() {
+    // A fixed-extent array is one whatever its elements are: an element that
+    // is a struct or another container is reached through the element
+    // descriptor, and reportable_kind is what decides whether anything can be
+    // done with it. Restricting this to scalar elements made
+    // std::array<SomeStruct, N> unreadable -- which is how DiceValues, an
+    // optional std::array of structs, stayed out of reach after the optional
+    // itself worked.
     if constexpr (ArrayTraits<T>::kIsArray) {
-        if constexpr (scalar_kind_of<typename ArrayTraits<T>::Elem>()
-                      != FieldKind::Unsupported) {
-            return FieldKind::ScalarArray;
-        } else {
-            return FieldKind::Unsupported;
-        }
+        return FieldKind::ScalarArray;
     } else if constexpr (GlmTraits<T>::kIsGlm) {
         if constexpr (scalar_kind_of<typename GlmTraits<T>::Elem>()
                       != FieldKind::Unsupported) {
@@ -249,6 +284,8 @@ constexpr FieldKind kind_of() {
         return FieldKind::DynArray;
     } else if constexpr (MapTraits<T>::kIsMap) {
         return FieldKind::Map;
+    } else if constexpr (OptionalTraits<T>::kIsOptional) {
+        return FieldKind::Optional;
     } else if constexpr (scalar_kind_of<T>() != FieldKind::Unsupported) {
         return scalar_kind_of<T>();
     } else if constexpr (std::is_class_v<T>) {
@@ -325,6 +362,11 @@ constexpr FieldDesc make_field(char const* name, std::size_t offset) {
         f.Count = &set_count_thunk<T>;
         f.Data = &set_data_thunk<T>;
         f.ReadOnly = true;
+    } else if constexpr (OptionalTraits<T>::kIsOptional) {
+        using E = typename OptionalTraits<T>::Elem;
+        describe_elements.template operator()<E>();
+        f.Count = &optional_count_thunk<T>;
+        f.Data = &optional_data_thunk<T>;
     } else if constexpr (MapTraits<T>::kIsMap) {
         using K = typename MapTraits<T>::Key;
         using V = typename MapTraits<T>::Value;
@@ -807,7 +849,8 @@ Resolved resolve_path(ClassFields const* cls, char const* path, void* base) {
             // reachable by slot; the key side is read separately, because a
             // path has no way to say "the key of this slot".
             case FieldKind::DynArray:
-            case FieldKind::Map: {
+            case FieldKind::Map:
+            case FieldKind::Optional: {
                 if (current.Count == nullptr || current.Data == nullptr) return out;
                 if (address != nullptr) {
                     if (index >= current.Count(address)) return out;
@@ -896,7 +939,7 @@ std::uint8_t reportable_kind(FieldDesc const& field, unsigned depth = 0) {
     }
 
     if (field.Kind == FieldKind::ScalarArray || field.Kind == FieldKind::DynArray
-        || field.Kind == FieldKind::Map) {
+        || field.Kind == FieldKind::Map || field.Kind == FieldKind::Optional) {
         // A container is usable if its elements are: a scalar, a struct bg3se
         // describes, or another container. That last case is why this
         // recurses rather than testing the element fields directly -- a
@@ -990,7 +1033,8 @@ extern "C" int bg3le_meta_array_length(void const* handle, char const* path,
         *count = r.Field.ElemCount;
         return 0;
     }
-    if (r.Field.Kind != FieldKind::DynArray && r.Field.Kind != FieldKind::Map) {
+    if (r.Field.Kind != FieldKind::DynArray && r.Field.Kind != FieldKind::Map
+        && r.Field.Kind != FieldKind::Optional) {
         return 3;
     }
     if (r.Field.Count == nullptr) return 4;
@@ -1352,6 +1396,54 @@ extern "C" int bg3le_meta_selftest() {
         }
     }
 
+    // An optional, empty and then full. Empty has to be distinguishable from
+    // unreadable: bg3se prints null for an empty one, and reporting it as
+    // unsupported conflated "there is nothing here" with "I cannot read this".
+    {
+        auto const* resMeta3 = static_cast<ClassFields const*>(
+            bg3le_meta_component("eoc::ActionResourcesComponent"));
+        std::size_t held = 0;
+        std::uint16_t sz = 0;
+        std::uint8_t ek = 0;
+
+        // The entries above were default-constructed, so DiceValues is empty.
+        if (bg3le_meta_array_length(resMeta3, "Resources[0][0].DiceValues",
+                                    &resources, &held, &sz, &ek) != 0) {
+            fail("an empty optional has no length");
+        } else if (held != 0) {
+            fail("an empty optional does not report as empty");
+        }
+
+        // Fill it; the same field has to report one and read back.
+        std::array<ActionResourceDiceValue, 7> dice{};
+        dice[0].Amount = 3.0;
+        dice[0].MaxAmount = 6.0;
+        resources.Resources.values()[0][0].DiceValues = dice;
+
+        if (bg3le_meta_array_length(resMeta3, "Resources[0][0].DiceValues",
+                                    &resources, &held, &sz, &ek) != 0) {
+            fail("a full optional has no length");
+        } else if (held != 1) {
+            fail("a full optional does not report as holding one");
+        }
+
+        if (!bg3le_meta_resolve(resMeta3,
+                                "Resources[0][0].DiceValues[0][0].Amount",
+                                &resources, &address, &kind, &size,
+                                &readOnly)) {
+            fail("cannot reach through a full optional");
+        } else if (*(double*)address != 3.0) {
+            fail("a value read through an optional does not match");
+        }
+
+        // Past the single slot must fail, as for any container.
+        if (bg3le_meta_resolve(resMeta3, "Resources[0][0].DiceValues[1]",
+                               &resources, &address, &kind, &size,
+                               &readOnly)) {
+            fail("an optional indexed past its single slot resolved");
+        }
+    }
+
     // Enum labels, checked against what bg3se prints on Windows for the same
     // save: ReplenishType came back as 2 and 8 here where bg3se showed
     // ["Default"] and ["Rest"]. It is a bitmask, so the labels are flags.
@@ -1496,6 +1588,7 @@ extern "C" char const* bg3le_meta_kind_name(std::uint8_t kind) {
         case FieldKind::Struct: return "struct";
         case FieldKind::DynArray: return "array";
         case FieldKind::Map: return "map";
+        case FieldKind::Optional: return "optional";
         case FieldKind::Inherit: return "inherit";
         default: return "unsupported";
     }
