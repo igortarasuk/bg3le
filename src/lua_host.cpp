@@ -1030,6 +1030,24 @@ extern "C" void* bg3le_resource_get(std::int32_t typeIndex, void const* guid,
 extern "C" std::size_t bg3le_resource_count(std::int32_t typeIndex);
 extern "C" bool bg3le_resource_guid_at(std::int32_t typeIndex, std::size_t i,
                                        void* guidOut);
+// Ext.Stats. The manager is found by fingerprint like the resource manager;
+// see src/vendor/stats.cpp for why the attribute values need four lookups
+// rather than an offset.
+extern "C" void* bg3le_stats_manager();
+extern "C" std::size_t bg3le_stats_count();
+extern "C" void* bg3le_stats_at(std::size_t index);
+extern "C" char const* bg3le_stats_name(void const* object);
+extern "C" void* bg3le_stats_find(char const* name);
+extern "C" char const* bg3le_stats_type(void const* object);
+extern "C" std::size_t bg3le_stats_attr_count(void const* object);
+extern "C" bool bg3le_stats_attr_at(void const* object, std::size_t index,
+                                    char const** nameOut,
+                                    char const** typeNameOut, int* kindOut,
+                                    int* rawOut);
+extern "C" char const* bg3le_stats_attr_label(void const* object,
+                                              std::size_t index, int raw);
+extern "C" char const* bg3le_stats_attr_string(int raw);
+
 extern "C" void* bg3le_resource_manager();
 extern "C" std::size_t bg3le_resource_bank_count();
 extern "C" bool bg3le_resource_bank_at(std::size_t i, std::int32_t* typeIndex,
@@ -1319,6 +1337,103 @@ int l_resource_guids(lua_State* L) {
         lua_pushstring(L, text);
         lua_rawseti(L, -2, ++written);
     }
+    return 1;
+}
+
+// ---- Ext.Stats ----
+//
+// The manager is found by fingerprint (src/vendor/stats.cpp). Attribute
+// values are stored apart from their names, so one attribute takes a name, a
+// type and a raw int, and the decoding of that int depends on the type. These
+// entry points hand the pieces to Lua and the prelude assembles them, which
+// keeps the C side free of policy about how a stat should look.
+
+// Ext._Internal.StatsCount() -> n
+int l_stats_count(lua_State* L) {
+    lua_pushinteger(L, (lua_Integer)bg3le_stats_count());
+    return 1;
+}
+
+// Ext._Internal.StatsNameAt(index) -> name
+int l_stats_name_at(lua_State* L) {
+    const auto i = (std::size_t)luaL_checkinteger(L, 1);
+    void* obj = bg3le_stats_at(i);
+    if (obj == nullptr) return 0;
+    char const* name = bg3le_stats_name(obj);
+    if (name == nullptr) return 0;
+    lua_pushstring(L, name);
+    return 1;
+}
+
+// Ext._Internal.StatsFind(name) -> address
+int l_stats_find(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    void* obj = bg3le_stats_find(name);
+    if (obj == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "no stat named %s (the manager holds %d)", name,
+                        (int)bg3le_stats_count());
+        return 2;
+    }
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)obj);
+    return 1;
+}
+
+// Ext._Internal.StatsType(address) -> modifier list name
+int l_stats_type(lua_State* L) {
+    auto* obj = (void*)(std::uintptr_t)luaL_checkinteger(L, 1);
+    char const* type = bg3le_stats_type(obj);
+    if (type == nullptr) return 0;
+    lua_pushstring(L, type);
+    return 1;
+}
+
+// Ext._Internal.StatsAttrCount(address) -> n
+int l_stats_attr_count(lua_State* L) {
+    auto* obj = (void*)(std::uintptr_t)luaL_checkinteger(L, 1);
+    lua_pushinteger(L, (lua_Integer)bg3le_stats_attr_count(obj));
+    return 1;
+}
+
+// Ext._Internal.StatsAttrAt(address, index) -> name, typeName, kind, raw
+int l_stats_attr_at(lua_State* L) {
+    auto* obj = (void*)(std::uintptr_t)luaL_checkinteger(L, 1);
+    const auto i = (std::size_t)luaL_checkinteger(L, 2);
+
+    char const* name = nullptr;
+    char const* typeName = nullptr;
+    int kind = 0;
+    int raw = 0;
+    if (!bg3le_stats_attr_at(obj, i, &name, &typeName, &kind, &raw)) {
+        return 0;
+    }
+
+    if (name != nullptr) lua_pushstring(L, name);
+    else lua_pushnil(L);
+    if (typeName != nullptr) lua_pushstring(L, typeName);
+    else lua_pushnil(L);
+    lua_pushinteger(L, kind);
+    lua_pushinteger(L, raw);
+    return 4;
+}
+
+// Ext._Internal.StatsAttrLabel(address, index, raw) -> label
+int l_stats_attr_label(lua_State* L) {
+    auto* obj = (void*)(std::uintptr_t)luaL_checkinteger(L, 1);
+    const auto i = (std::size_t)luaL_checkinteger(L, 2);
+    const int raw = (int)luaL_checkinteger(L, 3);
+    char const* label = bg3le_stats_attr_label(obj, i, raw);
+    if (label == nullptr) return 0;
+    lua_pushstring(L, label);
+    return 1;
+}
+
+// Ext._Internal.StatsAttrString(raw) -> text
+int l_stats_attr_string(lua_State* L) {
+    const int raw = (int)luaL_checkinteger(L, 1);
+    char const* text = bg3le_stats_attr_string(raw);
+    if (text == nullptr) return 0;
+    lua_pushstring(L, text);
     return 1;
 }
 
@@ -2017,6 +2132,22 @@ void lua_init() {
     lua_setfield(g_lua, -2, "MapKey");
     lua_pushcfunction(g_lua, l_variant_index);
     lua_setfield(g_lua, -2, "VariantIndex");
+    lua_pushcfunction(g_lua, l_stats_count);
+    lua_setfield(g_lua, -2, "StatsCount");
+    lua_pushcfunction(g_lua, l_stats_name_at);
+    lua_setfield(g_lua, -2, "StatsNameAt");
+    lua_pushcfunction(g_lua, l_stats_find);
+    lua_setfield(g_lua, -2, "StatsFind");
+    lua_pushcfunction(g_lua, l_stats_type);
+    lua_setfield(g_lua, -2, "StatsType");
+    lua_pushcfunction(g_lua, l_stats_attr_count);
+    lua_setfield(g_lua, -2, "StatsAttrCount");
+    lua_pushcfunction(g_lua, l_stats_attr_at);
+    lua_setfield(g_lua, -2, "StatsAttrAt");
+    lua_pushcfunction(g_lua, l_stats_attr_label);
+    lua_setfield(g_lua, -2, "StatsAttrLabel");
+    lua_pushcfunction(g_lua, l_stats_attr_string);
+    lua_setfield(g_lua, -2, "StatsAttrString");
     lua_pushcfunction(g_lua, l_resource_banks);
     lua_setfield(g_lua, -2, "ResourceBanks");
     lua_pushcfunction(g_lua, l_resource_get);
@@ -2591,6 +2722,119 @@ function Ext.Entity.Get(id)
                        EntityUuid = type(id) == "string" and id or nil},
                       entity_meta)
 end
+
+-- ---- Ext.Stats ----
+--
+-- A stat's attributes are not fields at fixed offsets; each one is a name, a
+-- type and a raw integer, and the type decides how to read the integer. That
+-- decoding lives here rather than in C so the shape of a stat is described in
+-- one readable place.
+--
+-- RPGEnumerationType, in the order bg3se declares it. The C side returns
+-- these numbers.
+local STAT_KIND = {
+  [0] = "Int", [1] = "Int64", [2] = "Float", [3] = "FixedString",
+  [4] = "Enumeration", [5] = "Flags", [6] = "GUID", [7] = "StatsFunctors",
+  [8] = "Conditions", [9] = "RollConditions", [10] = "Requirements",
+  [11] = "MemorizationRequirements", [12] = "TranslatedString",
+  [13] = "Unknown",
+}
+
+Ext.Stats = {}
+
+-- One attribute, decoded as far as its type allows.
+local function read_attribute(addr, i)
+  local name, typeName, kind, raw = Ext._Internal.StatsAttrAt(addr, i)
+  if name == nil then return nil end
+
+  local value
+  if kind == 0 or kind == 1 then
+    value = raw
+  elseif kind == 2 then
+    -- Floats are stored in the same int32 slot; the engine keeps them in the
+    -- float table rather than inline, so the raw value is an index and the
+    -- number itself is not reachable from here yet.
+    value = raw
+  elseif kind == 3 then
+    value = Ext._Internal.StatsAttrString(raw) or raw
+  elseif kind == 4 or kind == 5 then
+    value = Ext._Internal.StatsAttrLabel(addr, i, raw) or raw
+  else
+    -- Functors, conditions, requirements and translated strings are stored
+    -- elsewhere on the object; the raw handle is reported rather than guessed
+    -- at, so nothing here pretends to a value it does not have.
+    value = raw
+  end
+
+  return name, value, STAT_KIND[kind] or "Unknown", typeName, raw
+end
+
+-- Ext.Stats.Get(name) -> table of attributes, or nil plus a reason
+function Ext.Stats.Get(name)
+  if type(name) ~= "string" then
+    return nil, "Ext.Stats.Get takes a stat name"
+  end
+
+  local addr, err = Ext._Internal.StatsFind(name)
+  if addr == nil then return nil, err end
+
+  local out = {Name = name}
+  local n = Ext._Internal.StatsAttrCount(addr)
+  for i = 0, n - 1 do
+    local attr, value = read_attribute(addr, i)
+    if attr ~= nil then out[attr] = value end
+  end
+  -- Attributes need the modifier lists, which are not located yet. Say so in
+  -- the table rather than returning a name and letting it look complete.
+  if n == 0 then
+    out.AttributesUnavailable =
+      "the modifier lists have still to be located"
+  end
+  return out
+end
+
+-- Ext.Stats.GetTypes(name) -> { attribute = type, ... }
+--
+-- Separate from Get because the values and their types are wanted for
+-- different reasons, and putting both in one table would collide with the
+-- attribute names.
+function Ext.Stats.GetTypes(name)
+  local addr, err = Ext._Internal.StatsFind(name)
+  if addr == nil then return nil, err end
+  local out = {}
+  local n = Ext._Internal.StatsAttrCount(addr)
+  for i = 0, n - 1 do
+    local attr, _, kind, typeName = read_attribute(addr, i)
+    if attr ~= nil then
+      out[attr] = {Kind = kind, ValueList = typeName}
+    end
+  end
+  return out
+end
+
+-- Ext.Stats.GetAllStats() -> { name, ... }
+--
+-- No filter argument. Filtering by modifier list needs the modifier lists,
+-- which are not located yet, and the obvious implementation -- StatsFind per
+-- stat -- is quadratic: 15754 stats each costing a linear scan of 15754.
+-- That would hang the story thread, which has already happened once on this
+-- feature and is not worth repeating for a convenience.
+function Ext.Stats.GetAllStats(modifierList)
+  if modifierList ~= nil then
+    return nil, "filtering by modifier list is not available yet; the "
+      .. "modifier lists have still to be located"
+  end
+  local out = {}
+  local n = Ext._Internal.StatsCount()
+  for i = 0, n - 1 do
+    local name = Ext._Internal.StatsNameAt(i)
+    if name ~= nil then out[#out + 1] = name end
+  end
+  return out
+end
+
+-- How many stats the manager holds, without building a table of names.
+function Ext.Stats.GetStatsCount() return Ext._Internal.StatsCount() end
 
 -- ---- Ext.StaticData ----
 --

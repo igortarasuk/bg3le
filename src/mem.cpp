@@ -23,6 +23,17 @@ bool safe_read(const void* addr, void* out, std::size_t n) {
     return read_raw(addr, out, n);
 }
 
+std::size_t safe_read_some(const void* addr, void* out, std::size_t n) {
+    if (addr == nullptr || reinterpret_cast<std::uintptr_t>(addr) < 0x1000) {
+        return 0;
+    }
+    iovec local{out, n};
+    iovec remote{const_cast<void*>(addr), n};
+    const ssize_t got =
+        ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0);
+    return got > 0 ? (std::size_t)got : 0;
+}
+
 bool safe_cstr(const void* addr, char* buf, std::size_t buf_size) {
     if (buf_size == 0) return false;
     buf[0] = '\0';

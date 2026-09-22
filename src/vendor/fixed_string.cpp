@@ -33,6 +33,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 #include <string>
 
 #include "../log.h"
@@ -304,6 +305,75 @@ extern "C" void* bg3le_string_table() {
         g_table = search_for_table();
     }
     return g_table;
+}
+
+// The index of a string, by its text, or false if the table does not hold it.
+//
+// This exists so a scan can look for one exact 32-bit value instead of
+// guessing at plausible indices. The stats search first tried the latter:
+// seven plausibility tests at every four-byte offset of every writable
+// region, which took 114 seconds. Searching for a known index is a plain
+// memory compare.
+//
+// Walks buckets rather than entries. Resolving an entry costs a
+// process_vm_readv each, and a table of this size has millions of them, so
+// each bucket is read whole and searched locally -- one syscall per bucket.
+extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
+                                            std::uint32_t* out) {
+    if (wanted == nullptr) return false;
+    void const* table = bg3le_string_table();
+    if (table == nullptr) return false;
+
+    const std::size_t wantLen = std::strlen(wanted);
+    std::vector<unsigned char> bucketBuf;
+
+    for (std::size_t sub = 0; sub < kSubTableCount; ++sub) {
+        void const* st = sub_table(table, sub);
+        if (!sub_table_plausible(st)) continue;
+
+        const auto entrySize =
+            read_at<std::uint64_t>(st, offsetof(SubTable, EntrySize));
+        const auto numBuckets =
+            read_at<std::uint32_t>(st, offsetof(SubTable, NumBuckets));
+        const auto perBucket =
+            read_at<std::uint32_t>(st, offsetof(SubTable, EntriesPerBucket));
+        auto** buckets =
+            read_at<std::uint8_t**>(st, offsetof(SubTable, Buckets));
+        if (buckets == nullptr || entrySize == 0) continue;
+
+        const std::size_t span = (std::size_t)perBucket * (std::size_t)entrySize;
+        if (span == 0 || span > (64u << 20)) continue;
+        bucketBuf.resize(span);
+
+        for (std::uint32_t b = 0; b < numBuckets; ++b) {
+            std::uint8_t* bucket = nullptr;
+            if (!safe_read(&buckets[b], &bucket, sizeof(bucket))
+                || bucket == nullptr) {
+                continue;
+            }
+            const std::size_t got =
+                safe_read_some(bucket, bucketBuf.data(), span);
+            if (got < sizeof(Header) + 1) continue;
+
+            for (std::uint32_t e = 0; e < perBucket; ++e) {
+                const std::size_t at = (std::size_t)e * (std::size_t)entrySize;
+                if (at + sizeof(Header) + wantLen + 1 > got) break;
+
+                auto const* header = (Header const*)(bucketBuf.data() + at);
+                if (header->Length != wantLen) continue;
+
+                char const* text = (char const*)(header + 1);
+                if (std::memcmp(text, wanted, wantLen) != 0) continue;
+                if (text[wantLen] != '\0') continue;
+
+                if (out != nullptr) {
+                    *out = (std::uint32_t)sub | (b << 4) | (e << 20);
+                }
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // The text of a FixedString index, or null. length may be null.

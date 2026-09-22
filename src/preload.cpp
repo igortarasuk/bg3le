@@ -16,6 +16,7 @@
 #include <sched.h>
 #include <spawn.h>
 #include <sys/wait.h>
+#include <chrono>
 #include <thread>
 #include <mutex>
 #include <ctime>
@@ -63,6 +64,28 @@ void install_game_allocator() {
     }
     logf("game allocator: using the engine heap (new %p, delete %p)", alloc,
          free);
+}
+
+extern "C" void* bg3le_stats_manager();
+
+// Finds the stats manager on a thread of our own.
+//
+// The search reads every writable region, and the console dispatches
+// expressions onto the story thread -- so doing it on demand means the first
+// Ext.Stats call stalls the game. Worse, the stats are parsed during load, so
+// an early attempt fails for a reason that stops being true; this retries
+// until it succeeds or the game has plainly finished loading without it.
+//
+// Detached on purpose: nothing waits on the result, and a failure only means
+// Ext.Stats reports itself unavailable.
+void warm_stats_search() {
+    std::thread([] {
+        for (int attempt = 0; attempt < 40; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            if (bg3le_stats_manager() != nullptr) return;
+        }
+        logf("stats: gave up warming the search after 40 attempts");
+    }).detach();
 }
 
 template <typename Fn>
@@ -243,6 +266,7 @@ void ensure_symbols() {
         logf("  sentinel esv TagComponentTypeContext::m_State -> %p", p);
         lua_init();
         debug_server_start();
+        warm_stats_search();
         if (const char* e = std::getenv("BG3LE_CLOCK_STATS")) {
             g_clock_stats.store(e[0] == '1');
         }
