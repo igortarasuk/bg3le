@@ -350,3 +350,176 @@ adjacent to the other save-slot-state enum values used by this same
 dispatcher (`0x133`, `0x2c1`, and whatever the "corrupted save" / "wrong
 version" cases turn out to be), which would locate the enum table itself
 rather than one instruction referencing one entry of it.
+
+## Session 2: Steam vtable hook (works, but doesn't answer the question yet)
+
+Added a real, permanent diagnostic to `src/preload.cpp`: bg3's own PLT has
+**zero** relocations against the flat `SteamAPI_ISteamUserStats_*` functions
+(confirmed via `readelf -r`) -- it is a normal C++ Steamworks SDK consumer,
+not a flat-API one. It gets its `ISteamUserStats*` through
+`SteamInternal_FindOrCreateUserInterface(hSteamUser, "STEAMUSERSTATS_INTERFACE_VERSION012")`
+(this symbol *is* PLT-imported, confirmed live) and calls straight through
+the interface's vtable. `libsteam_api.so`'s own flat-API thunks are just
+`jmp [rax+offset]` on that same object, so disassembling them gives the exact
+vtable slot for free: `SetAchievement` = `+0x38` (slot 7), `StoreStats` =
+`+0x50` (slot 10).
+
+`preload.cpp` now interposes `SteamInternal_FindOrCreateUserInterface`
+(case-insensitive match on `"UserStats"` in the version string -- the real
+constant is all-caps, a first attempt missed it by matching mixed case), and
+on the first `ISteamUserStats` interface it sees, patches vtable slot 7 with
+a logging trampoline (`mprotect` the single 8-byte slot, swap the pointer,
+`mprotect` back), the same primitive family as `hook.cpp`'s `hook_slot`. This
+**works** -- confirmed live, logs `steam hook: ISteamUserStats vtable ...
+SetAchievement slot -> ...`.
+
+Two attempts to actually trigger it:
+- `Osi.UnlockAchievement("NEW_ACHIEVEMENT_1_0", host)` from the debug
+  console, both with and without mods active: call returns cleanly, **but
+  never reaches the hooked `SetAchievement`**. Root cause: `NEW_ACHIEVEMENT_1_0`
+  is not a real achievement ID -- it is only the localization *token* BG3's
+  Steam schema uses for the display name/description (confirmed by parsing
+  `~/.local/share/Steam/appcache/stats/UserGameStatsSchema_1086940.bin`
+  directly: real API names are `BG3_Quest01`..`BG3_Quest54`, e.g. `name` field
+  = `BG3_Quest01` for the "Descent from Avernus" achievement). The engine
+  presumably rejects the unknown name before ever touching Steam, so this
+  result says nothing about the mod block either way.
+- `Osi.UnlockAchievement("BG3_Quest01", host)` (a real, already-earned-by-this-save
+  achievement ID, chosen specifically to be safe) **crashed the game**
+  (SIGSEGV, confirmed via `coredumpctl`). Backtrace root-caused to
+  `bg3le::osi::invoke()` -> `COsiArgumentDesc::SetAnyString()` -- a marshalling
+  bug in `src/osi.cpp`, not in the Steam hook (the crash happens before
+  `invoke()`'s `handler()` call is ever reached, i.e. before Osiris itself
+  runs). Initial hypothesis (the `NextParam`-pointer memcpy in `invoke()`'s
+  per-param loop overwriting the value fields it just wrote) was checked
+  against `vendor/bg3se/BG3Extender/GameDefinitions/Osiris.h` and is **wrong**
+  -- `NextParam` really is the first 8-byte field there, matching what
+  `osi.cpp` assumes, so the bug is something else (most likely: `UnlockAchievement`
+  is one of the Osiris functions whose parameter signature bg3le's
+  `load_out_param_counts` signature walk failed to resolve -- see "Signature
+  walk found ... matched 324 of 1303 functions" in the boot log -- so its
+  `fn.params` may have the wrong count/types/order). **Not fixed this
+  session** -- deliberately parked in favour of the direct static hunt below,
+  since fixing it is a separate, real bg3le bug worth its own investigation
+  rather than a blocker for the achievements question specifically.
+
+Net result: the Steam-side hook infrastructure is sound and reusable, but we
+still have no live confirmation of where the block sits, because the one
+reliable way to *drive* a real achievement call through it (`Osi.UnlockAchievement`
+with a real ID) currently crashes.
+
+## Session 2: static hunt for the comparison, round 2 -- also inconclusive
+
+Picked up the "worth revisiting by finding its callers" lead on the generic
+16-byte comparator at `0x41eafa0` (`sete`+`xor`+SIMD-fallback shape, i.e.
+almost certainly `FixedString::operator==` or equivalent -- a leaf utility
+used all over the engine, not achievement-specific by itself). Found its
+function boundary cleanly this time (`int3` padding before/after, unlike the
+generic-registration functions below) and its exact 6 direct (non-inlined)
+call sites binary-wide via an `E8 rel32` scan:
+
+- `0x3d2ac85`, `0x5f82b6d`: not yet examined.
+- `0x41ea86a`, `0x41ead58`, `0x41ead8a`, `0x41eb231`: all four sit physically
+  inside/near the `LoadSavegame` address range, but disassembling the
+  surrounding code shows they are all comparing against a single constant
+  address (`0x1e95040`), with vector-growth/index-store code around them
+  (`+0x18`/`+0x30`/`+0x38`/`+0x3c` field pattern) -- this is a generic
+  `Set<FixedString>::Insert`-shaped hash-set operation (comparing against an
+  empty-slot sentinel), physically link-adjacent to `LoadSavegame` by
+  coincidence, not semantically part of it. Another dead end.
+
+Also tried the direct approach of searching for a function that references
+**several** of the six official-GUID globals at once (the actual comparison
+would plausibly need to check a mod's UUID against all six). Found two such
+clusters by raw `lea`-target scanning
+(`0x4ca37ef`-`0x4ca3867` and `0x740ac11`-`0x740ac6b`, each hitting all 6
+targets) -- both turned out to be generic "for every static global in this
+translation unit, call a shared per-object registration helper"
+(`__cxa_atexit` in one case, an unidentified `call 0x3883660` in the other)
+loops that touch literally every static in the binary, not anything
+achievement-specific. A third variant (32-bit `mov reg,[rip+addr]`, i.e.
+*reading* a target's value rather than taking its address) found 20 hits, but
+all against just two of the six targets (`0x7d26444`, `0x7d25a38`), scattered
+across a ~1.5MB code range -- too generic-looking to be the check (more
+likely some frequently-read flag/type-tag unrelated to mods).
+
+**Conclusion: raw objdump+python byte-pattern xref scanning has been pushed
+as far as it usefully goes on this binary.** The false-positive rate is high
+because BG3's binary is enormous and heavily templated (generic containers
+get instantiated and inlined everywhere), so "who references address X"
+answered by opcode-pattern-matching keeps surfacing generic
+container/registration machinery instead of business logic.
+
+## Session 2: Ghidra setup (portable, no sudo) and headless hunt
+
+Installed both without touching the system (no `pacman -S`, no sudo needed at
+all):
+
+- **JDK**: `pacman -Sp jdk-openjdk` prints the resolved mirror URL without
+  installing anything; downloaded that `.pkg.tar.zst` directly and extracted
+  it with `tar --use-compress-program=unzstd` into
+  `tools/jdk_extract/`. One fixup needed: the package's
+  `usr/lib/jvm/java-26-openjdk/conf` is a symlink to `/etc/java-openjdk`
+  (which doesn't exist without a real package install) -- replaced it with a
+  symlink to the package's own extracted `etc/java-openjdk` instead.
+- **Ghidra**: latest GitHub release zip, extracted with Python's `zipfile`
+  (no `unzip` binary on this system) -- note this does **not** preserve the
+  executable bit, so every script under `support/` needed an explicit
+  `chmod +x` pass afterwards.
+- **Import + full auto-analysis**: `analyzeHeadless <project> bg3proj -import bin/bg3`
+  took **~1h55m** single-threaded (confirmed via `top`: one core at ~100%,
+  the other 19 idle -- Ghidra's core auto-analysis pipeline does not
+  parallelize across analyzers) on this ~90MB-`.text` binary. Produced a very
+  large number of `WARN (ClearFlowAndRepairCmd) Removing function with bad
+  body` / `WARN (MultEntSubModel) Failed to find entry point for subroutine`
+  messages throughout -- Ghidra's own function-boundary analysis clearly
+  struggled with this binary (likely the same heavy SIMD/inlining/-O2
+  codegen that made raw disassembly hard by hand).
+- **Gotcha**: `-process <name>` **re-runs full auto-analysis by default**
+  unless `-noanalysis` is also passed -- burned ~15 minutes re-analyzing an
+  already-analyzed project before this was caught and killed/restarted
+  correctly.
+- **Gotcha**: Ghidra 12.1.4 dropped the bundled Jython interpreter; `.py`
+  post-scripts now require a real PyGhidra (CPython bridge) install, which we
+  don't have. Rewrote the post-script in Java instead
+  (`tools/ghidra_scripts/FindIsModded.java`, a plain `GhidraScript`) --
+  works with zero extra setup.
+
+**Findings from the Ghidra xref dump (`bg3le/reference/ghidra_findings.txt`,
+committed alongside this file) are sparse and inconclusive**, and notably
+*weaker* than the manual objdump scan:
+
+- Only 3 distinct functions found referencing any of the six official-GUID
+  globals at all (`FUN_04f496f0` hitting 2/6, `FUN_047de360` and
+  `FUN_04797ec0` hitting 1/6 each) -- all with `refType=WRITE`/`DATA`, i.e.
+  these read as *construction* sites, not comparison sites. None of these
+  three addresses match the `0x408d2f0` constructor found by hand earlier,
+  so Ghidra appears to have found a **different** set of writers than the
+  ones identified manually -- unreconciled.
+- **Decompilation failed for all three** (empty error message from
+  `DecompInterface`), which combined with the huge number of "bad function
+  body" warnings during import suggests Ghidra's control-flow/function
+  analysis genuinely did not fully map this binary's code -- likely needs
+  non-default analyzer settings (or per-function manual re-analysis at the
+  addresses already known from objdump) to be more useful than the manual
+  approach was. Not investigated further this session.
+
+**Bottom line for next time**: Ghidra is installed and working
+(`tools/ghidra_project/bg3proj`, `tools/ghidra_scripts/FindIsModded.java`),
+but its default-settings automated analysis of this specific binary is not
+yet better than manual objdump work, just different. The comparison function
+gating achievements is **still not located**. The most promising unexplored
+leads, in order:
+1. Fix the `osi.cpp` marshalling bug (real signature for `UnlockAchievement`
+   is likely wrong -- check/fix `load_out_param_counts`' handling of it, or
+   hardcode its known-correct arity/types) so `Osi.UnlockAchievement("BG3_Quest01", host)`
+   can be safely re-tried as a live oracle, this time correlated with the
+   already-working Steam vtable hook, across a real mods-active vs.
+   mods-inactive comparison (the one experiment that would settle this
+   conclusively and was never completed).
+2. In Ghidra's GUI (not headless) with the existing analyzed project, jump
+   directly to the three functions objdump found manually
+   (`0x4ca37ef`, `0x740ac11`, `0x41eafa0`, and the six GUID addresses
+   themselves) and force Ghidra to (re-)disassemble/create functions there by
+   hand if it hasn't -- interactive fix-up rather than trusting default
+   auto-analysis.
