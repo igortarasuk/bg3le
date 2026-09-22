@@ -363,3 +363,24 @@ Vendored rather than linked against the system library: bg3le is preloaded
 into a game that may run inside the Steam sniper container, which need not
 have `liblz4.so`, and a missing `DT_NEEDED` would stop it loading at all.
 Unmodified.
+
+### STDString is not std::string here
+
+`CoreLib/Base/BaseString.h` defined `STDString` as
+`std::basic_string<char, ..., GameAllocator<char>>`. That is right on
+Windows, where Larian's string is MSVC's `std::string` at 32 bytes. The
+native Linux build's is **16 bytes**, and is not any `std::string` --
+libc++'s is 24. `CoreLib/Base/LSString.h` (bg3le's own, added here) defines
+it: up to fifteen characters inline with the length in the last byte,
+otherwise a pointer, a size and a capacity whose top bit marks the heap
+form.
+
+This is the one vendored change that is not purely about compiling with
+clang, and it is not optional: every struct holding an `STDString` is laid
+out wrong without it. It was proven twice against the running game --
+"Shared" inline at `ModuleInfo+32` with its length at `+47`, which is the
+only way the 240-byte `Module` stride adds up, and the 3,125 entries of
+`RPGStats::Conditions` reading back as valid expressions at 16-byte spacing.
+
+One call site changed with it: `LuaDebugger.cpp:1027` passes `.c_str()` to
+`std::regex_match`, which has no overload for the new type.

@@ -1024,7 +1024,7 @@ namespace bg3se::lua::dbg
                 "local Ext = Ext\r\n";
             
             for (auto const& local : locals) {
-                if (std::regex_match(local.second, validLocalNameRe)) {
+                if (std::regex_match(local.second.c_str(), validLocalNameRe)) {
                     evalateLocals += "local " + local.second + " = _EVAL_LOCALS_[" + std::to_string(local.first).c_str() + "]\r\n";
                 } else {
                     OsiWarn("Variable '" << local.second << "' not passed to evaluation context");

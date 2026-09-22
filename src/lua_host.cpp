@@ -1094,6 +1094,7 @@ extern "C" void* bg3le_stats_object_expression(void const* object,
                                                char const* className,
                                                char const* field);
 extern "C" char const* bg3le_stats_expression_code(void const* pooled);
+extern "C" void bg3le_stats_expression_dump(void const* pooled);
 extern "C" bool bg3le_stats_expression_refcount(void const* pooled,
                                                 int* out);
 extern "C" int bg3le_stats_roll_condition_count(void const* object,
@@ -1557,6 +1558,13 @@ int l_stats_attr_condition(lua_State* L) {
     if (text == nullptr) return 0;
     lua_pushstring(L, text);
     return 1;
+}
+
+// Ext._Internal.ExpressionDump(pooled) -- diagnostics only.
+int l_expression_dump(lua_State* L) {
+    bg3le_stats_expression_dump(
+        (void const*)(std::uintptr_t)luaL_checkinteger(L, 1));
+    return 0;
 }
 
 // Ext._Internal.ObjectCondition(address, class, field) -> expression text
@@ -2571,6 +2579,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "StatsAttrTranslated");
     lua_pushcfunction(g_lua, l_stats_attr_condition);
     lua_setfield(g_lua, -2, "StatsAttrCondition");
+    lua_pushcfunction(g_lua, l_expression_dump);
+    lua_setfield(g_lua, -2, "ExpressionDump");
     lua_pushcfunction(g_lua, l_object_condition);
     lua_setfield(g_lua, -2, "ObjectCondition");
     lua_pushcfunction(g_lua, l_object_expression);

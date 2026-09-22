@@ -325,6 +325,38 @@ std::size_t values_offset(void const* functors) {
     return (std::size_t)-1;
 }
 
+// The raw bytes of an expression's Params buffer, so the engine's element
+// stride and where it keeps the variant index can be read off rather than
+// inferred from what this build happens to compile std::variant to.
+extern "C" void bg3le_stats_expression_dump(void const* pooled) {
+    std::size_t params = 0;
+    if (pooled == nullptr
+        || !field_offset("StatsExpressionPooled", "Params", &params)) {
+        return;
+    }
+
+    void const* buffer = nullptr;
+    std::uint32_t capacity = 0;
+    std::uint32_t size = 0;
+    if (!read_as((char const*)pooled + params, &buffer)
+        || !read_as((char const*)pooled + params + 8, &capacity)
+        || !read_as((char const*)pooled + params + 12, &size)
+        || buffer == nullptr) {
+        return;
+    }
+
+    logf("expr: Params buffer %p, capacity %u, size %u", buffer, capacity,
+         size);
+    for (std::size_t off = 0; off < 128; off += 8) {
+        std::uint64_t word = 0;
+        if (!read_as((char const*)buffer + off, &word)) break;
+        auto const* b = (unsigned char const*)&word;
+        logf("expr:   +%3zu %016llx  bytes %3u %3u %3u %3u %3u %3u %3u %3u",
+             off, (unsigned long long)word, b[0], b[1], b[2], b[3], b[4],
+             b[5], b[6], b[7]);
+    }
+}
+
 extern "C" int bg3le_stats_functor_count(void const* functors) {
     void const* buffer = nullptr;
     std::uint32_t count = 0;

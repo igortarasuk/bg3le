@@ -65,8 +65,12 @@ namespace bg3se
     };
 
 
-    using STDString = std::basic_string<char, std::char_traits<char>, GameAllocator<char>>;
-    using STDWString = std::basic_string<wchar_t, std::char_traits<wchar_t>, GameAllocator<wchar_t>>;
+    // Not std::basic_string. Upstream's definition is right on Windows,
+    // where Larian's string is MSVC's std::string; this build's is sixteen
+    // bytes and is not any std::string. See CoreLib/Base/LSString.h --
+    // getting this wrong silently mislays out every struct that holds one.
+    using STDString = LSStringBase<char>;
+    using STDWString = LSStringBase<wchar_t>;
     using StringView = std::string_view;
     using LSStringView = LSBaseStringView<char>;
     using WStringView = std::wstring_view;

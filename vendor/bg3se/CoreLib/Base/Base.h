@@ -4,6 +4,7 @@
 #include <CoreLib/Base/BaseUtilities.h>
 #include <CoreLib/Base/EnumHelpers.h>
 #include <CoreLib/Base/BaseMemory.h>
+#include <CoreLib/Base/LSString.h>
 #include <CoreLib/Base/BaseString.h>
 #include <CoreLib/Base/BaseTypes.h>
 #include <CoreLib/Base/BaseArray.h>
