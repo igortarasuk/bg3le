@@ -440,6 +440,10 @@ extern "C" bool bg3le_meta_map_key(void const* handle, const char* path,
                                    std::uint16_t* size);
 extern "C" bool bg3le_meta_format_guid(void const* bytes, char* out,
                                        std::size_t capacity);
+extern "C" bool bg3le_meta_enum_label(void const* handle, const char* path,
+                                      std::size_t index, const char** label,
+                                      std::uint64_t* value, bool* isBitmask);
+extern "C" std::size_t bg3le_meta_enum_count();
 extern "C" std::size_t bg3le_meta_class_count();
 extern "C" std::size_t bg3le_meta_component_count();
 extern "C" const char* bg3le_meta_engine_class(void const* handle);
@@ -729,6 +733,56 @@ bool write_field(lua_State* L, int index, void* address, FieldKind kind,
     }
 }
 
+// Pushes an enum-typed field as its label, or a bitmask as the list of set
+// flags -- which is how bg3se presents them, and scripts are written against
+// that. Returns false if the field is not an enum, leaving the caller to push
+// the raw integer.
+//
+// A value with no matching label is pushed as the number, so an unmapped bit
+// is visible rather than dropped.
+bool push_enum(lua_State* L, void const* meta, const char* path,
+               std::uint64_t raw) {
+    const char* label = nullptr;
+    std::uint64_t value = 0;
+    bool isBitmask = false;
+    if (!bg3le_meta_enum_label(meta, path, 0, &label, &value, &isBitmask)) {
+        return false;
+    }
+
+    if (!isBitmask) {
+        for (std::size_t i = 0;
+             bg3le_meta_enum_label(meta, path, i, &label, &value, &isBitmask);
+             ++i) {
+            if (value == raw) {
+                lua_pushstring(L, label);
+                return true;
+            }
+        }
+        lua_pushinteger(L, (lua_Integer)raw);
+        return true;
+    }
+
+    lua_newtable(L);
+    int n = 0;
+    std::uint64_t matched = 0;
+    for (std::size_t i = 0;
+         bg3le_meta_enum_label(meta, path, i, &label, &value, &isBitmask);
+         ++i) {
+        if (value != 0 && (raw & value) == value) {
+            lua_pushstring(L, label);
+            lua_rawseti(L, -2, ++n);
+            matched |= value;
+        }
+    }
+    // Any bits the table does not describe are reported as a leftover number,
+    // so a flag the metadata is missing does not vanish.
+    if ((raw & ~matched) != 0) {
+        lua_pushinteger(L, (lua_Integer)(raw & ~matched));
+        lua_rawseti(L, -2, ++n);
+    }
+    return true;
+}
+
 // Ext._Internal.GetField(handle, component, path)
 //
 // path may name a field, a field of a nested struct, or an element of an
@@ -772,6 +826,17 @@ int l_get_field(lua_State* L) {
     std::uint16_t elemCount = 0;
     bg3le_meta_field(meta, path, &fieldOffset, &fieldSize, &fieldKind,
                      &elemKind, &elemCount);
+
+    // An enum keeps its underlying integer kind, so it is read as a number
+    // and then rendered as a label.
+    const std::size_t width = field_kind_size((FieldKind)kind);
+    if (width != 0 && width <= 8) {
+        std::uint64_t raw = 0;
+        if (safe_read(address, &raw, width)
+            && push_enum(L, meta, path, raw)) {
+            return 1;
+        }
+    }
 
     if (!push_field(L, address, (FieldKind)kind, (FieldKind)elemKind,
                     elemCount)) {

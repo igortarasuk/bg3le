@@ -335,6 +335,11 @@ constexpr FieldDesc make_field(char const* name, std::size_t offset) {
     } else if constexpr (std::is_class_v<T>) {
         f.TypeName = type_name<T>().data();
         f.TypeNameLength = (std::uint16_t)type_name<T>().size();
+    } else if constexpr (std::is_enum_v<T>) {
+        // An enum keeps its scalar kind, so it still reads and writes as an
+        // integer; the type name is what lets the labels be found.
+        f.TypeName = type_name<T>().data();
+        f.TypeNameLength = (std::uint16_t)type_name<T>().size();
     }
 
     return f;
@@ -392,6 +397,29 @@ struct ClassFields {
 
 template <class T>
 struct FieldTable;
+
+// An enum's labels, so a field holding one reads as a name rather than as a
+// number. bg3se generates these the same macro-driven way it generates the
+// property maps, so they come out the same way: by including the generated
+// file with different macros.
+//
+// A bitmask is kept apart from a plain enum because they present differently
+// -- bg3se renders a bitmask as the list of set flags, and matching that
+// matters for scripts written against it.
+struct EnumLabel {
+    char const* Name;
+    std::uint64_t Value;
+};
+
+struct EnumDesc {
+    std::string_view TypeName;
+    char const* Name;
+    bool IsBitmask;
+    EnumLabel const* Labels;  // null-terminated
+};
+
+template <class T>
+struct EnumTable;
 
 }  // namespace bg3le
 
@@ -483,6 +511,94 @@ struct FieldTable;
 #undef P_FALLBACK
 
 #pragma clang diagnostic pop
+
+// ---------------------------------------------------------------------------
+// The enum labels, from the same generated metadata.
+//
+// Two passes, as with the property maps: one to declare a table per enum, one
+// to collect them. The type is in scope inside the expansion, so both the
+// table and the field that refers to it are named by the same type_name<T>()
+// and compare exactly.
+// ---------------------------------------------------------------------------
+
+#define BEGIN_ENUM_IMPL(cls, bitmask)                                         \
+    namespace bg3le {                                                         \
+    template <> struct EnumTable<cls> {                                       \
+        static constexpr std::string_view kTypeName = type_name<cls>();       \
+        static constexpr char const* kName = #cls;                            \
+        static constexpr bool kIsBitmask = bitmask;                           \
+        static constexpr EnumLabel kLabels[] = {
+
+#define BEGIN_ENUM(T, type, id) BEGIN_ENUM_IMPL(T, false)
+#define BEGIN_BITMASK(T, type, id) BEGIN_ENUM_IMPL(T, true)
+#define BEGIN_ENUM_NS(NS, T, luaName, type, id) BEGIN_ENUM_IMPL(NS::T, false)
+#define BEGIN_BITMASK_NS(NS, T, luaName, type, id) BEGIN_ENUM_IMPL(NS::T, true)
+
+#define EV(label, value) { #label, (std::uint64_t)(value) },
+
+// Null-terminated, so a table with no values is still a valid array.
+#define END_ENUM()                                                            \
+            { nullptr, 0 },                                                   \
+        };                                                                    \
+    };                                                                        \
+    }
+#define END_ENUM_NS() END_ENUM()
+
+#include <GameDefinitions/Generated/Enumerations.inl>
+#include <GameDefinitions/Generated/ExternalEnumerations.inl>
+
+#undef BEGIN_ENUM_IMPL
+#undef BEGIN_ENUM
+#undef BEGIN_BITMASK
+#undef BEGIN_ENUM_NS
+#undef BEGIN_BITMASK_NS
+#undef EV
+#undef END_ENUM
+#undef END_ENUM_NS
+
+namespace bg3le {
+namespace {
+
+template <class T>
+inline constexpr EnumDesc kEnumDesc{
+    EnumTable<T>::kTypeName,
+    EnumTable<T>::kName,
+    EnumTable<T>::kIsBitmask,
+    EnumTable<T>::kLabels,
+};
+
+constexpr EnumDesc const* kAllEnums[] = {
+#define BEGIN_ENUM(T, type, id) &kEnumDesc<T>,
+#define BEGIN_BITMASK(T, type, id) &kEnumDesc<T>,
+#define BEGIN_ENUM_NS(NS, T, luaName, type, id) &kEnumDesc<NS::T>,
+#define BEGIN_BITMASK_NS(NS, T, luaName, type, id) &kEnumDesc<NS::T>,
+#define EV(label, value)
+#define END_ENUM()
+#define END_ENUM_NS()
+#include <GameDefinitions/Generated/Enumerations.inl>
+#include <GameDefinitions/Generated/ExternalEnumerations.inl>
+#undef BEGIN_ENUM
+#undef BEGIN_BITMASK
+#undef BEGIN_ENUM_NS
+#undef BEGIN_BITMASK_NS
+#undef EV
+#undef END_ENUM
+#undef END_ENUM_NS
+};
+
+// Enums by their type_name<T>() spelling, the same index the class tables use.
+std::unordered_map<std::string_view, EnumDesc const*>& by_enum_name() {
+    static std::unordered_map<std::string_view, EnumDesc const*> map = [] {
+        std::unordered_map<std::string_view, EnumDesc const*> m;
+        m.reserve(std::size(kAllEnums));
+        for (auto const* e : kAllEnums) m.emplace(e->TypeName, e);
+        return m;
+    }();
+    return map;
+}
+
+}  // namespace
+}  // namespace bg3le
 
 namespace bg3le {
 namespace {
@@ -981,6 +1097,9 @@ extern "C" std::size_t bg3le_meta_fields(void const* handle,
 // Returns the number of failed checks, and writes a line per failure.
 extern "C" bool bg3le_meta_format_guid(void const* bytes, char* out,
                                        std::size_t capacity);
+extern "C" bool bg3le_meta_enum_label(void const* handle, char const* path,
+                                      std::size_t index, char const** label,
+                                      std::uint64_t* value, bool* isBitmask);
 
 extern "C" int bg3le_meta_selftest() {
     int failures = 0;
@@ -1230,6 +1349,41 @@ extern "C" int bg3le_meta_selftest() {
         }
     }
 
+    // Enum labels, checked against what bg3se prints on Windows for the same
+    // save: ReplenishType came back as 2 and 8 here where bg3se showed
+    // ["Default"] and ["Rest"]. It is a bitmask, so the labels are flags.
+    {
+        auto const* resMeta2 = static_cast<ClassFields const*>(
+            bg3le_meta_component("eoc::ActionResourcesComponent"));
+        char const* label = nullptr;
+        std::uint64_t value = 0;
+        bool isBitmask = false;
+
+        bool foundDefault = false;
+        bool foundRest = false;
+        for (std::size_t i = 0;
+             bg3le_meta_enum_label(resMeta2, "Resources[0][0].ReplenishType", i,
+                                   &label, &value, &isBitmask);
+             ++i) {
+            if (std::strcmp(label, "Default") == 0 && value == 0x02) {
+                foundDefault = true;
+            }
+            if (std::strcmp(label, "Rest") == 0 && value == 0x08) {
+                foundRest = true;
+            }
+        }
+        if (!isBitmask) fail("ReplenishType is not reported as a bitmask");
+        if (!foundDefault) fail("ReplenishType has no Default = 2");
+        if (!foundRest) fail("ReplenishType has no Rest = 8");
+
+        // A field that is not an enum must report none, rather than the
+        // labels of whatever happens to share its integer kind.
+        if (bg3le_meta_enum_label(meta, "Events[0].Amount", 0, &label, &value,
+                                  &isBitmask)) {
+            fail("a non-enum field reported enum labels");
+        }
+    }
+
     if (failures == 0) {
         bg3le::logf("meta selftest: the container walks behave");
     }
@@ -1275,6 +1429,45 @@ extern "C" std::size_t bg3le_meta_component_count() {
     }
     return n;
 }
+
+// The labels of an enum-typed field.
+//
+// Reported separately from the field's kind, which stays the underlying
+// integer, so an enum still reads and writes as a number for anything that
+// wants one. index walks the labels; a bitmask is told apart because bg3se
+// renders one as the list of set flags and matching that keeps scripts
+// written against it working.
+//
+// Returns false once index runs past the end, or immediately if the field is
+// not an enum.
+extern "C" bool bg3le_meta_enum_label(void const* handle, char const* path,
+                                      std::size_t index, char const** label,
+                                      std::uint64_t* value, bool* isBitmask) {
+    *label = nullptr;
+    if (handle == nullptr || path == nullptr) return false;
+
+    const auto r = resolve_path(static_cast<ClassFields const*>(handle), path,
+                                nullptr);
+    if (!r.Ok || r.Field.TypeName == nullptr) return false;
+
+    auto it = by_enum_name().find(
+        std::string_view(r.Field.TypeName, r.Field.TypeNameLength));
+    if (it == by_enum_name().end()) return false;
+
+    *isBitmask = it->second->IsBitmask;
+    auto const* labels = it->second->Labels;
+    for (std::size_t i = 0; i < index; ++i) {
+        if (labels[i].Name == nullptr) return false;
+    }
+    if (labels[index].Name == nullptr) return false;
+
+    *label = labels[index].Name;
+    *value = labels[index].Value;
+    return true;
+}
+
+// How many enums carry labels, for the startup log.
+extern "C" std::size_t bg3le_meta_enum_count() { return std::size(kAllEnums); }
 
 // The engine's name for a component, so a caller who looked the component up
 // by bg3se's short name can still reach bg3le's symbol-table index, which is
