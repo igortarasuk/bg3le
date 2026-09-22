@@ -13,7 +13,9 @@
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-GAME=/home/lenon/bg3mods/bg3-linux-native
+# The Steam install is the native build now, so the game and its Data live in
+# one place and the separate tree with a Data symlink is gone.
+GAME="$HOME/.local/share/Steam/steamapps/common/Baldurs Gate 3"
 SNIPER="$HOME/.local/share/Steam/steamapps/common/SteamLinuxRuntime_sniper"
 
 export MANGOHUD="${MANGOHUD:-1}"
