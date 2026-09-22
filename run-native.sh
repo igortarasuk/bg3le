@@ -8,8 +8,8 @@
 # via its LD_PRELOAD shim, so it cannot collide with ours. MANGOHUD=0 or
 # DISABLE_MANGOHUD=1 turns it off.
 #
-# GameMode is on by default when installed; GAMEMODE=0 turns it off. See the
-# comment further down for what it does and does not reach.
+# GameMode is off by default; GAMEMODE=1 turns it on. See the comment further
+# down for why it is off.
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -49,8 +49,37 @@ export vk_x11_strict_image_count="${vk_x11_strict_image_count:-false}"
 
 cd "$GAME"
 
+# Without steam_appid.txt beside the binary, libsteam_api does not know which
+# app this is and asks Steam to launch it properly. Steam then starts the game
+# itself -- without our LD_PRELOAD -- and the shell that ran this script is
+# told "command line was forwarded" and exits. The game comes up either way,
+# which is what makes this worth guarding: the only visible symptom is that
+# bg3le is silently absent and bg3lua finds no server.
+#
+# Written here rather than left as a manual step because a Steam update can
+# remove it again.
+if [ ! -f steam_appid.txt ]; then
+    printf '1086940' > steam_appid.txt
+    echo "run-native: wrote steam_appid.txt (Steam install lacked it)" >&2
+fi
+
 launch=("$SNIPER/run" -- ./bin/bg3 "$@")
-if [ "${GAMEMODE:-1}" != "0" ] && command -v gamemoderun >/dev/null 2>&1; then
+
+# GameMode is off unless asked for, because it does not work here and says so
+# loudly. Inside the sniper container libgamemodeauto cannot dlopen
+# libgamemode.so -- the container has its own /usr/lib, and the host's copy is
+# not in it -- and cannot reach the session bus. The result was around 350
+# lines of "dlopen failed" and "Could not connect to bus" per launch, and
+# `gamemoded -s` still reporting "gamemode is inactive": it was never applying
+# anything. An earlier note in this repo said otherwise on the strength of
+# libgamemodeauto appearing in /proc/<pid>/maps; being mapped is not the same
+# as working.
+#
+# Little is lost. What GameMode mainly does is set the CPU governor, and this
+# machine already runs governor and energy_performance_preference at
+# performance with the firmware profile at performance too. Its GPU
+# optimisations need explicit opt-in and are not configured.
+if [ "${GAMEMODE:-0}" != "0" ] && command -v gamemoderun >/dev/null 2>&1; then
     launch=(gamemoderun "${launch[@]}")
 fi
 
