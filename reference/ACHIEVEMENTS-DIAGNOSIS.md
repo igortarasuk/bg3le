@@ -230,15 +230,72 @@ already-established session, or browsing the Mods screen, doesn't
 recompute it. Everything tried above was against an already-running,
 already-loaded session.
 
+## Fresh-process load: still only `LoadSavegame`, not the other three
+
+Relaunched the game from scratch and set breakpoints on all four
+`ModuleSettings`-taking functions simultaneously, *before* touching the main
+menu's Continue/Load at all. Only `LoadSavegame` (`0x41e6ee0` + bias) fired
+-- `LoadModule`, `HandleModuleLoaded`, `LoadModuleAndLevel` never did, even
+for the very first load of the process's life. So the "cached, computed once"
+theory was half right and half wrong: `LoadSavegame` *is* the real entry
+point for a normal single-player Continue/Load (it must read the module list
+out of the save file itself rather than needing it passed in, hence the
+`ModuleSettings const*` argument being reliably `NULL` -- that parameter is
+an override path, not the normal one). The other three are for something
+else (fresh campaign creation via the main menu's "New Game", most likely).
+
+Dumped `esv::LoadProtocol::LoadSavegame` in full via `objdump` (it is large;
+spans at least `0x41e6ee0`-`0x41ec000`) and grepped for the two most useful
+signal types:
+
+- References to the known official-GUID literal addresses
+  (`.rodata` addresses of `.L.str.733`-`.L.str.738`, the same six built by
+  the static-init table from earlier): **zero** hits in the function. Expected
+  -- a real check would compare against the already-hashed/interned form, not
+  re-reference the raw string.
+- `setcc` instructions (`sete`/`setne`/`setb`, i.e. "turn a comparison into a
+  0/1 byte" -- the compiler's typical output for computing a bool, and what
+  the Windows patch target ultimately does too): only **4** in the whole
+  function.
+  - `sete sil` @ `0x41e7e52`: gated behind `EoCServer+0xB0` (not
+    `ModuleSettings`), building a UI dialog call with two 16-bit literal
+    operands (`0x5ad5`, `0x5ade` -- look like localization/string-table IDs)
+    and comparing a state byte to 3. Looks like unrelated loading-phase UI,
+    not a mods check.
+  - `setne cl` @ `0x41e81aa` and `setb bl` @ `0x41ebd88`: both inside
+    obviously unrelated code (one next to a `net::AbstractPeer::BindSocket`
+    `__FUNCTION__` string).
+  - `sete al; xor al,0x1` @ `0x41eafb2`-`0x41eafbd`: this one is interesting
+    on its own merits -- it is a **generic 16-byte struct equality comparator**
+    (`return a != b`, byte-for-byte, on two 16-byte blocks -- Guid-shaped),
+    but it is a tiny leaf utility that could be called from anywhere in the
+    binary for any GUID comparison, not evidence of anything by itself.
+    Worth revisiting by finding *its* callers specifically (not by grepping
+    this one function) if the direct approach below stalls.
+
+None of the four are a clean match. The actual "modded" branch may not live
+inside `LoadSavegame` at all -- it plausibly runs later, once inside an
+active session (an Osiris/Lua signal, or on the first Steam achievement
+attempt itself), rather than at load time.
+
 ## Next step
 
-Relaunch the game fresh and set the `LoadModule` breakpoint (or an `rwatch`
-on `Mods.count`) *before* loading anything at all -- i.e. catch the very
-first module load of the process's life, at the main menu's initial
-"Continue"/"Load", rather than a reload of an already-active session. If
-that still doesn't fire, `HandleModuleLoaded` (`0x40150b0`) and
-`LoadModuleAndLevel` (`0x41e7760`) are the two remaining named candidates
-that take `ModuleSettings const&`. Now that `bg3+0x7b8c7f8` gives a reliable,
-hook-free `EoCServer*`, a `rwatch` on `*(EoCServer+0x268+16)` (the live
-`Mods.count`, computed fresh each session since the bias changes) is the
-most direct version of this to set up next time, ahead of that first load.
+Two options, in order of directness:
+
+1. **Watch the achievement path itself instead of the mod-list path.**
+   `Osi.UnlockAchievement`/`Osi.ProgressAchievement`/`Osi.SetAchievementProgress`
+   are real, bound Osiris externals (`Ext._Internal` confirms `Osi.UnlockAchievement`
+   exists and is callable from the live console). Their native implementation is
+   the actual place the modded-check has to happen for achievements
+   specifically, regardless of where `IsModded` itself lives. Not yet tried
+   live: calling `Osi.UnlockAchievement(...)` from the debug console with no
+   active game session (main menu, no character/story loaded) risks a crash
+   from missing preconditions, so this needs an active session with a real
+   character handle first, not another main-menu test.
+2. Set the same four-breakpoint net (plus an `rwatch` on `EoCServer+0x268+16`,
+   i.e. the live `Mods.count`, cheap to compute now that `bg3+0x7b8c7f8` is
+   known) **inside an active session** rather than at the main menu --
+   attempt an actual in-game action that plausibly re-derives modded status,
+   e.g. opening the achievements panel if the Steam overlay exposes one, or
+   completing a small in-game milestone that would normally pop an
+   achievement.
