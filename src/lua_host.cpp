@@ -3666,6 +3666,99 @@ end
 
 -- Published so the stats code can reach it. The prelude is compiled in more
 -- than one chunk, so a local here is not in scope there.
+-- ---- Ext.Server* and Ext.Client* ----
+--
+-- bg3se exposes most modules three times: under a plain name, and under a
+-- Server and a Client name. They are the same functions -- a mod picks the
+-- name that says which side it means to run on -- except that a few are
+-- only on the plain one.
+--
+-- The table below is generated from the captured surface by
+-- tools/gen-context-aliases.py rather than written out, because getting a
+-- single name wrong here is a mod that does not run and nothing that says
+-- so. A view forwards to the base rather than copying it, so a function
+-- added to the base later appears in both twins without being listed twice.
+local CONTEXT_MODULES = {
+  {"ClientDebug", "Debug"},
+  {"ClientEntity", "Entity", {GetEntitiesOnTile = true}},
+  {"ClientIO", "IO"},
+  {"ClientJson", "Json"},
+  {"ClientLoca", "Loca"},
+  {"ClientLog", "Log"},
+  {"ClientMath", "Math"},
+  {"ClientMod", "Mod"},
+  {"ClientResource", "Resource"},
+  {"ClientStaticData", "StaticData"},
+  {"ClientStats", "Stats", {LoadStatsFile = true}},
+  {"ClientTable", "Table"},
+  {"ClientTimer", "Timer"},
+  {"ClientTypes", "Types", {GenerateIdeHelpers = true}},
+  {"ClientUtils", "Utils", {GameTime = true, LoadTestLibrary = true, MicrosecTime = true, MonotonicTime = true, Print = true, PrintError = true, PrintWarning = true, Profile = true, ProfileNamed = true, Random = true, Round = true}},
+  {"ClientVars", "Vars"},
+  {"ServerDebug", "Debug"},
+  {"ServerEntity", "Entity", {GetEntitiesOnTile = true}},
+  {"ServerIO", "IO"},
+  {"ServerJson", "Json"},
+  {"ServerLevel", "Level"},
+  {"ServerLoca", "Loca"},
+  {"ServerLog", "Log"},
+  {"ServerMath", "Math"},
+  {"ServerMod", "Mod"},
+  {"ServerNet", "Net"},
+  {"ServerResource", "Resource"},
+  {"ServerStaticData", "StaticData"},
+  {"ServerStats", "Stats", {LoadStatsFile = true}},
+  {"ServerTable", "Table"},
+  {"ServerTemplate", "Template"},
+  {"ServerTimer", "Timer"},
+  {"ServerTypes", "Types", {GenerateIdeHelpers = true}},
+  {"ServerUtils", "Utils", {GameTime = true, LoadTestLibrary = true, MicrosecTime = true, MonotonicTime = true, Print = true, PrintError = true, PrintWarning = true, Profile = true, ProfileNamed = true, Random = true, Round = true}},
+  {"ServerVars", "Vars"},
+}
+
+local function context_view(base, omit)
+  local function visible(key)
+    if omit ~= nil and omit[key] then return false end
+    return base[key] ~= nil
+  end
+
+  return setmetatable({}, {
+    __index = function(_, key)
+      if not visible(key) then return nil end
+      return base[key]
+    end,
+
+    -- Iterating a module is how a mod discovers what is there, and how
+    -- tools/api-coverage.lua counts, so the view has to enumerate as the
+    -- real one does.
+    __pairs = function()
+      local keys = {}
+      for key in pairs(base) do
+        if visible(key) then keys[#keys + 1] = key end
+      end
+      table.sort(keys)
+
+      local i = 0
+      return function()
+        i = i + 1
+        local key = keys[i]
+        if key == nil then return nil end
+        return key, base[key]
+      end
+    end,
+
+    __newindex = function(_, key)
+      error("Ext context modules mirror their base; set Ext.<module>."
+            .. tostring(key) .. " instead", 2)
+    end,
+  })
+end
+
+for _, entry in ipairs(CONTEXT_MODULES) do
+  local name, from, omit = entry[1], entry[2], entry[3]
+  if Ext[from] ~= nil then Ext[name] = context_view(Ext[from], omit) end
+end
+
 Ext._Internal.ReadObject = read_object
 
 Ext.StaticData = {}
