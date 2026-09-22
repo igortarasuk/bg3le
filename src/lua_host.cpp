@@ -1093,6 +1093,65 @@ extern "C" char const* bg3le_stats_object_condition(void const* object,
 extern "C" void* bg3le_stats_object_expression(void const* object,
                                                char const* className,
                                                char const* field);
+extern "C" int bg3le_math_add(lua_State* L);
+extern "C" int bg3le_math_sub(lua_State* L);
+extern "C" int bg3le_math_mul(lua_State* L);
+extern "C" int bg3le_math_div(lua_State* L);
+extern "C" int bg3le_math_reflect(lua_State* L);
+extern "C" int bg3le_math_angle(lua_State* L);
+extern "C" int bg3le_math_cross(lua_State* L);
+extern "C" int bg3le_math_distance(lua_State* L);
+extern "C" int bg3le_math_dot(lua_State* L);
+extern "C" int bg3le_math_length(lua_State* L);
+extern "C" int bg3le_math_normalize(lua_State* L);
+extern "C" int bg3le_math_perpendicular(lua_State* L);
+extern "C" int bg3le_math_project(lua_State* L);
+extern "C" int bg3le_math_determinant(lua_State* L);
+extern "C" int bg3le_math_inverse(lua_State* L);
+extern "C" int bg3le_math_transpose(lua_State* L);
+extern "C" int bg3le_math_outer_product(lua_State* L);
+extern "C" int bg3le_math_rotate(lua_State* L);
+extern "C" int bg3le_math_translate(lua_State* L);
+extern "C" int bg3le_math_scale(lua_State* L);
+extern "C" int bg3le_math_extract_euler_angles(lua_State* L);
+extern "C" int bg3le_math_build_from_euler_angles3(lua_State* L);
+extern "C" int bg3le_math_build_from_euler_angles4(lua_State* L);
+extern "C" int bg3le_math_decompose(lua_State* L);
+extern "C" int bg3le_math_extract_axis_angle(lua_State* L);
+extern "C" int bg3le_math_build_from_axis_angle3(lua_State* L);
+extern "C" int bg3le_math_build_from_axis_angle4(lua_State* L);
+extern "C" int bg3le_math_build_rotation3(lua_State* L);
+extern "C" int bg3le_math_build_rotation4(lua_State* L);
+extern "C" int bg3le_math_build_translation(lua_State* L);
+extern "C" int bg3le_math_build_scale(lua_State* L);
+extern "C" int bg3le_math_quat_from_euler(lua_State* L);
+extern "C" int bg3le_math_quat_from_to_rotation(lua_State* L);
+extern "C" int bg3le_math_quat_dot(lua_State* L);
+extern "C" int bg3le_math_quat_slerp(lua_State* L);
+extern "C" int bg3le_math_quat_to_mat3(lua_State* L);
+extern "C" int bg3le_math_quat_to_mat4(lua_State* L);
+extern "C" int bg3le_math_mat3_to_quat(lua_State* L);
+extern "C" int bg3le_math_mat4_to_quat(lua_State* L);
+extern "C" int bg3le_math_quat_normalize(lua_State* L);
+extern "C" int bg3le_math_quat_inverse(lua_State* L);
+extern "C" int bg3le_math_quat_rotate(lua_State* L);
+extern "C" int bg3le_math_quat_rotate_axis_angle(lua_State* L);
+extern "C" int bg3le_math_quat_length(lua_State* L);
+extern "C" int bg3le_math_quat_mul(lua_State* L);
+extern "C" int bg3le_math_random(lua_State* L);
+extern "C" int bg3le_math_round(lua_State* L);
+extern "C" int bg3le_math_fract(lua_State* L);
+extern "C" int bg3le_math_trunc(lua_State* L);
+extern "C" int bg3le_math_sign(lua_State* L);
+extern "C" int bg3le_math_clamp(lua_State* L);
+extern "C" int bg3le_math_smoothstep(lua_State* L);
+extern "C" int bg3le_math_lerp(lua_State* L);
+extern "C" int bg3le_math_asin(lua_State* L);
+extern "C" int bg3le_math_acos(lua_State* L);
+extern "C" int bg3le_math_atan(lua_State* L);
+extern "C" int bg3le_math_atan2(lua_State* L);
+extern "C" int bg3le_math_is_nan(lua_State* L);
+extern "C" int bg3le_math_is_inf(lua_State* L);
 extern "C" char const* bg3le_stats_expression_code(void const* pooled);
 extern "C" void bg3le_stats_expression_dump(void const* pooled);
 extern "C" bool bg3le_stats_expression_refcount(void const* pooled,
@@ -2649,6 +2708,134 @@ void lua_init() {
     lua_setfield(g_lua, -2, "HasComponent");
     lua_setfield(g_lua, -2, "_Internal");
 
+    // ---- Ext.Math ----
+    //
+    // A module of its own rather than entries under _Internal: these are
+    // the public functions themselves, taking and returning the plain Lua
+    // values bg3se uses -- a vector is an array of numbers, a matrix a flat
+    // column-major array. See src/vendor/math.cpp.
+    lua_createtable(g_lua, 0, 59);
+    lua_pushcfunction(g_lua, bg3le_math_add);
+    lua_setfield(g_lua, -2, "Add");
+    lua_pushcfunction(g_lua, bg3le_math_sub);
+    lua_setfield(g_lua, -2, "Sub");
+    lua_pushcfunction(g_lua, bg3le_math_mul);
+    lua_setfield(g_lua, -2, "Mul");
+    lua_pushcfunction(g_lua, bg3le_math_div);
+    lua_setfield(g_lua, -2, "Div");
+    lua_pushcfunction(g_lua, bg3le_math_reflect);
+    lua_setfield(g_lua, -2, "Reflect");
+    lua_pushcfunction(g_lua, bg3le_math_angle);
+    lua_setfield(g_lua, -2, "Angle");
+    lua_pushcfunction(g_lua, bg3le_math_cross);
+    lua_setfield(g_lua, -2, "Cross");
+    lua_pushcfunction(g_lua, bg3le_math_distance);
+    lua_setfield(g_lua, -2, "Distance");
+    lua_pushcfunction(g_lua, bg3le_math_dot);
+    lua_setfield(g_lua, -2, "Dot");
+    lua_pushcfunction(g_lua, bg3le_math_length);
+    lua_setfield(g_lua, -2, "Length");
+    lua_pushcfunction(g_lua, bg3le_math_normalize);
+    lua_setfield(g_lua, -2, "Normalize");
+    lua_pushcfunction(g_lua, bg3le_math_perpendicular);
+    lua_setfield(g_lua, -2, "Perpendicular");
+    lua_pushcfunction(g_lua, bg3le_math_project);
+    lua_setfield(g_lua, -2, "Project");
+    lua_pushcfunction(g_lua, bg3le_math_determinant);
+    lua_setfield(g_lua, -2, "Determinant");
+    lua_pushcfunction(g_lua, bg3le_math_inverse);
+    lua_setfield(g_lua, -2, "Inverse");
+    lua_pushcfunction(g_lua, bg3le_math_transpose);
+    lua_setfield(g_lua, -2, "Transpose");
+    lua_pushcfunction(g_lua, bg3le_math_outer_product);
+    lua_setfield(g_lua, -2, "OuterProduct");
+    lua_pushcfunction(g_lua, bg3le_math_rotate);
+    lua_setfield(g_lua, -2, "Rotate");
+    lua_pushcfunction(g_lua, bg3le_math_translate);
+    lua_setfield(g_lua, -2, "Translate");
+    lua_pushcfunction(g_lua, bg3le_math_scale);
+    lua_setfield(g_lua, -2, "Scale");
+    lua_pushcfunction(g_lua, bg3le_math_extract_euler_angles);
+    lua_setfield(g_lua, -2, "ExtractEulerAngles");
+    lua_pushcfunction(g_lua, bg3le_math_build_from_euler_angles3);
+    lua_setfield(g_lua, -2, "BuildFromEulerAngles3");
+    lua_pushcfunction(g_lua, bg3le_math_build_from_euler_angles4);
+    lua_setfield(g_lua, -2, "BuildFromEulerAngles4");
+    lua_pushcfunction(g_lua, bg3le_math_decompose);
+    lua_setfield(g_lua, -2, "Decompose");
+    lua_pushcfunction(g_lua, bg3le_math_extract_axis_angle);
+    lua_setfield(g_lua, -2, "ExtractAxisAngle");
+    lua_pushcfunction(g_lua, bg3le_math_build_from_axis_angle3);
+    lua_setfield(g_lua, -2, "BuildFromAxisAngle3");
+    lua_pushcfunction(g_lua, bg3le_math_build_from_axis_angle4);
+    lua_setfield(g_lua, -2, "BuildFromAxisAngle4");
+    lua_pushcfunction(g_lua, bg3le_math_build_rotation3);
+    lua_setfield(g_lua, -2, "BuildRotation3");
+    lua_pushcfunction(g_lua, bg3le_math_build_rotation4);
+    lua_setfield(g_lua, -2, "BuildRotation4");
+    lua_pushcfunction(g_lua, bg3le_math_build_translation);
+    lua_setfield(g_lua, -2, "BuildTranslation");
+    lua_pushcfunction(g_lua, bg3le_math_build_scale);
+    lua_setfield(g_lua, -2, "BuildScale");
+    lua_pushcfunction(g_lua, bg3le_math_quat_from_euler);
+    lua_setfield(g_lua, -2, "QuatFromEuler");
+    lua_pushcfunction(g_lua, bg3le_math_quat_from_to_rotation);
+    lua_setfield(g_lua, -2, "QuatFromToRotation");
+    lua_pushcfunction(g_lua, bg3le_math_quat_dot);
+    lua_setfield(g_lua, -2, "QuatDot");
+    lua_pushcfunction(g_lua, bg3le_math_quat_slerp);
+    lua_setfield(g_lua, -2, "QuatSlerp");
+    lua_pushcfunction(g_lua, bg3le_math_quat_to_mat3);
+    lua_setfield(g_lua, -2, "QuatToMat3");
+    lua_pushcfunction(g_lua, bg3le_math_quat_to_mat4);
+    lua_setfield(g_lua, -2, "QuatToMat4");
+    lua_pushcfunction(g_lua, bg3le_math_mat3_to_quat);
+    lua_setfield(g_lua, -2, "Mat3ToQuat");
+    lua_pushcfunction(g_lua, bg3le_math_mat4_to_quat);
+    lua_setfield(g_lua, -2, "Mat4ToQuat");
+    lua_pushcfunction(g_lua, bg3le_math_quat_normalize);
+    lua_setfield(g_lua, -2, "QuatNormalize");
+    lua_pushcfunction(g_lua, bg3le_math_quat_inverse);
+    lua_setfield(g_lua, -2, "QuatInverse");
+    lua_pushcfunction(g_lua, bg3le_math_quat_rotate);
+    lua_setfield(g_lua, -2, "QuatRotate");
+    lua_pushcfunction(g_lua, bg3le_math_quat_rotate_axis_angle);
+    lua_setfield(g_lua, -2, "QuatRotateAxisAngle");
+    lua_pushcfunction(g_lua, bg3le_math_quat_length);
+    lua_setfield(g_lua, -2, "QuatLength");
+    lua_pushcfunction(g_lua, bg3le_math_quat_mul);
+    lua_setfield(g_lua, -2, "QuatMul");
+    lua_pushcfunction(g_lua, bg3le_math_random);
+    lua_setfield(g_lua, -2, "Random");
+    lua_pushcfunction(g_lua, bg3le_math_round);
+    lua_setfield(g_lua, -2, "Round");
+    lua_pushcfunction(g_lua, bg3le_math_fract);
+    lua_setfield(g_lua, -2, "Fract");
+    lua_pushcfunction(g_lua, bg3le_math_trunc);
+    lua_setfield(g_lua, -2, "Trunc");
+    lua_pushcfunction(g_lua, bg3le_math_sign);
+    lua_setfield(g_lua, -2, "Sign");
+    lua_pushcfunction(g_lua, bg3le_math_clamp);
+    lua_setfield(g_lua, -2, "Clamp");
+    lua_pushcfunction(g_lua, bg3le_math_smoothstep);
+    lua_setfield(g_lua, -2, "Smoothstep");
+    lua_pushcfunction(g_lua, bg3le_math_lerp);
+    lua_setfield(g_lua, -2, "Lerp");
+    lua_pushcfunction(g_lua, bg3le_math_asin);
+    lua_setfield(g_lua, -2, "Asin");
+    lua_pushcfunction(g_lua, bg3le_math_acos);
+    lua_setfield(g_lua, -2, "Acos");
+    lua_pushcfunction(g_lua, bg3le_math_atan);
+    lua_setfield(g_lua, -2, "Atan");
+    lua_pushcfunction(g_lua, bg3le_math_atan2);
+    lua_setfield(g_lua, -2, "Atan2");
+    lua_pushcfunction(g_lua, bg3le_math_is_nan);
+    lua_setfield(g_lua, -2, "IsNaN");
+    lua_pushcfunction(g_lua, bg3le_math_is_inf);
+    lua_setfield(g_lua, -2, "IsInf");
+    lua_setfield(g_lua, -2, "Math");
+
+
     lua_setglobal(g_lua, "Ext");
 
     static const char kPrelude[] = R"LUA(
@@ -2767,28 +2954,10 @@ Ext.Table = {
 }
 table.find = Ext.Table.Find
 
--- The scalar half of Ext.Math; the vector and matrix entries need their
--- userdata types, so they stub out rather than silently misbehave.
-Ext.Math = setmetatable({
-  Round = function(x) return math.floor(x + 0.5) end,
-  Trunc = function(x) return x >= 0 and math.floor(x) or math.ceil(x) end,
-  Fract = function(x) return x - math.floor(x) end,
-  Sign = function(x) return (x > 0 and 1) or (x < 0 and -1) or 0 end,
-  Clamp = function(x, lo, hi) return math.max(lo, math.min(hi, x)) end,
-  Lerp = function(a, b, t) return a + (b - a) * t end,
-  Smoothstep = function(a, b, x)
-    local t = math.max(0, math.min(1, (x - a) / (b - a)))
-    return t * t * (3 - 2 * t)
-  end,
-  IsNaN = function(x) return x ~= x end,
-  IsInf = function(x) return x == math.huge or x == -math.huge end,
-  Acos = math.acos, Asin = math.asin, Atan = math.atan,
-  Random = function(a, b)
-    if a == nil then return math.random() end
-    if b == nil then return math.random(a) end
-    return math.random(a, b)
-  end
-}, {__index = stub_index("Math")})
+-- Ext.Math is registered from C against the same glm the real extender
+-- uses; see src/vendor/math.cpp. The Lua approximations that used to stand
+-- in here were not merely incomplete, they disagreed: Round(-2.5) gave -2
+-- where glm's gives -3.
 
 Ext.Utils = {
   Print = Ext.Log.Print,

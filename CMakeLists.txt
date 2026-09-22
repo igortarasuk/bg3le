@@ -249,13 +249,15 @@ add_library(bg3le SHARED
     src/affinity.cpp
     src/vulkan_memory.cpp
     src/pak.cpp
+    src/math.cpp
     # Yann Collet's LZ4, vendored rather than linked: the sniper container
     # need not have liblz4, and a missing DT_NEEDED would stop bg3le loading
     # at all. See vendor/NOTICE.md.
     external/lz4/lz4.c
 )
 set_source_files_properties(external/lz4/lz4.c PROPERTIES COMPILE_FLAGS -w)
-target_include_directories(bg3le PRIVATE external/lz4)
+target_include_directories(bg3le PRIVATE external/lz4
+    ${EXTERNAL}/glm)
 # vulkan and SDL2 resolve from the host process, which has both loaded before
 # bg3le is.
 target_link_libraries(bg3le PRIVATE dl lua_static bg3se_vendor vulkan SDL2)
