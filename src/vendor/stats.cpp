@@ -43,8 +43,11 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <ctime>
 #include <vector>
+
+#include "ls_string.h"
 
 #include "../log.h"
 #include "../mem.h"
@@ -261,6 +264,8 @@ struct Found {
     ArrayRef Floats{};                  // RPGStats::Floats
     ArrayRef Guids{};                   // RPGStats::GUIDs
     ArrayRef Int64s{};                  // RPGStats::Int64s
+    ArrayRef TranslatedStrings{};       // RPGStats::TranslatedStrings
+    ArrayRef Conditions{};              // RPGStats::Conditions
     bool Attributes{false};             // whether all of the above landed
 };
 
@@ -399,12 +404,18 @@ bool find_modifier_name_offset(ArrayRef const& lists, std::size_t* out,
 // enumerations (RPGEnumeration::IsFlagType). A flags value is an index into
 // the Int64s pool whose contents are a bitmask, not a label index, which is
 // why an exact label lookup finds nothing for them.
+// RPGEnumeration::IsFlagType, copied whole. Seven of these were missing,
+// which made StatusGroups report the raw int 1564 instead of
+// {SG_Light, SG_Surface} and AuraFlags report the label "None" instead of
+// an empty set.
 constexpr char const* kFlagTypes[] = {
     "AttributeFlags",      "WeaponFlags",       "ResistanceFlags",
     "PassiveFlags",        "SpellFlagList",     "StatusEvent",
     "StatusPropertyFlags", "ProficiencyGroupFlags",
     "CinematicArenaFlags", "LineOfSightFlags",  "SpellCategoryFlags",
-    "StatsFunctorContext"};
+    "StatsFunctorContext", "StatusGroupFlags",  "InterruptContext",
+    "InterruptContextScope", "InterruptDefaultValue",
+    "InterruptFlagsList",  "AuraFlags",         "AbilityFlags"};
 constexpr std::size_t kFlagTypeCount =
     sizeof(kFlagTypes) / sizeof(kFlagTypes[0]);
 
@@ -514,6 +525,74 @@ bool find_string_pool(unsigned long long runAddr, ArrayRef* out,
     return false;
 }
 
+// Whether an array reads as RPGStats::TranslatedStrings: sixteen-byte
+// entries opening with a FixedString that resolves to a loca handle, which
+// is an "h" followed by thirty-six hex-and-g characters.
+bool plausible_handles(ArrayRef const& a) {
+    if (a.Size < 4) return false;
+    std::size_t good = 0;
+    std::size_t checked = 0;
+    for (std::size_t i = 0; i < 16 && i < a.Size; ++i) {
+        std::uint32_t index = 0;
+        if (!read_as((char const*)a.Buffer + i * 16, &index)) return false;
+        ++checked;
+        char const* text = bg3le_fixed_string(index, nullptr);
+        if (text != nullptr && text[0] == 'h' && std::strlen(text) == 37) {
+            ++good;
+        }
+    }
+    return checked > 0 && good * 2 >= checked;
+}
+
+// RPGStats::Conditions, an array of Larian strings holding the condition
+// expressions that Conditions, TargetConditions and UseConditions index
+// into.
+//
+// It sits far past the pools -- several maps and a lock later -- and none of
+// those have a size that can be confirmed from the headers, so it is found
+// by content instead of position: an array whose entries read as strings
+// that look like conditions, "Character() and Enemy() and not Dead()".
+void find_conditions(unsigned long long poolAddr, Found* f) {
+    auto plausible_conditions = [](ArrayRef const& a) {
+        if (a.Size < 16) return false;
+        std::size_t calls = 0;
+        std::size_t readable = 0;
+        for (std::size_t i = 0; i < 24 && i < a.Size; ++i) {
+            std::string text;
+            if (!read_ls_string((char const*)a.Buffer + i * 16, &text)) {
+                return false;
+            }
+            ++readable;
+            // A condition is a boolean expression over predicates, so the
+            // overwhelming majority carry a call.
+            if (text.find('(') != std::string::npos
+                && text.find(')') != std::string::npos) {
+                ++calls;
+            }
+        }
+        return readable >= 16 && calls * 2 >= readable;
+    };
+
+    // A bounded walk: the member order puts Conditions after the pools, and
+    // a window rather than a whole-memory scan keeps a wrong match from
+    // being possible at all.
+    constexpr std::size_t kWindow = 4096;
+    for (std::size_t off = 64; off <= kWindow; off += 8) {
+        ArrayRef candidate{};
+        if (!array_header_at((void const*)(poolAddr + off), &candidate)) {
+            continue;
+        }
+        if (!plausible_conditions(candidate)) continue;
+
+        f->Conditions = candidate;
+        logf("stats: condition pool at pool+%zu, %u entries", off,
+             candidate.Size);
+        return;
+    }
+    logf("stats: no condition pool found; Conditions attributes report "
+         "nothing");
+}
+
 // RPGStats::Floats and RPGStats::GUIDs, the pools the other indexed
 // attribute kinds point into.
 //
@@ -597,6 +676,25 @@ void find_value_pools(unsigned long long poolAddr, Found* f) {
         logf("stats: no guid pool found; GUID attributes report their "
              "pool index");
     }
+
+    // TranslatedStrings follows Floats in the member order. An entry is a
+    // RuntimeStringHandle pair -- sixteen bytes, the handle's FixedString
+    // first -- and a handle resolves to text like
+    // "h5fafec24g30d5g425cg952cga9c53752059c", which is what confirms it
+    // rather than the position.
+    constexpr std::size_t kTranslatedAt = 64;
+    ArrayRef translated{};
+    if (array_header_at((void const*)(poolAddr + kTranslatedAt), &translated)
+        && plausible_handles(translated)) {
+        f->TranslatedStrings = translated;
+        logf("stats: translated string pool at pool+%zu, %u entries",
+             kTranslatedAt, translated.Size);
+    } else {
+        logf("stats: no translated string pool found; TranslatedString "
+             "attributes report nothing");
+    }
+
+    find_conditions(poolAddr, f);
 }
 
 // Object::IndexedProperties and Object::ModifierListIndex, derived from the
@@ -1094,7 +1192,7 @@ extern "C" bool bg3le_stats_attr_flags(void const* object, std::size_t index,
     Found const& f = state();
     if (out == nullptr || capacity == 0) return false;
     out[0] = '\0';
-    if (raw < 0 || f.Int64s.Buffer == nullptr) return false;
+    if (raw <= 0 || f.Int64s.Buffer == nullptr) return false;
     if ((std::size_t)raw >= f.Int64s.Size) return false;
 
     std::int64_t const* slot = nullptr;
@@ -1129,13 +1227,18 @@ extern "C" bool bg3le_stats_attr_flags(void const* object, std::size_t index,
         used += len;
         out[used] = '\0';
     }
-    return used > 0;
+    // True even when nothing is set: upstream returns an empty array for a
+    // flag attribute with no bits, which is not the same as no value.
+    return true;
 }
 
 // A Float attribute's value, from the float pool.
 extern "C" bool bg3le_stats_attr_float(int raw, double* out) {
     Found const& f = state();
-    if (raw < 0 || f.Floats.Buffer == nullptr) return false;
+    // Slot zero is the unset slot, not a value: RPGStats::GetFloat and every
+    // other pool accessor tests `attributeId > 0`. Accepting it here is what
+    // made unset floats read back as 0.0 where upstream reports nothing.
+    if (raw <= 0 || f.Floats.Buffer == nullptr) return false;
     if ((std::size_t)raw >= f.Floats.Size) return false;
     float v = 0.0f;
     if (!read_as((char const*)f.Floats.Buffer + (std::size_t)raw
@@ -1150,7 +1253,7 @@ extern "C" bool bg3le_stats_attr_float(int raw, double* out) {
 extern "C" bool bg3le_stats_attr_guid(int raw, char* out,
                                       std::size_t capacity) {
     Found const& f = state();
-    if (raw < 0 || f.Guids.Buffer == nullptr) return false;
+    if (raw <= 0 || f.Guids.Buffer == nullptr) return false;
     if ((std::size_t)raw >= f.Guids.Size) return false;
     std::uint8_t bytes[16] = {};
     if (!read_as((char const*)f.Guids.Buffer + (std::size_t)raw * 16,
@@ -1164,7 +1267,7 @@ extern "C" bool bg3le_stats_attr_guid(int raw, char* out,
 // not the global string table.
 extern "C" char const* bg3le_stats_attr_string(int raw) {
     Found const& f = state();
-    if (raw < 0 || f.Strings.Buffer == nullptr) return nullptr;
+    if (raw <= 0 || f.Strings.Buffer == nullptr) return nullptr;
     if ((std::size_t)raw >= f.Strings.Size) return nullptr;
 
     std::uint32_t id = 0;
@@ -1173,6 +1276,36 @@ extern "C" char const* bg3le_stats_attr_string(int raw) {
         return nullptr;
     }
     return bg3le_fixed_string(id, nullptr);
+}
+
+// A TranslatedString attribute's loca handle, e.g.
+// "h5fafec24g30d5g425cg952cga9c53752059c".
+extern "C" char const* bg3le_stats_attr_translated(int raw) {
+    Found const& f = state();
+    if (raw <= 0 || f.TranslatedStrings.Buffer == nullptr) return nullptr;
+    if ((std::size_t)raw >= f.TranslatedStrings.Size) return nullptr;
+
+    std::uint32_t index = 0;
+    if (!read_as((char const*)f.TranslatedStrings.Buffer
+                     + (std::size_t)raw * 16, &index)) {
+        return nullptr;
+    }
+    return bg3le_fixed_string(index, nullptr);
+}
+
+// A Conditions attribute's expression text.
+extern "C" char const* bg3le_stats_attr_condition(int raw) {
+    Found const& f = state();
+    if (raw <= 0 || f.Conditions.Buffer == nullptr) return nullptr;
+    if ((std::size_t)raw >= f.Conditions.Size) return nullptr;
+
+    // Held until the next call, like the other text this file hands out.
+    static thread_local std::string text;
+    if (!read_ls_string((char const*)f.Conditions.Buffer
+                            + (std::size_t)raw * 16, &text)) {
+        return nullptr;
+    }
+    return text.c_str();
 }
 
 }  // namespace bg3le

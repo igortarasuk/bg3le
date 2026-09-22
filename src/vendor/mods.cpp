@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 
+#include "ls_string.h"
 #include "mods.h"
 
 #include "../log.h"
@@ -345,12 +346,16 @@ bool search() {
         }
     }
 
-    // Nothing validated as a whole manager: keep the load order alone rather
-    // than nothing, since GetLoadOrder and GetMod work without the rest.
+    // Nothing validated as a whole manager, so nothing is adopted. An
+    // earlier version fell back to the first header on the grounds that
+    // GetLoadOrder works without the rest; it accepted a four-entry
+    // coincidence at stride 336, and because a non-null buffer stops the
+    // retry, that wrong answer stuck for the rest of the run and took
+    // Ext.Stats' ModId down with it. Waiting is better than guessing.
     if (chosen == nullptr) {
-        chosen = &headers.front();
-        found = Manager{};
-        found.LoadOrder = chosen->Array;
+        logf("mods: %zu candidate headers, none with a mod manager around "
+             "it yet", headers.size());
+        return false;
     }
 
     state() = found;
@@ -400,31 +405,6 @@ void const* module_at(std::size_t index) {
     return module_at(state().LoadOrder, index);
 }
 
-// Larian's string, sixteen bytes: up to fifteen characters inline with the
-// length in the last byte, or a pointer followed by size and capacity with
-// the top bit of the capacity marking the heap form.
-bool read_string(void const* addr, std::string* out) {
-    unsigned char raw[16] = {};
-    if (!safe_read(addr, raw, sizeof(raw))) return false;
-
-    if ((raw[15] & 0x80) == 0) {
-        const std::size_t size = raw[15];
-        if (size > 15) return false;
-        out->assign((char const*)raw, size);
-        return true;
-    }
-
-    std::uint64_t buffer = 0;
-    std::uint32_t size = 0;
-    std::memcpy(&buffer, raw, sizeof(buffer));
-    std::memcpy(&size, raw + 8, sizeof(size));
-    if (buffer == 0 || size > (1u << 20)) return false;
-
-    out->assign(size, '\0');
-    if (size == 0) return true;
-    return safe_read((void const*)(std::uintptr_t)buffer, out->data(), size);
-}
-
 // Storage for the strings a ModInfo points at, one slot per field so a
 // filled struct stays wholly readable until the next call.
 char const* hold(int slot, std::string const& text) {
@@ -436,7 +416,7 @@ char const* hold(int slot, std::string const& text) {
 char const* read_string_field(void const* module, std::size_t offset,
                               int slot) {
     std::string text;
-    if (!read_string((char const*)module + offset, &text)) return "";
+    if (!read_ls_string((char const*)module + offset, &text)) return "";
     return hold(slot, text);
 }
 

@@ -1066,6 +1066,8 @@ extern "C" bool bg3le_stats_attr_at(void const* object, std::size_t index,
 extern "C" char const* bg3le_stats_attr_label(void const* object,
                                               std::size_t index, int raw);
 extern "C" char const* bg3le_stats_attr_string(int raw);
+extern "C" char const* bg3le_stats_attr_translated(int raw);
+extern "C" char const* bg3le_stats_attr_condition(int raw);
 extern "C" bool bg3le_stats_attr_float(int raw, double* out);
 extern "C" bool bg3le_stats_attr_guid(int raw, char* out,
                                       std::size_t capacity);
@@ -1501,6 +1503,24 @@ int l_mod_list(lua_State* L) {
 
         lua_rawseti(L, -2, (int)i + 1);
     }
+    return 1;
+}
+
+// Ext._Internal.StatsAttrTranslated(raw) -> loca handle
+int l_stats_attr_translated(lua_State* L) {
+    char const* text =
+        bg3le_stats_attr_translated((int)luaL_checkinteger(L, 1));
+    if (text == nullptr) return 0;
+    lua_pushstring(L, text);
+    return 1;
+}
+
+// Ext._Internal.StatsAttrCondition(raw) -> condition expression
+int l_stats_attr_condition(lua_State* L) {
+    char const* text =
+        bg3le_stats_attr_condition((int)luaL_checkinteger(L, 1));
+    if (text == nullptr) return 0;
+    lua_pushstring(L, text);
     return 1;
 }
 
@@ -2394,6 +2414,10 @@ void lua_init() {
     lua_setfield(g_lua, -2, "ModInfo");
     lua_pushcfunction(g_lua, l_mod_list);
     lua_setfield(g_lua, -2, "ModList");
+    lua_pushcfunction(g_lua, l_stats_attr_translated);
+    lua_setfield(g_lua, -2, "StatsAttrTranslated");
+    lua_pushcfunction(g_lua, l_stats_attr_condition);
+    lua_setfield(g_lua, -2, "StatsAttrCondition");
     lua_pushcfunction(g_lua, l_stat_origin);
     lua_setfield(g_lua, -2, "StatOrigin");
     lua_pushcfunction(g_lua, l_stats_count);
@@ -3113,9 +3137,13 @@ local function read_attribute(addr, i)
   if kind == 0 or kind == 1 then
     value = raw
   elseif kind == 2 then
-    value = Ext._Internal.StatsAttrFloat(raw) or {PoolIndex = raw}
+    -- nil, not a stand-in: the pools treat slot zero as unset, and upstream
+    -- reports nothing for an attribute the stat does not carry. Reporting
+    -- the pool index instead put {PoolIndex = 0} where the reference has
+    -- null.
+    value = Ext._Internal.StatsAttrFloat(raw)
   elseif kind == 6 then
-    value = Ext._Internal.StatsAttrGuid(raw) or {PoolIndex = raw}
+    value = Ext._Internal.StatsAttrGuid(raw)
   elseif kind == 3 then
     -- Index 0 is the unset slot and does not resolve; an absent string is
     -- empty, not the number nought.
@@ -3145,13 +3173,20 @@ local function read_attribute(addr, i)
     -- value for a stat with no requirements, which most have.
     value = {}
   elseif kind == 7 then
-    value = nil                      -- StatsFunctors: null upstream
-  elseif kind == 8 or kind == 9 then
-    -- Conditions resolve to their expression string upstream. The condition
-    -- pool is not located yet, so an empty string keeps the type right.
-    value = ""
+    value = nil                      -- StatsFunctors: not read yet
+  elseif kind == 8 then
+    -- Conditions, TargetConditions and UseConditions index the condition
+    -- pool. Upstream's Object::GetString falls back to "" when the lookup
+    -- misses, so this does too.
+    value = Ext._Internal.StatsAttrCondition(raw) or ""
+  elseif kind == 9 then
+    value = nil                      -- RollConditions: not read yet
+  elseif kind == 11 then
+    -- MemorizationRequirements is deprecated and upstream pushes nil for it
+    -- unconditionally, whatever the stat holds.
+    value = nil
   elseif kind == 12 then
-    value = nil                      -- TranslatedString
+    value = Ext._Internal.StatsAttrTranslated(raw)
   else
     value = raw
   end
@@ -3187,11 +3222,19 @@ local STAT_METHODS = {
   CopyFrom = stat_method("CopyFrom"),
 }
 
+-- An attribute the engine has no value for. Upstream reports the key with a
+-- nil value -- its FallbackNext walks the modifier list and pushes nil when
+-- the get fails -- and a Lua table cannot hold nil, so the key is held with
+-- this marker and read back as nil.
+local STAT_NIL = setmetatable({}, {__tostring = function() return "nil" end})
+
 local stat_proxy = {}
 stat_proxy.__index = function(self, key)
   local m = STAT_METHODS[key]
   if m ~= nil then return m end
-  return rawget(self, "__fields")[key]
+  local v = rawget(self, "__fields")[key]
+  if v == STAT_NIL then return nil end
+  return v
 end
 
 stat_proxy.__newindex = function(_, key, _)
@@ -3213,7 +3256,11 @@ stat_proxy.__pairs = function(self)
     i = i + 1
     local k = keys[i]
     if k == nil then return nil end
-    return k, STAT_METHODS[k] or fields[k]
+    local v = STAT_METHODS[k] or fields[k]
+    if v == STAT_NIL then v = nil end
+    -- The key is what ends the loop, not the value, so an attribute with no
+    -- value still appears.
+    return k, v
   end
 end
 
@@ -3236,7 +3283,10 @@ function Ext.Stats.Get(name)
   local n = Ext._Internal.StatsAttrCount(addr)
   for i = 0, n - 1 do
     local attr, value = read_attribute(addr, i)
-    if attr ~= nil then fields[attr] = value end
+    if attr ~= nil then
+      if value == nil then value = STAT_NIL end
+      fields[attr] = value
+    end
   end
 
   -- An empty attribute set means the discovery did not land, which is worth
