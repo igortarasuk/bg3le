@@ -1093,6 +1093,17 @@ extern "C" char const* bg3le_stats_object_condition(void const* object,
 extern "C" void* bg3le_stats_object_expression(void const* object,
                                                char const* className,
                                                char const* field);
+extern "C" int bg3le_ext_monotonic_time(lua_State* L);
+extern "C" int bg3le_ext_microsec_time(lua_State* L);
+extern "C" int bg3le_ext_clock_epoch(lua_State* L);
+extern "C" int bg3le_ext_clock_time(lua_State* L);
+extern "C" int bg3le_ext_generate_guid(lua_State* L);
+extern "C" int bg3le_ext_game_version(lua_State* L);
+extern "C" int bg3le_ext_command_line(lua_State* L);
+extern "C" int bg3le_ext_load_file(lua_State* L);
+extern "C" int bg3le_ext_save_file(lua_State* L);
+extern "C" int bg3le_ext_memory_usage(lua_State* L);
+extern "C" int bg3le_ext_show_error(lua_State* L);
 extern "C" int bg3le_math_add(lua_State* L);
 extern "C" int bg3le_math_sub(lua_State* L);
 extern "C" int bg3le_math_mul(lua_State* L);
@@ -2708,6 +2719,34 @@ void lua_init() {
     lua_setfield(g_lua, -2, "HasComponent");
     lua_setfield(g_lua, -2, "_Internal");
 
+    // Clocks, identity and file access for Ext.Utils, Ext.IO and
+    // Ext.Timer. Parked under _Internal; the prelude arranges them into the
+    // modules and names bg3se uses. See src/ext_libs.cpp.
+    lua_getfield(g_lua, -1, "_Internal");
+    lua_pushcfunction(g_lua, bg3le_ext_monotonic_time);
+    lua_setfield(g_lua, -2, "MonotonicTime");
+    lua_pushcfunction(g_lua, bg3le_ext_microsec_time);
+    lua_setfield(g_lua, -2, "MicrosecTime");
+    lua_pushcfunction(g_lua, bg3le_ext_clock_epoch);
+    lua_setfield(g_lua, -2, "ClockEpoch");
+    lua_pushcfunction(g_lua, bg3le_ext_clock_time);
+    lua_setfield(g_lua, -2, "ClockTime");
+    lua_pushcfunction(g_lua, bg3le_ext_generate_guid);
+    lua_setfield(g_lua, -2, "GenerateGuid");
+    lua_pushcfunction(g_lua, bg3le_ext_game_version);
+    lua_setfield(g_lua, -2, "GameVersion");
+    lua_pushcfunction(g_lua, bg3le_ext_command_line);
+    lua_setfield(g_lua, -2, "GetCommandLineParams");
+    lua_pushcfunction(g_lua, bg3le_ext_load_file);
+    lua_setfield(g_lua, -2, "LoadFile");
+    lua_pushcfunction(g_lua, bg3le_ext_save_file);
+    lua_setfield(g_lua, -2, "SaveFile");
+    lua_pushcfunction(g_lua, bg3le_ext_memory_usage);
+    lua_setfield(g_lua, -2, "GetMemoryUsage");
+    lua_pushcfunction(g_lua, bg3le_ext_show_error);
+    lua_setfield(g_lua, -2, "ShowError");
+    lua_pop(g_lua, 1);
+
     // ---- Ext.Math ----
     //
     // A module of its own rather than entries under _Internal: these are
@@ -2959,6 +2998,268 @@ table.find = Ext.Table.Find
 -- in here were not merely incomplete, they disagreed: Round(-2.5) gave -2
 -- where glm's gives -3.
 
+-- ---- Ext.Json.Parse ----
+--
+-- Stringify was already here; this is its inverse. Written out rather than
+-- wrapped around a library because the output has to be the shape bg3se
+-- produces: objects become tables keyed by string, arrays tables keyed by
+-- integer from one, and null becomes nil, which means a null in an array
+-- leaves a hole exactly as it does upstream.
+function Ext.Json.Parse(text)
+  if type(text) ~= "string" then
+    error("Ext.Json.Parse expects a string", 2)
+  end
+
+  local pos = 1
+
+  local function fail(what)
+    error(string.format("Ext.Json.Parse: %s at offset %d", what, pos), 3)
+  end
+
+  local function skip()
+    while true do
+      local c = text:sub(pos, pos)
+      if c == " " or c == "\t" or c == "\n" or c == "\r" then
+        pos = pos + 1
+      else
+        return c
+      end
+    end
+  end
+
+  local ESCAPES = {
+    ['"'] = '"', ["\\"] = "\\", ["/"] = "/", b = "\b", f = "\f",
+    n = "\n", r = "\r", t = "\t",
+  }
+
+  local function parse_string()
+    pos = pos + 1                      -- the opening quote
+    local parts = {}
+    while true do
+      local c = text:sub(pos, pos)
+      if c == "" then fail("unterminated string") end
+      if c == '"' then pos = pos + 1 return table.concat(parts) end
+
+      if c == "\\" then
+        local esc = text:sub(pos + 1, pos + 1)
+        local simple = ESCAPES[esc]
+        if simple ~= nil then
+          parts[#parts + 1] = simple
+          pos = pos + 2
+        elseif esc == "u" then
+          local hex = text:sub(pos + 2, pos + 5)
+          local code = tonumber(hex, 16)
+          if code == nil then fail("bad \\u escape") end
+          -- utf8.char is 5.3; the fork is 5.3.6.
+          parts[#parts + 1] = utf8.char(code)
+          pos = pos + 6
+        else
+          fail("bad escape")
+        end
+      else
+        parts[#parts + 1] = c
+        pos = pos + 1
+      end
+    end
+  end
+
+  local parse_value
+
+  local function parse_array()
+    pos = pos + 1
+    local out = {}
+    if skip() == "]" then pos = pos + 1 return out end
+    while true do
+      out[#out + 1] = parse_value()
+      local c = skip()
+      if c == "," then
+        pos = pos + 1
+      elseif c == "]" then
+        pos = pos + 1
+        return out
+      else
+        fail("expected , or ]")
+      end
+    end
+  end
+
+  local function parse_object()
+    pos = pos + 1
+    local out = {}
+    if skip() == "}" then pos = pos + 1 return out end
+    while true do
+      if skip() ~= '"' then fail("expected a key") end
+      local key = parse_string()
+      if skip() ~= ":" then fail("expected :") end
+      pos = pos + 1
+      out[key] = parse_value()
+      local c = skip()
+      if c == "," then
+        pos = pos + 1
+      elseif c == "}" then
+        pos = pos + 1
+        return out
+      else
+        fail("expected , or }")
+      end
+    end
+  end
+
+  parse_value = function()
+    local c = skip()
+    if c == "" then fail("unexpected end of input") end
+    if c == "{" then return parse_object() end
+    if c == "[" then return parse_array() end
+    if c == '"' then return parse_string() end
+
+    if text:sub(pos, pos + 3) == "true" then pos = pos + 4 return true end
+    if text:sub(pos, pos + 4) == "false" then pos = pos + 5 return false end
+    if text:sub(pos, pos + 3) == "null" then pos = pos + 4 return nil end
+
+    local literal = text:match("^-?%d+%.?%d*[eE]?[-+]?%d*", pos)
+    if literal == nil or literal == "" then fail("unexpected character") end
+    pos = pos + #literal
+    -- An integer stays an integer, as bg3se's parser keeps them apart.
+    return math.tointeger(tonumber(literal)) or tonumber(literal)
+  end
+
+  local value = parse_value()
+  if skip() ~= "" then fail("trailing content") end
+  return value
+end
+
+-- ---- Ext.IO ----
+--
+-- LoadFile reads under the profile directory, or the game's Data directory
+-- with a context of "data"; SaveFile writes under the profile only. Both
+-- refuse a path that climbs out of its root, as upstream's does.
+Ext.IO = {}
+
+function Ext.IO.LoadFile(path, context)
+  return Ext._Internal.LoadFile(path, context)
+end
+
+function Ext.IO.SaveFile(path, contents)
+  return Ext._Internal.SaveFile(path, tostring(contents), false)
+end
+
+function Ext.IO.AppendFile(path, contents)
+  return Ext._Internal.SaveFile(path, tostring(contents), true)
+end
+
+-- Path overrides are a redirection table the engine consults when opening a
+-- file. bg3le does not hook the engine's file opens, so an override would
+-- be recorded and never honoured; it is kept and reported so
+-- GetPathOverride round-trips, and the limitation is stated rather than
+-- hidden behind a silent no-op.
+local path_overrides = {}
+
+function Ext.IO.AddPathOverride(path, overridePath)
+  path_overrides[path] = overridePath
+end
+
+function Ext.IO.GetPathOverride(path)
+  return path_overrides[path]
+end
+
+-- ---- Ext.Debug ----
+--
+-- bg3le is always in developer mode -- it exists to be developed against --
+-- and has no crash reporter to exercise, so Crash refuses rather than
+-- taking the game down.
+Ext.Debug = {}
+
+function Ext.Debug.IsDeveloperMode() return true end
+
+function Ext.Debug.DebugBreak()
+  local server = Ext._Internal.DebugBreak
+  if server ~= nil then return server() end
+  Ext.Log.PrintWarning("Ext.Debug.DebugBreak: no debugger attached")
+end
+
+function Ext.Debug.DumpStack()
+  local level = 2
+  while true do
+    local info = debug.getinfo(level, "Sln")
+    if info == nil then break end
+    Ext.Log.Print(string.format("%d: %s %s:%d", level - 1,
+      info.name or info.what or "?", info.short_src or "?",
+      info.currentline or 0))
+    level = level + 1
+  end
+end
+
+function Ext.Debug.DebugDumpLifetimes()
+  -- Upstream dumps its Lua lifetime pools. bg3le hands out plain values
+  -- rather than lifetime-scoped proxies, so there is nothing to dump; an
+  -- empty report is the honest one.
+  Ext.Log.Print("bg3le does not use lifetime-scoped references")
+end
+
+function Ext.Debug.GenerateIdeHelpers()
+  error("bg3le: Ext.Debug.GenerateIdeHelpers needs the type metadata "
+        .. "writer, which is not implemented", 2)
+end
+
+function Ext.Debug.Crash()
+  error("bg3le: Ext.Debug.Crash is a crash-reporter test and is refused; "
+        .. "bg3le has no crash reporter", 2)
+end
+
+function Ext.Debug.Reset()
+  error("bg3le: Ext.Debug.Reset needs the extension state reload path, "
+        .. "which is not implemented", 2)
+end
+
+function Ext.Debug.SetEntityRuntimeCheckLevel(level)
+  if type(level) ~= "number" then
+    error("Ext.Debug.SetEntityRuntimeCheckLevel expects a number", 2)
+  end
+  Ext._Internal.EntityCheckLevel = level
+end
+
+-- ---- Ext.Osiris ----
+--
+-- Osiris is already bound, so a listener is a subscription on the call
+-- bg3le makes when the engine raises it.
+Ext.Osiris = {}
+
+local osiris_listeners = {}
+
+function Ext.Osiris.RegisterListener(name, arity, event, handler)
+  if type(name) ~= "string" or type(handler) ~= "function" then
+    error("Ext.Osiris.RegisterListener(name, arity, event, handler)", 2)
+  end
+  local key = name .. "/" .. tostring(arity) .. "/" .. tostring(event)
+  osiris_listeners[key] = osiris_listeners[key] or {}
+  table.insert(osiris_listeners[key], handler)
+  return handler
+end
+
+function Ext.Osiris.UnregisterListener(name, arity, event, handler)
+  local key = name .. "/" .. tostring(arity) .. "/" .. tostring(event)
+  local list = osiris_listeners[key]
+  if list == nil then return false end
+  for i, h in ipairs(list) do
+    if h == handler then table.remove(list, i) return true end
+  end
+  return false
+end
+
+-- Called from the Osiris bridge when the engine raises a call.
+function Ext._Internal.FireOsirisListener(name, arity, event, ...)
+  local list = osiris_listeners[name .. "/" .. tostring(arity) .. "/"
+                               .. tostring(event)]
+  if list == nil then return end
+  for _, handler in ipairs(list) do
+    local ok, err = pcall(handler, ...)
+    if not ok then
+      Ext.Log.PrintError("Osiris listener failed: " .. tostring(err))
+    end
+  end
+end
+
+-- ---- Ext.Utils ----
 Ext.Utils = {
   Print = Ext.Log.Print,
   PrintWarning = Ext.Log.PrintWarning,
@@ -2967,15 +3268,109 @@ Ext.Utils = {
   Random = Ext.Math.Random,
   MonotonicTime = Ext.Timer.MonotonicTime,
   MicrosecTime = Ext.Timer.MicrosecTime,
+  GenerateGuid = Ext._Internal.GenerateGuid,
+  GameVersion = Ext._Internal.GameVersion,
+  GetCommandLineParams = Ext._Internal.GetCommandLineParams,
+  GetMemoryUsage = Ext._Internal.GetMemoryUsage,
+  ShowError = Ext._Internal.ShowError,
 }
+
+-- The extender version a mod tests against. bg3le reports the bg3se
+-- version whose public API it implements, because that is the question the
+-- mod is asking; reference/utils-shape.txt has the capture at 32.
+function Ext.Utils.Version() return 32 end
+
+-- Bound late: Ext.Timer is completed further down, after this table.
+function Ext.Utils.GameTime() return Ext.Timer.GameTime() end
+
+function Ext.Utils.ShowErrorAndExitGame(message)
+  Ext._Internal.ShowError(tostring(message))
+  error("bg3le: " .. tostring(message), 0)
+end
+
+function Ext.Utils.GetValueType(value)
+  local t = type(value)
+  if t == "table" then
+    -- bg3se distinguishes its own object types here; a plain table is
+    -- still "table" to it, which is all bg3le hands out.
+    return "table"
+  end
+  return t
+end
+
+function Ext.Utils.IsValidHandle(handle)
+  return type(handle) == "number" and handle ~= 0
+end
+
+function Ext.Utils.HandleToInteger(handle)
+  if type(handle) ~= "number" then return nil end
+  return math.tointeger(handle)
+end
+
+function Ext.Utils.IntegerToHandle(i)
+  if type(i) ~= "number" then return nil end
+  return math.tointeger(i)
+end
+
+function Ext.Utils.LoadString(text, globals)
+  local chunk, err = load(text, text, "t", globals)
+  if chunk == nil then error(err, 2) end
+  return chunk()
+end
+
+function Ext.Utils.Include(modGuid, fileName, globals)
+  local contents = Ext.IO.LoadFile(fileName, "data")
+  if contents == nil then
+    error("Ext.Utils.Include: cannot read " .. tostring(fileName), 2)
+  end
+  return Ext.Utils.LoadString(contents, globals)
+end
+
+-- Profiling is Optick upstream, which is not built here. The calls keep
+-- their shape so instrumented code runs, and the scopes are counted so the
+-- data is not simply thrown away.
+local profile_depth = 0
+
+function Ext.Utils.ProfileBegin() profile_depth = profile_depth + 1 end
+function Ext.Utils.ProfileEnd()
+  if profile_depth > 0 then profile_depth = profile_depth - 1 end
+end
+
+function Ext.Utils.Profile(_, fn, ...) return fn(...) end
+function Ext.Utils.ProfileNamed(_, fn, ...) return fn(...) end
+
+function Ext.Utils.GetGameState()
+  return Ext._Internal.GameState and Ext._Internal.GameState() or "Running"
+end
+
+function Ext.Utils.GetGlobalSwitches()
+  error("bg3le: Ext.Utils.GetGlobalSwitches needs the engine's "
+        .. "GlobalSwitches object, which is not located yet", 2)
+end
+
+function Ext.Utils.GetDialogManager()
+  error("bg3le: Ext.Utils.GetDialogManager needs the engine's dialog "
+        .. "manager, which is not located yet", 2)
+end
+
+function Ext.Utils.LoadTestLibrary()
+  error("bg3le: Ext.Utils.LoadTestLibrary needs the bundled test library, "
+        .. "which bg3le does not ship", 2)
+end
 
 function Ext.IsServer() return true end
 function Ext.IsClient() return false end
 
+-- Only what is still unimplemented, and only if nothing has defined it
+-- already: this used to assign unconditionally, which quietly replaced
+-- Ext.IO and Ext.Debug with stubs because they are defined further up.
+-- "Loca" rather than "Localization" -- the latter is not a module bg3se
+-- has, so a mod asking for Ext.Loca got a nil index instead of the error
+-- the stub exists to give.
 for _, name in ipairs({"Entity", "Stats", "Level", "StaticData", "Mod", "Net",
-                       "Vars", "IO", "Types", "Localization", "Debug",
-                       "Events", "Resource", "Template"}) do
-  Ext[name] = stub(name)
+                       "Vars", "Types", "Loca", "Events", "Resource",
+                       "Template"}) do
+  if Ext[name] == nil then Ext[name] = stub(name) end
 end
 Ext.Definition = Ext.StaticData
 Mods = {}
@@ -2997,31 +3392,137 @@ end})
 
 _D = Ext.Dump
 _DS = Ext.DumpShallow
+Ext.Timer.ClockEpoch = Ext._Internal.ClockEpoch
+Ext.Timer.ClockTime = Ext._Internal.ClockTime
+Ext.Timer.MonotonicTime = Ext._Internal.MonotonicTime
+Ext.Timer.MicrosecTime = Ext._Internal.MicrosecTime
+
 _P = Ext.Log.Print
 _PW = Ext.Log.PrintWarning
 _PE = Ext.Log.PrintError
 Print = Ext.Log.Print
 print = Ext.Log.Print
 
+-- ---- Ext.Timer ----
+--
 -- Timers are driven from the server tick, so callbacks run on the story
--- thread and may call Osiris.
+-- thread and may call Osiris. Delays are in milliseconds, which is
+-- upstream's unit: its WaitFor divides by a thousand before handing the
+-- value to the engine's timer service.
+--
+-- Upstream keeps two queues, one on game time and one on wall clock, so a
+-- game timer stops while the game is paused. bg3le has not located the
+-- engine's clock, so both run on the monotonic clock and a game timer
+-- keeps counting through a pause. The queues are kept apart regardless, so
+-- the distinction becomes real the moment that clock is found rather than
+-- needing every caller revisited.
 local timers, next_handle = {}, 1
 
-function Ext.Timer.WaitFor(ms, fn, repeat_ms)
+-- Upstream marks realtime timers with a flag in the handle and reads it
+-- back to pick a queue; the same bit is used here for the same reason.
+local REALTIME_FLAG = 0x40000000
+
+local function add_timer(ms, fn, repeat_ms, realtime)
+  if type(fn) ~= "function" then
+    error("Ext.Timer expects a callback function", 3)
+  end
   local handle = next_handle
   next_handle = handle + 1
+  if realtime then handle = handle | REALTIME_FLAG end
+
   timers[handle] = {
-    due = Ext.Timer.MonotonicTime() + ms, fn = fn, every = repeat_ms
+    due = Ext.Timer.MonotonicTime() + (ms or 0),
+    fn = fn,
+    every = repeat_ms,
+    paused = false,
   }
   return handle
 end
 
-function Ext.Timer.Cancel(handle) timers[handle] = nil end
+function Ext.Timer.WaitFor(ms, fn, repeat_ms)
+  return add_timer(ms, fn, repeat_ms, false)
+end
+
+function Ext.Timer.WaitForRealtime(ms, fn, repeat_ms)
+  return add_timer(ms, fn, repeat_ms, true)
+end
+
+function Ext.Timer.Cancel(handle)
+  if timers[handle] == nil then return false end
+  timers[handle] = nil
+  return true
+end
+
+function Ext.Timer.Pause(handle)
+  local t = timers[handle]
+  if t == nil then return false end
+  if not t.paused then
+    t.paused = true
+    -- Held as remaining time, so resuming does not fire immediately for a
+    -- timer that was paused past its due moment.
+    t.remaining = math.max(0, t.due - Ext.Timer.MonotonicTime())
+  end
+  return true
+end
+
+function Ext.Timer.Resume(handle)
+  local t = timers[handle]
+  if t == nil then return false end
+  if t.paused then
+    t.paused = false
+    t.due = Ext.Timer.MonotonicTime() + (t.remaining or 0)
+    t.remaining = nil
+  end
+  return true
+end
+
+function Ext.Timer.IsPaused(handle)
+  local t = timers[handle]
+  return t ~= nil and t.paused
+end
+
+-- Persistent timers survive a save upstream, by name and with serialised
+-- arguments. bg3le has no savegame serialisation, so one behaves like an
+-- ordinary timer; the handler registry is real so the calling shape is the
+-- same, and the limitation is logged once rather than silently dropped on
+-- load.
+local persistent_handlers = {}
+local warned_persistent = false
+
+function Ext.Timer.RegisterPersistentHandler(name, fn)
+  persistent_handlers[name] = fn
+end
+
+function Ext.Timer.WaitForPersistent(ms, callbackName, args, repeat_ms)
+  local fn = persistent_handlers[callbackName]
+  if fn == nil then
+    error("Ext.Timer.WaitForPersistent: no handler registered as "
+          .. tostring(callbackName), 2)
+  end
+  if not warned_persistent then
+    warned_persistent = true
+    Ext.Log.PrintWarning("bg3le: persistent timers do not survive a save "
+                         .. "yet; this one behaves as an ordinary timer")
+  end
+  return add_timer(ms, function() fn(args) end, repeat_ms, false)
+end
+
+-- Upstream reports the engine's game clock. bg3le counts from the first
+-- tick instead, which is the same thing for measuring intervals and is not
+-- the same thing across a load; it is seconds either way.
+local first_tick = nil
+
+function Ext.Timer.GameTime()
+  if first_tick == nil then return 0.0 end
+  return (Ext.Timer.MonotonicTime() - first_tick) / 1000.0
+end
 
 function Ext._Internal.RunTimers()
   local now = Ext.Timer.MonotonicTime()
+  if first_tick == nil then first_tick = now end
+
   for handle, t in pairs(timers) do
-    if now >= t.due then
+    if not t.paused and now >= t.due then
       if t.every then t.due = now + t.every else timers[handle] = nil end
       local ok, err = pcall(t.fn)
       if not ok then
