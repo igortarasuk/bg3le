@@ -87,6 +87,8 @@ char const* text_of(bg3se::FixedString const& fs) {
 
 extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
                                             std::uint32_t* out);
+extern "C" bool bg3le_meta_format_guid(void const* bytes, char* out,
+                                       std::size_t capacity);
 
 // The seven rarity indices, looked up once by name.
 //
@@ -237,16 +239,418 @@ bool find_objects(unsigned long long runAddr, ArrayRef* out,
     return false;
 }
 
-// What the search establishes. No struct offsets survive into this.
+// What the search establishes. No struct offsets survive into this: every
+// one of these was derived by looking at the memory, because RPGStats' own
+// offsets are wrong for this build (TreasureRarities at 800 here, 3648 in the
+// engine).
 struct Found {
-    bool Searched{false};
     ArrayRef Objects{};
-    std::size_t NameOffset{0};
+    std::size_t NameOffset{0};          // Object::Name
+
+    ArrayRef Lists{};                   // RPGStats::ModifierLists
+    std::size_t ListNameOffset{0};      // ModifierList::Name
+    std::size_t ModifierNameOffset{0};  // Modifier::Name
+    std::size_t AttrsOffset{0};         // ModifierList::Attributes
+
+    ArrayRef ValueLists{};              // RPGStats::ModifierValueLists
+    std::size_t ValueNameOffset{0};     // RPGEnumeration::Name
+
+    std::size_t PropsOffset{0};         // Object::IndexedProperties
+    std::size_t ListIndexOffset{0};     // Object::ModifierListIndex
+    ArrayRef Strings{};                 // RPGStats::FixedStrings
+    ArrayRef Floats{};                  // RPGStats::Floats
+    ArrayRef Guids{};                   // RPGStats::GUIDs
+    bool Attributes{false};             // whether all of the above landed
 };
 
 Found& state() {
     static Found f;
     return f;
+}
+
+// A pointer array containing an element with a specific name.
+//
+// This is the test that cannot be faked. The modifier value lists must
+// contain an entry called "ConstantInt", because that is the type name the
+// engine compares against when deciding how to read an attribute; the
+// modifier lists must contain one called "Weapon". An array of unrelated
+// named objects will not.
+bool array_contains_name(ArrayRef const& array, std::size_t nameOffset,
+                         char const* wanted, std::size_t limit) {
+    for (std::size_t i = 0; i < array.Size && i < limit; ++i) {
+        void const* element = nullptr;
+        if (!read_as((char const*)array.Buffer + i * sizeof(void*),
+                     &element)) {
+            return false;
+        }
+        if (element == nullptr) continue;
+        bg3se::FixedString name{};
+        if (!read_as((char const*)element + nameOffset, &name)) continue;
+        char const* text = text_of(name);
+        if (text != nullptr && std::strcmp(text, wanted) == 0) return true;
+    }
+    return false;
+}
+
+// Finds a pointer array near the run whose elements carry a given name at
+// some offset, identified by a name it must contain.
+bool find_named_array(unsigned long long runAddr, char const* mustContain,
+                      std::size_t minSize, std::size_t maxSize,
+                      std::size_t maxNameOffset, ArrayRef* out,
+                      std::size_t* nameOffsetOut, char const* what) {
+    constexpr std::size_t kWindow = 16384;
+    const unsigned long long lo = runAddr > kWindow ? runAddr - kWindow : 0;
+    const unsigned long long hi = runAddr + kWindow;
+
+    for (unsigned long long at = lo; at + 16 <= hi; at += 8) {
+        ArrayRef array{};
+        if (!array_header_at((void const*)at, &array)) continue;
+        if (array.Size < minSize || array.Size > maxSize) continue;
+
+        for (std::size_t nameOff = 0; nameOff <= maxNameOffset;
+             nameOff += 4) {
+            // Distinct names first, for the same reason as the stats array.
+            if (named_elements(array, nameOff, 8) < 8) continue;
+            if (!array_contains_name(array, nameOff, mustContain,
+                                     array.Size)) {
+                continue;
+            }
+            *out = array;
+            *nameOffsetOut = nameOff;
+            logf("stats: %s at %#llx, %u entries, name at +%zu (contains "
+                 "\"%s\")", what, at, array.Size, nameOff, mustContain);
+            return true;
+        }
+    }
+    logf("stats: no %s near the run (wanted an array of %zu-%zu entries "
+         "containing \"%s\")", what, minSize, maxSize, mustContain);
+    return false;
+}
+
+// Modifier::Name, found by requiring a list's attributes to have distinct
+// resolvable names.
+bool find_modifier_name_offset(ArrayRef const& lists, std::size_t* out,
+                               std::size_t* attrsOffsetOut) {
+    // The attribute array's offset is searched for, not assumed. Assuming
+    // zero failed: a ModifierList starts with a vtable pointer, which our
+    // header does not declare, so the array actually begins at +8. The
+    // reconstructed layout agrees with the name landing at +92 --
+    // VMT(8) + Array(16) + HashMap(64) + int32(4).
+    for (std::size_t i = 0; i < lists.Size && i < 16; ++i) {
+        void const* list = nullptr;
+        if (!read_as((char const*)lists.Buffer + i * sizeof(void*), &list)) {
+            continue;
+        }
+        if (list == nullptr) continue;
+
+        for (std::size_t attrsOff = 0; attrsOff <= 32; attrsOff += 8) {
+            ArrayRef attrs{};
+            if (!array_header_at((char const*)list + attrsOff, &attrs)) {
+                continue;
+            }
+            if (attrs.Size < 8) continue;
+
+            for (std::size_t off = 0; off <= 64; off += 4) {
+                if (named_elements(attrs, off, 8) < 8) continue;
+                *out = off;
+                *attrsOffsetOut = attrsOff;
+                logf("stats: Modifier::Name at +%zu, ModifierList::Attributes "
+                     "at +%zu (%u attributes on list %zu)", off, attrsOff,
+                     attrs.Size, i);
+                return true;
+            }
+        }
+    }
+    // Diagnostic: what the first list's attribute array actually looks like.
+    for (std::size_t i = 0; i < lists.Size && i < 2; ++i) {
+        void const* list = nullptr;
+        if (!read_as((char const*)lists.Buffer + i * sizeof(void*), &list)
+            || list == nullptr) {
+            continue;
+        }
+        ArrayRef attrs{};
+        const bool header = array_header_at(list, &attrs);
+        logf("stats:   list %zu at %p: header=%d size=%u buffer=%p", i, list,
+             header ? 1 : 0, header ? attrs.Size : 0,
+             header ? attrs.Buffer : nullptr);
+        if (!header) {
+            std::uint64_t words[4] = {};
+            if (read_as(list, &words)) {
+                logf("stats:     first words %#lx %#lx %#lx %#lx", words[0],
+                     words[1], words[2], words[3]);
+            }
+            continue;
+        }
+        void const* first = nullptr;
+        if (read_as(attrs.Buffer, &first) && first != nullptr) {
+            std::uint32_t w[8] = {};
+            if (read_as(first, &w)) {
+                logf("stats:     modifier[0] at %p: %u %u %u %u %u %u %u %u",
+                     first, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            }
+        }
+    }
+    logf("stats: could not place Modifier::Name; attributes stay unavailable");
+    return false;
+}
+
+// Strings the value pool must contain, and a list of names cannot.
+constexpr char const* kDiceStrings[] = {"1d8", "1d6", "1d10", "2d6"};
+constexpr std::size_t kDiceCount =
+    sizeof(kDiceStrings) / sizeof(kDiceStrings[0]);
+
+// Whether a pool of FixedString indices holds any of the given strings.
+bool pool_contains_any(ArrayRef const& pool, char const* const* wanted,
+                       std::size_t count) {
+    std::uint32_t ids[8];
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < count && n < 8; ++i) {
+        std::uint32_t id = 0;
+        if (bg3le_fixed_string_index_of(wanted[i], &id)) ids[n++] = id;
+    }
+    if (n == 0) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            logf("stats: none of the dice strings are in the string table, so "
+                 "the value pool cannot be identified that way");
+        }
+        return false;
+    }
+
+    const std::size_t limit = pool.Size < 200000 ? pool.Size : 200000;
+    for (std::size_t i = 0; i < limit; ++i) {
+        std::uint32_t entry = 0;
+        if (!read_as((char const*)pool.Buffer + i * sizeof(std::uint32_t),
+                     &entry)) {
+            return false;
+        }
+        for (std::size_t k = 0; k < n; ++k) {
+            if (entry == ids[k]) return true;
+        }
+    }
+    return false;
+}
+
+// RPGStats::FixedStrings, the pool a FixedString attribute indexes into.
+//
+// An attribute's raw int is not a global string index. It is a position in
+// this pool, which is why "Damage" read back as 2303 -- decoded as a string
+// index its sub-table nibble is 15, and only 11 exist -- and why every unset
+// attribute resolved to "Version64", the string at index 0.
+//
+// The header puts FixedStrings immediately after TreasureRarities, so the
+// rarity run locates it: a CompactSet of uint32 string indices that resolve.
+bool find_string_pool(unsigned long long runAddr, ArrayRef* out,
+                      unsigned long long* poolAddrOut) {
+    // Both directions, and wide. Searching only forwards found nothing: the
+    // header has FixedStrings just after TreasureRarities, but the engine's
+    // member order plainly differs -- the modifier lists sit *below* the run
+    // in memory, not above it.
+    constexpr std::size_t kWindow = 16384;
+    constexpr std::size_t kProbe = 8;
+    const unsigned long long lo = runAddr > kWindow ? runAddr - kWindow : 0;
+    const unsigned long long hi = runAddr + kWindow;
+
+    for (unsigned long long at = lo; at + 16 <= hi; at += 4) {
+        ArrayRef pool{};
+        if (!array_header_at((void const*)at, &pool)) continue;
+        // The pool holds every string the stats files mention, so it is
+        // large; a small array of resolvable indices is something else.
+        if (pool.Size < 256) continue;
+
+        // No structural pre-filter. Requiring the first entries to resolve
+        // and differ rejected the real pool on its first run -- a pool may
+        // hold empty or repeated slots -- while happily accepting the stat
+        // name array, which has neither. The dice test below is the only
+        // thing that actually distinguishes them, so it decides alone.
+
+        // Distinctness is not enough here. The Objects manager keeps a
+        // NameToHandle map whose key array is 15754 resolvable, distinct
+        // string indices -- the stat names -- and matching it made every
+        // attribute read back as a stat name ("Damage" came out as
+        // "Interrupt_BardicInspiration_SavingThrow_d8", unset ones as
+        // "Target_MainHandAttack", which is stat zero).
+        //
+        // So the test is positive rather than structural: the value pool has
+        // to contain dice notation, because that is what weapon damage is
+        // written as. A list of stat names does not.
+        if (!pool_contains_any(pool, kDiceStrings, kDiceCount)) {
+            logf("stats:   candidate pool at %#llx rejected: %u resolvable "
+                 "entries but no dice notation", at, pool.Size);
+            continue;
+        }
+
+        *out = pool;
+        *poolAddrOut = at;
+        logf("stats: string pool at %#llx (%+lld from the run), %u entries",
+             at, (long long)(at - runAddr), pool.Size);
+        return true;
+    }
+    logf("stats: no string pool found after the rarity run; FixedString "
+         "attributes will report their raw index");
+    return false;
+}
+
+// RPGStats::Floats and RPGStats::GUIDs, the pools the other indexed
+// attribute kinds point into.
+//
+// The header's member order held for the string pool -- it landed exactly
+// where TreasureRarities plus its padding predicted -- so the same order is
+// used here: FixedStrings, Int64s, GUIDs, Floats. Each is a 16-byte array
+// header, so the candidates are a short walk forward, and each is checked
+// against what its contents should look like rather than accepted on
+// position alone.
+void find_value_pools(unsigned long long poolAddr, Found* f) {
+    // Floats: finite, and not a block of zeroes or garbage exponents.
+    auto plausible_floats = [](ArrayRef const& a) {
+        if (a.Size < 8) return false;
+        std::size_t sane = 0;
+        std::size_t nonzero = 0;
+        for (std::size_t i = 0; i < 16 && i < a.Size; ++i) {
+            float v = 0.0f;
+            if (!read_as((char const*)a.Buffer + i * sizeof(float), &v)) {
+                return false;
+            }
+            const float mag = v < 0 ? -v : v;
+            if (v == v && mag < 1e9f) ++sane;      // v == v rejects NaN
+            if (v != 0.0f) ++nonzero;
+        }
+        return sane >= 16 && nonzero >= 2;
+    };
+
+    // Guids: 16 bytes each, and a real one is not all zeroes.
+    auto plausible_guids = [](ArrayRef const& a) {
+        if (a.Size < 4) return false;
+        std::size_t nonzero = 0;
+        for (std::size_t i = 0; i < 8 && i < a.Size; ++i) {
+            std::uint64_t w[2] = {};
+            if (!read_as((char const*)a.Buffer + i * 16, &w)) return false;
+            if (w[0] != 0 || w[1] != 0) ++nonzero;
+        }
+        return nonzero >= 4;
+    };
+
+    // At the positions the member order predicts, not the first thing that
+    // passes. Scanning forward for "the first plausible guid array" picked
+    // pool+16, which is Int64s: an array of pointers read sixteen bytes at a
+    // time looks exactly like non-zero guids. The order is
+    // FixedStrings, Int64s, GUIDs, Floats, and floats landing at +48 on the
+    // first run is what confirms it.
+    constexpr std::size_t kGuidsAt = 32;
+    constexpr std::size_t kFloatsAt = 48;
+
+    ArrayRef guids{};
+    if (array_header_at((void const*)(poolAddr + kGuidsAt), &guids)
+        && plausible_guids(guids)) {
+        f->Guids = guids;
+        logf("stats: guid pool at pool+%zu, %u entries", kGuidsAt,
+             guids.Size);
+    }
+
+    ArrayRef floats{};
+    if (array_header_at((void const*)(poolAddr + kFloatsAt), &floats)
+        && plausible_floats(floats)) {
+        f->Floats = floats;
+        logf("stats: float pool at pool+%zu, %u entries", kFloatsAt,
+             floats.Size);
+    }
+    if (f->Floats.Buffer == nullptr) {
+        logf("stats: no float pool found; Float attributes report their "
+             "pool index");
+    }
+    if (f->Guids.Buffer == nullptr) {
+        logf("stats: no guid pool found; GUID attributes report their "
+             "pool index");
+    }
+}
+
+// Object::IndexedProperties and Object::ModifierListIndex, derived from the
+// one relationship that has to hold: an object's value count equals the
+// number of attributes in its modifier list.
+//
+// This is self-validating, which matters because these two offsets sit after
+// members whose size cannot be confirmed from the headers. A pair of offsets
+// that agrees across many objects is right; nothing else would.
+bool find_object_offsets(Found const& f, std::size_t* propsOut,
+                         std::size_t* indexOut) {
+    constexpr std::size_t kSamples = 24;
+    constexpr std::size_t kMaxProps = 64;
+    constexpr std::size_t kMaxIndex = 512;
+
+    // Vector<int32_t> is a begin/end pair, so the count is the byte span
+    // divided by four.
+    auto vector_count = [](void const* at, std::size_t* countOut) {
+        void const* begin = nullptr;
+        void const* end = nullptr;
+        if (!read_as((char const*)at + 0, &begin)) return false;
+        if (!read_as((char const*)at + 8, &end)) return false;
+        if (begin == nullptr || end < begin) return false;
+        const std::size_t bytes =
+            (std::size_t)((char const*)end - (char const*)begin);
+        if (bytes % 4 != 0 || bytes > (1u << 20)) return false;
+        *countOut = bytes / 4;
+        return true;
+    };
+
+    auto list_attr_count = [&f](std::uint32_t listIndex,
+                                std::size_t* countOut) {
+        if (listIndex >= f.Lists.Size) return false;
+        void const* list = nullptr;
+        if (!read_as((char const*)f.Lists.Buffer + listIndex * sizeof(void*),
+                     &list)) {
+            return false;
+        }
+        if (list == nullptr) return false;
+        ArrayRef attrs{};
+        if (!array_header_at((char const*)list + f.AttrsOffset, &attrs)) {
+            return false;
+        }
+        *countOut = attrs.Size;
+        return true;
+    };
+
+    for (std::size_t props = 0; props <= kMaxProps; props += 8) {
+        for (std::size_t idx = 0; idx <= kMaxIndex; idx += 4) {
+            std::size_t agreed = 0;
+            std::size_t tried = 0;
+
+            for (std::size_t i = 0; i < f.Objects.Size && tried < kSamples;
+                 ++i) {
+                void const* obj = nullptr;
+                if (!read_as((char const*)f.Objects.Buffer + i * sizeof(void*),
+                             &obj)) {
+                    break;
+                }
+                if (obj == nullptr) continue;
+                ++tried;
+
+                std::size_t valueCount = 0;
+                if (!vector_count((char const*)obj + props, &valueCount)) {
+                    break;
+                }
+                std::uint32_t listIndex = 0;
+                if (!read_as((char const*)obj + idx, &listIndex)) break;
+
+                std::size_t attrCount = 0;
+                if (!list_attr_count(listIndex, &attrCount)) break;
+                if (valueCount != attrCount || valueCount == 0) break;
+                ++agreed;
+            }
+
+            if (tried >= kSamples && agreed == tried) {
+                *propsOut = props;
+                *indexOut = idx;
+                logf("stats: Object::IndexedProperties at +%zu, "
+                     "ModifierListIndex at +%zu (agreed on %zu objects)",
+                     props, idx, agreed);
+                return true;
+            }
+        }
+    }
+    logf("stats: no offsets made an object's value count match its modifier "
+         "list's attribute count; attributes stay unavailable");
+    return false;
 }
 
 bool search_for_stats() {
@@ -306,11 +710,37 @@ bool search_for_stats() {
                 if (!find_objects(base + off, &objects, &nameOffset)) continue;
 
                 std::fclose(maps);
-                state().Objects = objects;
-                state().NameOffset = nameOffset;
+                Found& f = state();
+                f.Objects = objects;
+                f.NameOffset = nameOffset;
                 logf("stats: %u stats found via the rarity run at %#llx "
                      "(scanned %zu bytes over %zu regions)", objects.Size,
                      base + off, scanned, regions);
+
+                // Attributes need three more things, each identified by
+                // content. Any of them missing leaves enumeration working
+                // and attributes reporting themselves unavailable.
+                const unsigned long long run = base + off;
+                const bool lists = find_named_array(
+                    run, "Weapon", 4, 4096, 128, &f.Lists, &f.ListNameOffset,
+                    "modifier lists");
+                unsigned long long poolAddr = 0;
+                if (find_string_pool(run, &f.Strings, &poolAddr)) {
+                    find_value_pools(poolAddr, &f);
+                }
+                const bool values = find_named_array(
+                    run, "ConstantInt", 4, 65536, 32, &f.ValueLists,
+                    &f.ValueNameOffset, "modifier value lists");
+                bool offsets = false;
+                if (lists) {
+                    offsets = find_modifier_name_offset(f.Lists, &f.ModifierNameOffset,
+                                                        &f.AttrsOffset)
+                              && find_object_offsets(f, &f.PropsOffset,
+                                                     &f.ListIndexOffset);
+                }
+                f.Attributes = lists && values && offsets;
+                logf("stats: attributes %s",
+                     f.Attributes ? "available" : "unavailable");
                 return true;
             }
         }
@@ -405,30 +835,226 @@ extern "C" void* bg3le_stats_find(char const* wanted) {
     return nullptr;
 }
 
-// Attributes are not available yet.
+// ---- attributes ----
 //
-// Reading them needs RPGStats::ModifierLists and ModifierValueLists, and the
-// struct offsets that would reach them are the very thing that proved wrong:
-// our TreasureRarities sits at 800 where the engine's is at 3648. They have
-// to be found by content, the way the stats array now is, and until that is
-// done these report nothing rather than returning numbers read from the
-// wrong place.
-extern "C" char const* bg3le_stats_type(void const*) { return nullptr; }
+// Four lookups, because the values are stored apart from their names:
+//
+//   Object[ListIndexOffset]        -> index into ModifierLists
+//   ModifierList.Attributes[n]     -> Modifier, which carries the name
+//   Object.IndexedProperties[n]    -> the raw int32
+//   Modifier.EnumerationIndex      -> RPGEnumeration, which says how to read
+//
+// Every offset here was derived by looking at memory, not taken from the
+// headers; see the search above for why.
 
-extern "C" std::size_t bg3le_stats_attr_count(void const*) { return 0; }
+namespace {
 
-extern "C" bool bg3le_stats_attr_at(void const*, std::size_t, char const**,
-                                    char const**, int*, int*) {
-    return false;
+void const* list_for(void const* object) {
+    Found const& f = state();
+    if (!f.Attributes || object == nullptr) return nullptr;
+
+    std::uint32_t index = 0;
+    if (!read_as((char const*)object + f.ListIndexOffset, &index)) {
+        return nullptr;
+    }
+    if (index >= f.Lists.Size) return nullptr;
+
+    void const* list = nullptr;
+    if (!read_as((char const*)f.Lists.Buffer + index * sizeof(void*),
+                 &list)) {
+        return nullptr;
+    }
+    return list;
 }
 
-extern "C" char const* bg3le_stats_attr_label(void const*, std::size_t, int) {
+void const* modifier_at(void const* object, std::size_t index) {
+    void const* list = list_for(object);
+    if (list == nullptr) return nullptr;
+    ArrayRef attrs{};
+    if (!array_header_at((char const*)list + state().AttrsOffset, &attrs)) {
+        return nullptr;
+    }
+    if (index >= attrs.Size) return nullptr;
+    void const* mod = nullptr;
+    if (!read_as((char const*)attrs.Buffer + index * sizeof(void*), &mod)) {
+        return nullptr;
+    }
+    return mod;
+}
+
+// The enumeration a modifier's value should be read through. EnumerationIndex
+// is the modifier's first member.
+void const* enumeration_for(void const* modifier) {
+    Found const& f = state();
+    if (modifier == nullptr || f.ValueLists.Buffer == nullptr) return nullptr;
+    std::int32_t index = 0;
+    if (!read_as(modifier, &index)) return nullptr;
+    if (index < 0 || (std::size_t)index >= f.ValueLists.Size) return nullptr;
+    void const* en = nullptr;
+    if (!read_as((char const*)f.ValueLists.Buffer + (std::size_t)index
+                     * sizeof(void*), &en)) {
+        return nullptr;
+    }
+    return en;
+}
+
+// Upstream decides this by comparing the enumeration's name against known
+// type names, so the same comparison is made here on the resolved text.
+// Values are RPGEnumerationType in bg3se's declaration order.
+int property_type(void const* enumeration) {
+    if (enumeration == nullptr) return 13;                       // Unknown
+    bg3se::FixedString name{};
+    if (!read_as((char const*)enumeration + state().ValueNameOffset, &name)) {
+        return 13;
+    }
+    char const* text = text_of(name);
+    if (text == nullptr) return 13;
+
+    if (std::strcmp(text, "ConstantInt") == 0) return 0;         // Int
+    if (std::strcmp(text, "ConstantFloat") == 0) return 2;       // Float
+    if (std::strcmp(text, "FixedString") == 0
+        || std::strcmp(text, "StatusIDs") == 0) return 3;        // FixedString
+    if (std::strcmp(text, "Guid") == 0) return 6;                // GUID
+    if (std::strcmp(text, "StatsFunctors") == 0) return 7;
+    if (std::strcmp(text, "Conditions") == 0
+        || std::strcmp(text, "TargetConditions") == 0
+        || std::strcmp(text, "UseConditions") == 0) return 8;
+    if (std::strcmp(text, "RollConditions") == 0) return 9;
+    if (std::strcmp(text, "Requirements") == 0) return 10;
+    if (std::strcmp(text, "MemorizationRequirements") == 0) return 11;
+    if (std::strcmp(text, "TranslatedString") == 0) return 12;
+    return 4;                                                    // Enumeration
+}
+
+}  // namespace
+
+extern "C" char const* bg3le_stats_type(void const* object) {
+    void const* list = list_for(object);
+    if (list == nullptr) return nullptr;
+    bg3se::FixedString name{};
+    if (!read_as((char const*)list + state().ListNameOffset, &name)) {
+        return nullptr;
+    }
+    return text_of(name);
+}
+
+extern "C" std::size_t bg3le_stats_attr_count(void const* object) {
+    void const* list = list_for(object);
+    if (list == nullptr) return 0;
+    ArrayRef attrs{};
+    if (!array_header_at((char const*)list + state().AttrsOffset, &attrs)) {
+        return 0;
+    }
+    return attrs.Size;
+}
+
+extern "C" bool bg3le_stats_attr_at(void const* object, std::size_t index,
+                                    char const** nameOut,
+                                    char const** typeNameOut, int* kindOut,
+                                    int* rawOut) {
+    Found const& f = state();
+    if (!f.Attributes || object == nullptr) return false;
+
+    void const* mod = modifier_at(object, index);
+    if (mod == nullptr) return false;
+
+    // The attribute's position is its index into the object's values.
+    void const* begin = nullptr;
+    void const* end = nullptr;
+    auto const* props = (char const*)object + f.PropsOffset;
+    if (!read_as(props + 0, &begin)) return false;
+    if (!read_as(props + 8, &end)) return false;
+    if (begin == nullptr || end < begin) return false;
+    const std::size_t count =
+        (std::size_t)((char const*)end - (char const*)begin) / 4;
+    if (index >= count) return false;
+
+    std::int32_t raw = 0;
+    if (!read_as((char const*)begin + index * sizeof(std::int32_t), &raw)) {
+        return false;
+    }
+
+    bg3se::FixedString modName{};
+    if (!read_as((char const*)mod + f.ModifierNameOffset, &modName)) {
+        return false;
+    }
+
+    void const* en = enumeration_for(mod);
+    if (nameOut != nullptr) *nameOut = text_of(modName);
+    if (typeNameOut != nullptr) {
+        if (en != nullptr) {
+            bg3se::FixedString enName{};
+            *typeNameOut =
+                read_as((char const*)en + f.ValueNameOffset, &enName)
+                    ? text_of(enName)
+                    : nullptr;
+        } else {
+            *typeNameOut = nullptr;
+        }
+    }
+    if (kindOut != nullptr) *kindOut = property_type(en);
+    if (rawOut != nullptr) *rawOut = raw;
+    return true;
+}
+
+// For an enumeration-typed attribute, the label matching the raw value. The
+// enumeration maps label to value, so this is a reverse lookup over it.
+extern "C" char const* bg3le_stats_attr_label(void const* object,
+                                              std::size_t index, int raw) {
+    void const* mod = modifier_at(object, index);
+    void const* en = enumeration_for(mod);
+    if (en == nullptr) return nullptr;
+
+    // RPGEnumeration is Name then Values, so the map follows the name.
+    auto const* map = (bg3se::LegacyMap<bg3se::FixedString, std::int32_t> const*)
+        ((char const*)en + state().ValueNameOffset + 8);
+    for (auto const& pair : *map) {
+        if (pair.Value == raw) return text_of(pair.Key);
+    }
     return nullptr;
 }
 
+// A Float attribute's value, from the float pool.
+extern "C" bool bg3le_stats_attr_float(int raw, double* out) {
+    Found const& f = state();
+    if (raw < 0 || f.Floats.Buffer == nullptr) return false;
+    if ((std::size_t)raw >= f.Floats.Size) return false;
+    float v = 0.0f;
+    if (!read_as((char const*)f.Floats.Buffer + (std::size_t)raw
+                     * sizeof(float), &v)) {
+        return false;
+    }
+    if (out != nullptr) *out = (double)v;
+    return true;
+}
+
+// A GUID attribute's value, formatted the way the engine writes one.
+extern "C" bool bg3le_stats_attr_guid(int raw, char* out,
+                                      std::size_t capacity) {
+    Found const& f = state();
+    if (raw < 0 || f.Guids.Buffer == nullptr) return false;
+    if ((std::size_t)raw >= f.Guids.Size) return false;
+    std::uint8_t bytes[16] = {};
+    if (!read_as((char const*)f.Guids.Buffer + (std::size_t)raw * 16,
+                 &bytes)) {
+        return false;
+    }
+    return bg3le_meta_format_guid(bytes, out, capacity);
+}
+
+// A FixedString attribute's text: the raw value indexes RPGStats' own pool,
+// not the global string table.
 extern "C" char const* bg3le_stats_attr_string(int raw) {
-    if (raw < 0) return nullptr;
-    return bg3le_fixed_string((std::uint32_t)raw, nullptr);
+    Found const& f = state();
+    if (raw < 0 || f.Strings.Buffer == nullptr) return nullptr;
+    if ((std::size_t)raw >= f.Strings.Size) return nullptr;
+
+    std::uint32_t id = 0;
+    if (!read_as((char const*)f.Strings.Buffer
+                     + (std::size_t)raw * sizeof(std::uint32_t), &id)) {
+        return nullptr;
+    }
+    return bg3le_fixed_string(id, nullptr);
 }
 
 }  // namespace bg3le

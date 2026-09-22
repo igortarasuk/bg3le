@@ -1047,6 +1047,9 @@ extern "C" bool bg3le_stats_attr_at(void const* object, std::size_t index,
 extern "C" char const* bg3le_stats_attr_label(void const* object,
                                               std::size_t index, int raw);
 extern "C" char const* bg3le_stats_attr_string(int raw);
+extern "C" bool bg3le_stats_attr_float(int raw, double* out);
+extern "C" bool bg3le_stats_attr_guid(int raw, char* out,
+                                      std::size_t capacity);
 
 extern "C" void* bg3le_resource_manager();
 extern "C" std::size_t bg3le_resource_bank_count();
@@ -1365,6 +1368,18 @@ int l_stats_name_at(lua_State* L) {
     return 1;
 }
 
+// Ext._Internal.StatsAt(index) -> address
+//
+// Filtering needs the address without paying for a name lookup: StatsFind is
+// a linear scan, so using it per stat would be quadratic.
+int l_stats_at(lua_State* L) {
+    const auto i = (std::size_t)luaL_checkinteger(L, 1);
+    void* obj = bg3le_stats_at(i);
+    if (obj == nullptr) return 0;
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)obj);
+    return 1;
+}
+
 // Ext._Internal.StatsFind(name) -> address
 int l_stats_find(lua_State* L) {
     const char* name = luaL_checkstring(L, 1);
@@ -1433,6 +1448,24 @@ int l_stats_attr_string(lua_State* L) {
     const int raw = (int)luaL_checkinteger(L, 1);
     char const* text = bg3le_stats_attr_string(raw);
     if (text == nullptr) return 0;
+    lua_pushstring(L, text);
+    return 1;
+}
+
+// Ext._Internal.StatsAttrFloat(raw) -> number
+int l_stats_attr_float(lua_State* L) {
+    const int raw = (int)luaL_checkinteger(L, 1);
+    double v = 0.0;
+    if (!bg3le_stats_attr_float(raw, &v)) return 0;
+    lua_pushnumber(L, v);
+    return 1;
+}
+
+// Ext._Internal.StatsAttrGuid(raw) -> guid string
+int l_stats_attr_guid(lua_State* L) {
+    const int raw = (int)luaL_checkinteger(L, 1);
+    char text[40];
+    if (!bg3le_stats_attr_guid(raw, text, sizeof(text))) return 0;
     lua_pushstring(L, text);
     return 1;
 }
@@ -2136,6 +2169,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "StatsCount");
     lua_pushcfunction(g_lua, l_stats_name_at);
     lua_setfield(g_lua, -2, "StatsNameAt");
+    lua_pushcfunction(g_lua, l_stats_at);
+    lua_setfield(g_lua, -2, "StatsAt");
     lua_pushcfunction(g_lua, l_stats_find);
     lua_setfield(g_lua, -2, "StatsFind");
     lua_pushcfunction(g_lua, l_stats_type);
@@ -2148,6 +2183,10 @@ void lua_init() {
     lua_setfield(g_lua, -2, "StatsAttrLabel");
     lua_pushcfunction(g_lua, l_stats_attr_string);
     lua_setfield(g_lua, -2, "StatsAttrString");
+    lua_pushcfunction(g_lua, l_stats_attr_float);
+    lua_setfield(g_lua, -2, "StatsAttrFloat");
+    lua_pushcfunction(g_lua, l_stats_attr_guid);
+    lua_setfield(g_lua, -2, "StatsAttrGuid");
     lua_pushcfunction(g_lua, l_resource_banks);
     lua_setfield(g_lua, -2, "ResourceBanks");
     lua_pushcfunction(g_lua, l_resource_get);
@@ -2751,14 +2790,25 @@ local function read_attribute(addr, i)
   if kind == 0 or kind == 1 then
     value = raw
   elseif kind == 2 then
-    -- Floats are stored in the same int32 slot; the engine keeps them in the
-    -- float table rather than inline, so the raw value is an index and the
-    -- number itself is not reachable from here yet.
-    value = raw
+    value = Ext._Internal.StatsAttrFloat(raw) or {PoolIndex = raw}
+  elseif kind == 6 then
+    value = Ext._Internal.StatsAttrGuid(raw) or {PoolIndex = raw}
   elseif kind == 3 then
-    value = Ext._Internal.StatsAttrString(raw) or raw
+    -- Index 0 is the unset slot and does not resolve; an absent string is
+    -- empty, not the number nought.
+    value = Ext._Internal.StatsAttrString(raw) or ""
   elseif kind == 4 or kind == 5 then
-    value = Ext._Internal.StatsAttrLabel(addr, i, raw) or raw
+    -- An exact match is reported; anything else is reported as raw.
+    --
+    -- Treating an unmatched value as a bitmask and naming each bit was
+    -- tried and produced confident nonsense: a longsword's proficiency came
+    -- out as "Clubs;Darts;LightArmor;Shortswords;256;1024" and its
+    -- properties as "Light;Heavy;NoDualWield", when they should be
+    -- Longswords/Martial and Versatile. So a flags value is not a bitmask
+    -- over these labels, and until what it actually is has been worked out,
+    -- the number is reported as a number rather than dressed up as names.
+    local exact = Ext._Internal.StatsAttrLabel(addr, i, raw)
+    value = exact or {Raw = raw, Unresolved = "flag set, not yet decoded"}
   else
     -- Functors, conditions, requirements and translated strings are stored
     -- elsewhere on the object; the raw handle is reported rather than guessed
@@ -2784,11 +2834,13 @@ function Ext.Stats.Get(name)
     local attr, value = read_attribute(addr, i)
     if attr ~= nil then out[attr] = value end
   end
-  -- Attributes need the modifier lists, which are not located yet. Say so in
-  -- the table rather than returning a name and letting it look complete.
+  -- An empty attribute set means the discovery did not land, which is worth
+  -- saying rather than returning a lone name that looks complete.
   if n == 0 then
     out.AttributesUnavailable =
-      "the modifier lists have still to be located"
+      "no attributes readable; see the stats lines in the extender log"
+  else
+    out.ModifierList = Ext._Internal.StatsType(addr)
   end
   return out
 end
@@ -2820,15 +2872,23 @@ end
 -- That would hang the story thread, which has already happened once on this
 -- feature and is not worth repeating for a convenience.
 function Ext.Stats.GetAllStats(modifierList)
-  if modifierList ~= nil then
-    return nil, "filtering by modifier list is not available yet; the "
-      .. "modifier lists have still to be located"
-  end
   local out = {}
   local n = Ext._Internal.StatsCount()
   for i = 0, n - 1 do
     local name = Ext._Internal.StatsNameAt(i)
-    if name ~= nil then out[#out + 1] = name end
+    if name == nil then goto continue end
+    if modifierList == nil then
+      out[#out + 1] = name
+    else
+      -- By index, never by name: StatsFind is a linear scan, so filtering
+      -- through it would be 15754 scans of 15754 entries and would hang the
+      -- story thread.
+      local addr = Ext._Internal.StatsAt(i)
+      if addr ~= nil and Ext._Internal.StatsType(addr) == modifierList then
+        out[#out + 1] = name
+      end
+    end
+    ::continue::
   end
   return out
 end
