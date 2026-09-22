@@ -1068,6 +1068,14 @@ extern "C" char const* bg3le_stats_attr_label(void const* object,
 extern "C" char const* bg3le_stats_attr_string(int raw);
 extern "C" char const* bg3le_stats_attr_translated(int raw);
 extern "C" char const* bg3le_stats_attr_condition(int raw);
+extern "C" char const* bg3le_stats_ai_flags(void const* object);
+extern "C" int bg3le_stats_roll_condition_count(void const* object,
+                                                char const* attribute);
+extern "C" bool bg3le_stats_roll_condition_at(void const* object,
+                                              char const* attribute,
+                                              int index,
+                                              char const** nameOut,
+                                              char const** textOut);
 extern "C" bool bg3le_stats_attr_float(int raw, double* out);
 extern "C" bool bg3le_stats_attr_guid(int raw, char* out,
                                       std::size_t capacity);
@@ -1521,6 +1529,43 @@ int l_stats_attr_condition(lua_State* L) {
         bg3le_stats_attr_condition((int)luaL_checkinteger(L, 1));
     if (text == nullptr) return 0;
     lua_pushstring(L, text);
+    return 1;
+}
+
+// Ext._Internal.StatsAIFlags(address) -> the object's AIFlags
+int l_stats_ai_flags(lua_State* L) {
+    auto const* object =
+        (void const*)(std::uintptr_t)luaL_checkinteger(L, 1);
+    char const* text = bg3le_stats_ai_flags(object);
+    if (text == nullptr) return 0;
+    lua_pushstring(L, text);
+    return 1;
+}
+
+// Ext._Internal.StatsRollConditions(address, attribute)
+//   -> { [name] = condition, ... }, or nil when the attribute has none
+int l_stats_roll_conditions(lua_State* L) {
+    auto const* object =
+        (void const*)(std::uintptr_t)luaL_checkinteger(L, 1);
+    char const* attribute = luaL_checkstring(L, 2);
+
+    const int count = bg3le_stats_roll_condition_count(object, attribute);
+    if (count < 0) return 0;
+
+    lua_createtable(L, 0, count);
+    for (int i = 0; i < count; ++i) {
+        char const* name = nullptr;
+        char const* text = nullptr;
+        if (!bg3le_stats_roll_condition_at(object, attribute, i, &name,
+                                           &text)) {
+            continue;
+        }
+        // Upstream skips a roll condition whose expression does not
+        // resolve, rather than storing an empty one.
+        if (name == nullptr || text == nullptr) continue;
+        lua_pushstring(L, text);
+        lua_setfield(L, -2, name);
+    }
     return 1;
 }
 
@@ -2418,6 +2463,10 @@ void lua_init() {
     lua_setfield(g_lua, -2, "StatsAttrTranslated");
     lua_pushcfunction(g_lua, l_stats_attr_condition);
     lua_setfield(g_lua, -2, "StatsAttrCondition");
+    lua_pushcfunction(g_lua, l_stats_ai_flags);
+    lua_setfield(g_lua, -2, "StatsAIFlags");
+    lua_pushcfunction(g_lua, l_stats_roll_conditions);
+    lua_setfield(g_lua, -2, "StatsRollConditions");
     lua_pushcfunction(g_lua, l_stat_origin);
     lua_setfield(g_lua, -2, "StatOrigin");
     lua_pushcfunction(g_lua, l_stats_count);
@@ -3134,6 +3183,16 @@ local function read_attribute(addr, i)
   if name == nil then return nil end
 
   local value
+  -- AIFlags before anything else. It classifies as an Enumeration, since it
+  -- carries labels and is not one of upstream's flag types, but
+  -- Object::GetString special-cases it: the value is a FixedString on the
+  -- object, not an index into a pool. Decoding it as an enumeration
+  -- reported "CanNotUse" on a spell whose AIFlags is empty.
+  if typeName == "AIFlags" then
+    return name, Ext._Internal.StatsAIFlags(addr) or "",
+           STAT_KIND[kind] or "Unknown", typeName, raw
+  end
+
   if kind == 0 or kind == 1 then
     value = raw
   elseif kind == 2 then
@@ -3180,7 +3239,9 @@ local function read_attribute(addr, i)
     -- misses, so this does too.
     value = Ext._Internal.StatsAttrCondition(raw) or ""
   elseif kind == 9 then
-    value = nil                      -- RollConditions: not read yet
+    -- A table keyed by each roll condition's text key, holding its
+    -- expression; nil when the attribute carries none.
+    value = Ext._Internal.StatsRollConditions(addr, name)
   elseif kind == 11 then
     -- MemorizationRequirements is deprecated and upstream pushes nil for it
     -- unconditionally, whatever the stat holds.

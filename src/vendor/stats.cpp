@@ -925,6 +925,70 @@ void const* object_at(std::size_t index) {
     return element;
 }
 
+// Object's own members, past the indexed properties.
+//
+// The member order gives these directly once the container sizes are known:
+// StaticArray and Array are both sixteen bytes here, so HashSet is
+// forty-eight and HashMap sixty-four. Counting from Name at +32 puts
+// ModifierListIndex at +228, which is exactly where it was derived
+// independently -- that agreement is what says the rest of the walk is
+// right.
+//
+//   +40  Functors        HashMap<FixedString, Array<FunctorGroup>>
+//   +104 RollConditions  HashMap<FixedString, Array<RollCondition>>
+//   +168 AIFlags         FixedString
+//   +176 Requirements    Array<Requirement>
+constexpr std::size_t kObjectRollConditions = 104;
+constexpr std::size_t kObjectAIFlags = 168;
+
+// A bg3se HashMap: HashKeys, NextIds, Keys, then Values. Looking a key up
+// means walking the buckets upstream, but Keys and Values are parallel
+// arrays, so a linear walk finds the same entry without reimplementing the
+// hash -- and these maps hold a handful of entries.
+struct HashMapRef {
+    void const* Keys{nullptr};
+    void const* Values{nullptr};
+    std::uint32_t Count{0};
+};
+
+bool read_hash_map(void const* at, HashMapRef* out) {
+    constexpr std::size_t kKeysBuffer = 32;
+    constexpr std::size_t kKeysSize = 44;
+    constexpr std::size_t kValuesBuffer = 48;
+
+    void const* keys = nullptr;
+    void const* values = nullptr;
+    std::uint32_t count = 0;
+    if (!read_as((char const*)at + kKeysBuffer, &keys)
+        || !read_as((char const*)at + kKeysSize, &count)
+        || !read_as((char const*)at + kValuesBuffer, &values)) {
+        return false;
+    }
+    if (count > 4096) return false;
+    if (count != 0 && (keys == nullptr || values == nullptr)) return false;
+
+    out->Keys = keys;
+    out->Values = values;
+    out->Count = count;
+    return true;
+}
+
+// The slot in a map keyed by attribute name, or -1.
+int hash_map_slot(void const* map, char const* name) {
+    HashMapRef m{};
+    if (name == nullptr || !read_hash_map(map, &m)) return -1;
+
+    for (std::uint32_t i = 0; i < m.Count; ++i) {
+        std::uint32_t key = 0;
+        if (!read_as((char const*)m.Keys + i * sizeof(std::uint32_t), &key)) {
+            return -1;
+        }
+        char const* text = bg3le_fixed_string(key, nullptr);
+        if (text != nullptr && std::strcmp(text, name) == 0) return (int)i;
+    }
+    return -1;
+}
+
 }  // namespace
 
 // ---- the C surface Ext.Stats is built on ----
@@ -1306,6 +1370,76 @@ extern "C" char const* bg3le_stats_attr_condition(int raw) {
         return nullptr;
     }
     return text.c_str();
+}
+
+// Object::AIFlags, which upstream reads off the object rather than out of
+// the string pool -- Object::GetString special-cases the AIFlags type.
+// Reading the pool instead reported "CanNotUse" on a spell whose AIFlags is
+// empty.
+extern "C" char const* bg3le_stats_ai_flags(void const* object) {
+    if (object == nullptr || !state().Attributes) return nullptr;
+    std::uint32_t index = 0;
+    if (!read_as((char const*)object + kObjectAIFlags, &index)) return nullptr;
+    char const* text = bg3le_fixed_string(index, nullptr);
+    return text != nullptr ? text : "";
+}
+
+// How many roll conditions an attribute carries, and the n-th one's text
+// key and expression. Upstream reports the attribute as a table keyed by
+// the roll condition's name.
+extern "C" int bg3le_stats_roll_condition_count(void const* object,
+                                                char const* attribute) {
+    if (object == nullptr || !state().Attributes) return -1;
+    auto const* map = (char const*)object + kObjectRollConditions;
+    const int slot = hash_map_slot(map, attribute);
+    if (slot < 0) return -1;
+
+    HashMapRef m{};
+    if (!read_hash_map(map, &m)) return -1;
+
+    // Values[slot] is an Array<RollCondition>.
+    std::uint32_t size = 0;
+    if (!read_as((char const*)m.Values + (std::size_t)slot * 16 + 12,
+                 &size)) {
+        return -1;
+    }
+    return size > 4096 ? -1 : (int)size;
+}
+
+extern "C" bool bg3le_stats_roll_condition_at(void const* object,
+                                              char const* attribute,
+                                              int index,
+                                              char const** nameOut,
+                                              char const** textOut) {
+    const int count = bg3le_stats_roll_condition_count(object, attribute);
+    if (count < 0 || index < 0 || index >= count) return false;
+
+    auto const* map = (char const*)object + kObjectRollConditions;
+    const int slot = hash_map_slot(map, attribute);
+    HashMapRef m{};
+    if (slot < 0 || !read_hash_map(map, &m)) return false;
+
+    void const* buffer = nullptr;
+    if (!read_as((char const*)m.Values + (std::size_t)slot * 16, &buffer)
+        || buffer == nullptr) {
+        return false;
+    }
+
+    // RollCondition is { FixedString Name; ConditionId Conditions }, and
+    // ConditionId is one int32 indexing the condition pool.
+    auto const* entry = (char const*)buffer + (std::size_t)index * 8;
+    std::uint32_t name = 0;
+    std::int32_t condition = 0;
+    if (!read_as(entry, &name) || !read_as(entry + 4, &condition)) {
+        return false;
+    }
+
+    if (nameOut != nullptr) {
+        char const* text = bg3le_fixed_string(name, nullptr);
+        *nameOut = text != nullptr ? text : "";
+    }
+    if (textOut != nullptr) *textOut = bg3le_stats_attr_condition(condition);
+    return true;
 }
 
 }  // namespace bg3le
