@@ -985,12 +985,14 @@ int l_array_info(lua_State* L) {
     }
 
     lua_pushinteger(L, (lua_Integer)count);
-    // An unsupported element kind on an array that resolved means the elements
-    // are structs; whether they can be descended into was already decided by
-    // the kind the field itself reports.
-    lua_pushstring(L, (FieldKind)elemKind == FieldKind::Unsupported
-                          ? "struct"
-                          : field_kind_name((FieldKind)elemKind));
+    // The element kind as it actually is, which for anything that is not a
+    // scalar is "unsupported": the field tables only record a scalar kind for
+    // elements. This used to answer "struct" instead, reasoning that a
+    // non-scalar element must be one -- and then an element that was itself a
+    // container got walked as a struct and raised. Nothing dispatches on this
+    // any more, since read_path asks about the element's own path, so it can
+    // simply be accurate.
+    lua_pushstring(L, field_kind_name((FieldKind)elemKind));
     return 2;
 }
 
@@ -1865,8 +1867,53 @@ end
 -- and both honour metamethods -- so a view still dumps like an array.
 local make_fields
 local make_map
+local make_array
 
-local function make_array(handle, comp, path)
+-- Reads whatever is at a path, whichever kind it turns out to be.
+--
+-- One dispatch, because there were three: the component view, an array
+-- element and a map value each had their own. They drifted, and the array one
+-- asked the *container* for its element kind -- which reports "struct" for an
+-- element that is itself a container, so reading a std::optional holding a
+-- std::array raised instead of returning the array. Asking about the element's
+-- own path instead is both correct and the same question in every case.
+local read_path
+
+read_path = function(handle, comp, path)
+  local kind = Ext._Internal.FieldInfo(comp, path)
+  if kind == nil then
+    error("bg3le: " .. comp .. "." .. path .. " does not resolve", 0)
+  end
+
+  if kind == "array" then return make_array(handle, comp, path) end
+  if kind == "map" then return make_map(handle, comp, path) end
+
+  -- An optional holds nought or one. Empty reads as nil, which is the answer
+  -- bg3se gives too, and stays distinct from unreadable, which raises. A full
+  -- one reads as whatever it holds -- and what it holds may itself be a
+  -- container, which is the case that was broken.
+  if kind == "optional" then
+    local held, err = Ext._Internal.ArrayInfo(handle, comp, path)
+    if held == nil then
+      error("bg3le: cannot size " .. comp .. "." .. path .. ": "
+            .. tostring(err), 0)
+    end
+    if held == 0 then return nil end
+    return read_path(handle, comp, path .. "[0]")
+  end
+
+  if kind == "struct" then
+    local inner, err = Ext._Internal.ComponentFields(comp, path)
+    if inner == nil then error("bg3le: " .. tostring(err), 0) end
+    return make_fields(handle, comp, path, inner)
+  end
+
+  local value, err = Ext._Internal.GetField(handle, comp, path)
+  if value == nil and err ~= nil then error("bg3le: " .. err, 0) end
+  return value
+end
+
+make_array = function(handle, comp, path)
   -- Raises rather than reporting zero, for the reason in make_map below: a
   -- failure to resolve must not read as an empty array.
   local function length()
@@ -1888,16 +1935,7 @@ local function make_array(handle, comp, path)
   end
 
   local function element(i)
-    local ipath = element_path(i)
-    local _, elemKind = Ext._Internal.ArrayInfo(handle, comp, path)
-    if elemKind == "struct" then
-      local inner, err = Ext._Internal.ComponentFields(comp, ipath)
-      if inner == nil then error("bg3le: " .. tostring(err), 0) end
-      return make_fields(handle, comp, ipath, inner)
-    end
-    local value, err = Ext._Internal.GetField(handle, comp, ipath)
-    if value == nil and err ~= nil then error("bg3le: " .. err, 0) end
-    return value
+    return read_path(handle, comp, element_path(i))
   end
 
   return setmetatable({}, {
@@ -1949,18 +1987,7 @@ make_map = function(handle, comp, path)
   end
 
   local function value_at(i)
-    local vpath = path .. "[" .. i .. "]"
-    local kind = Ext._Internal.FieldInfo(comp, vpath)
-    if kind == "struct" then
-      local inner, err = Ext._Internal.ComponentFields(comp, vpath)
-      if inner == nil then error("bg3le: " .. tostring(err), 0) end
-      return make_fields(handle, comp, vpath, inner)
-    end
-    if kind == "array" then return make_array(handle, comp, vpath) end
-    if kind == "map" then return make_map(handle, comp, vpath) end
-    local value, err = Ext._Internal.GetField(handle, comp, vpath)
-    if value == nil and err ~= nil then error("bg3le: " .. err, 0) end
-    return value
+    return read_path(handle, comp, path .. "[" .. i .. "]")
   end
 
   -- Slot of a key, or nil. Linear, as above.
@@ -2046,34 +2073,10 @@ make_fields = function(handle, comp, prefix, fields)
         local where = prefix == "" and comp or (comp .. "." .. prefix)
         error("bg3le: " .. where .. " has no field " .. tostring(key), 0)
       end
-      local path = path_to(key)
-      if kind == "array" then
-        return make_array(handle, comp, path)
-      end
-      if kind == "map" then
-        return make_map(handle, comp, path)
-      end
-      -- An optional holds nought or one. Empty reads as nil, which is the
-      -- answer bg3se gives too, and is distinct from the field being
-      -- unreadable -- that still raises. A full one reads as whatever it
-      -- holds, which is the element one index in.
-      if kind == "optional" then
-        local held, err = Ext._Internal.ArrayInfo(handle, comp, path)
-        if held == nil then
-          error("bg3le: cannot size " .. comp .. "." .. path .. ": "
-                .. tostring(err), 0)
-        end
-        if held == 0 then return nil end
-        return make_array(handle, comp, path)[1]
-      end
-      if kind == "struct" then
-        local inner, err = Ext._Internal.ComponentFields(comp, path)
-        if inner == nil then error("bg3le: " .. tostring(err), 0) end
-        return make_fields(handle, comp, path, inner)
-      end
-      local value, err = Ext._Internal.GetField(handle, comp, path)
-      if value == nil and err ~= nil then error("bg3le: " .. err, 0) end
-      return value
+      -- The field table says which kind it is, but read_path asks again
+      -- about the field's own path. Both agree; going through the one
+      -- dispatch is what keeps the three call sites from drifting.
+      return read_path(handle, comp, path_to(key))
     end,
     __newindex = function(_, key, value)
       local ok, err = Ext._Internal.SetField(handle, comp, path_to(key), value)

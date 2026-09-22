@@ -94,6 +94,11 @@ function Ext._Internal.ArrayInfo(handle, comp, path)
   return count, "int32"
 end
 
+-- read_path asks about the element's own path rather than asking the container
+-- for its element kind, which is what makes a container inside a container
+-- work. Every element in this section is an int32.
+function Ext._Internal.FieldInfo(comp, path) return "int32", "", 0 end
+
 function Ext._Internal.GetField(handle, comp, path)
   local i, err = index_of(path)
   if i == nil then return nil, err end
@@ -303,15 +308,65 @@ check("the serializer did not re-index the view", direct, 0)
 check("naming the field directly still raises",
       pcall(function() return proxy.DiceValues end), false)
 
+"""
+
+NESTED_TEST = r"""
+-- ---- a container inside a container ----
+--
+-- DiceValues is a std::optional<std::array<DiceValue, 7>>. Reading it raised
+-- "<unreadable>" for the one action resource whose optional was actually
+-- engaged, while the eight empty ones read as nil and looked fine. The cause
+-- was three copies of the read dispatch: the array one asked the *container*
+-- for its element kind, which reports "struct" for an element that is itself a
+-- container, so it tried to walk an array as a struct.
+--
+-- Stubbed here as: Dice is an optional holding one, and Dice[0] is an array of
+-- two numbers.
+local optionalHeld = 1
+
+function Ext._Internal.FieldInfo(comp, path)
+  if path == "Dice" then return "optional", "", 0 end
+  if path == "Dice[0]" then return "array", "float", 2 end
+  if path == "Dice[0][0]" or path == "Dice[0][1]" then return "float", "", 0 end
+  return nil
+end
+
+function Ext._Internal.ArrayInfo(handle, comp, path)
+  if path == "Dice" then return optionalHeld, "struct" end
+  if path == "Dice[0]" then return 2, "float" end
+  return nil, "not a container: " .. tostring(path)
+end
+
+function Ext._Internal.GetField(handle, comp, path)
+  if path == "Dice[0][0]" then return 1.5 end
+  if path == "Dice[0][1]" then return 2.5 end
+  return nil, "no such path: " .. tostring(path)
+end
+
+local dice = read_path(1, "ActionResources", "Dice")
+check("an optional holding an array is not nil", dice ~= nil, true)
+if dice ~= nil then
+  check("its length", #dice, 2)
+  check("its first element", dice[1], 1.5)
+  check("its second element", dice[2], 2.5)
+end
+
+-- And an empty one still reads as nil rather than raising or as an empty
+-- array, which is what bg3se prints.
+optionalHeld = 0
+check("an empty optional reads as nil", read_path(1, "ActionResources", "Dice"),
+      nil)
+optionalHeld = 1
+
 if fails > 0 then
   print(fails .. " failure(s)")
   os.exit(1)
 end
-print("array, map and dump behaviour all check out")
+print("array, map, dump and nested containers all check out")
 """
 
 harness = (PRELUDE + make_array + make_map + "Ext.Json = {}\n" + encoder
-           + ARRAY_TEST + MAP_TEST + DUMP_TEST)
+           + ARRAY_TEST + MAP_TEST + DUMP_TEST + NESTED_TEST)
 
 with tempfile.NamedTemporaryFile("w", suffix=".lua", delete=False) as f:
     f.write(harness)
