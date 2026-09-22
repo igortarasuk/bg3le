@@ -2266,8 +2266,24 @@ local function encode(v, indent, depth, opts, seen, out)
   if v == nil then out[#out+1] = "null"
   elseif t == "boolean" then out[#out+1] = tostring(v)
   elseif t == "number" then
-    out[#out+1] = (math.type(v) == "integer") and tostring(v)
-                  or string.format("%.14g", v)
+    -- Floats print to full round-trip precision, and keep a decimal point
+    -- even when whole, because that is what the real extender emits:
+    -- Weight is 1.350000023841858 there and ValueScale is 1.0, where %.14g
+    -- gave 1.3500000238419 and 1. A float and an integer are different
+    -- types in Lua and the output should not blur them.
+    if math.type(v) == "integer" then
+      out[#out+1] = tostring(v)
+    else
+      local text = string.format("%.17g", v)
+      -- %.17g is round-trip exact but verbose; prefer the shortest form
+      -- that still reads back identically.
+      for _, fmt in ipairs({"%.15g", "%.16g"}) do
+        local short = string.format(fmt, v)
+        if tonumber(short) == v then text = short break end
+      end
+      if not text:find("[.eE]") then text = text .. ".0" end
+      out[#out+1] = text
+    end
   elseif t == "string" then
     out[#out+1] = string.format("%q", v):gsub("\\\n", "\\n")
   elseif t ~= "table" then
