@@ -1,0 +1,49 @@
+count: 87
+{
+    "Description": {
+        "ArgumentString": {
+            "Handle": "ls::TranslatedStringRepository::s_HandleUnknown",
+            "Version": 0
+        },
+        "Get": "function: 00006FFFE7B0D050",
+        "Handle": {
+            "Handle": "hc76c8721g97e6g4d63gb106g1ab1dba11266",
+            "Version": 3
+        }
+    },
+    "DiceType": "Default",
+    "DisplayName": {
+        "ArgumentString": {
+            "Handle": "ls::TranslatedStringRepository::s_HandleUnknown",
+            "Version": 0
+        },
+        "Get": "function: 00006FFFE7B0D050",
+        "Handle": {
+            "Handle": "hb827daf0gcc2eg4d22g99b8g23e9219cfca1",
+            "Version": 2
+        }
+    },
+    "Error": {
+        "ArgumentString": {
+            "Handle": "ls::TranslatedStringRepository::s_HandleUnknown",
+            "Version": 0
+        },
+        "Get": "function: 00006FFFE7B0D050",
+        "Handle": {
+            "Handle": "ls::TranslatedStringRepository::s_HandleUnknown",
+            "Version": 0
+        }
+    },
+    "IsHidden": false,
+    "IsSpellResource": false,
+    "MaxLevel": 0,
+    "MaxValue": 0.0,
+    "Name": "Movement",
+    "PartyActionResource": false,
+    "ReplenishType": [
+        "Default"
+    ],
+    "ResourceUUID": "d6b2369d-84f0-4ca4-a3a7-62d2d192a185",
+    "ShowOnActionResourcePanel": false,
+    "UpdatesSpellPowerLevel": false
+}

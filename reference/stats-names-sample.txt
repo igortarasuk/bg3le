@@ -1,0 +1,20 @@
+Target_MainHandAttack
+Target_WEAPON ATTACK
+Target_Sentinel_AttackOfOpportunity
+Target_Charger_Attack
+Target_CommanderStrike_Attack_D8
+Target_CommanderStrike_Attack_D10
+Target_Dipped_Fire
+Target_Dipped_Poison
+Target_FlameBlade_Attack
+Target_HordeBreaker
+Target_HordeBreaker_Free
+Target_LungingAttack
+Target_OffhandAttack
+Target_UnarmedAttack
+Target_Bash
+Target_DisarmingAttack
+Target_DistractingStrike
+Target_EnsnaringStrike
+Target_EnsnaringStrike_2
+Target_EnsnaringStrike_3
