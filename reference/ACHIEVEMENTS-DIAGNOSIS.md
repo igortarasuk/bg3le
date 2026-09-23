@@ -1,9 +1,15 @@
 # Re-enabling achievements with mods active
 
 Goal: port bg3se's `EnableAchievements` config option (Windows) to bg3le.
-Status: mechanism identified on the Windows side, live debug access confirmed
-working end-to-end, native equivalent not yet located. Written up here so the
-investigation survives a session boundary.
+Status: **done**. The Linux equivalent doesn't patch out the engine's own
+mod-check (its exact location was never conclusively pinpointed -- see
+"Session 4" below); instead it forces the real Steam calls directly from
+bg3le's own DIV-dispatch hook, bypassing whatever the engine's internal
+handler decides. Live-validated end-to-end: with mods active, calling
+`Osi.UnlockAchievement(name, character)` now produces an immediate, real
+Steam achievement toast. Implementation: `src/preload.cpp`,
+`maybe_force_unlock_achievement` and the "ISteamUserStats vtable hook state"
+block above `call_wrapper`.
 
 ## What bg3se (Windows) actually patches
 
@@ -592,3 +598,193 @@ directly out of it. Two ways in, not yet tried:
    the very next real or synthetic `UnlockAchievement` call (once the
    `osi.cpp` crash on repeat-unlock is understood well enough to make that
    safe, or by using a fresh not-yet-earned id each time to sidestep it).
+
+## Session 4: found the dispatch mechanism, gave up on the branch, bypassed it
+
+Followed the two leads above, then abandoned patching the internal check in
+favor of forcing the real Steam calls directly. Details below; the short
+version is in the Status line at the top of this file.
+
+### Locating `UnlockAchievement`'s native handler
+
+`BG3LE_WRAP_DIV=1` (see `preload.cpp`, `maybe_wrap_div_table`) intercepts the
+two function pointers (`copy[1]`/`copy[2]`, "Call"/"Query") the game hands to
+`COsiris::RegisterDIVFunctions`, giving `g_real_call`/`g_real_query` -- the
+generic native entry points Osiris itself dispatches *through* for every
+`Osi.*` function, story-script or Lua alike. Live gdb breakpoint-chaining from
+there (conditional breakpoints, chained via `commands` blocks that enable the
+next one and `continue`, load-bias recomputed from `/proc/<pid>/maps` each
+relaunch since ASLR moves everything) found:
+
+- A flat dispatcher (static offset `0x2cd4500`) that takes the Osiris
+  function id in `rdi`, indexes `(id>>3)&0x1ffffff` into a global array of
+  per-function descriptor objects, walks the argument chain doing type
+  validation, then does a C++ virtual call (`call [rbx_vtable+0x10]`) to the
+  function's actual native implementation.
+- For id `0x80001669` (`UnlockAchievement`), that virtual call lands on a
+  this-adjusting thunk at static offset `0x3088b70`, which falls through to
+  the real handler body at `0x3088b90`.
+
+An exhaustive breakpoint sweep of every `call`/`jmp` site in
+`0x3088b70`-`0x3089a00` (19 sites, `objdump` + a small Python script to
+generate the gdb batch file, each breakpoint incrementing a shared counter
+and logging its own address before auto-continuing) gave the real execution
+path for a fresh, not-yet-earned achievement id with **mods off**:
+`0x3088bb1 -> 0x3088bd8 -> 0x3088bf7 -> 0x3088da5 -> 0x3088e46 -> 0x3088e6a`,
+each hit twice (the handler runs twice per `UnlockAchievement` call). Notably
+this skips clean over `0x3088cbb` and `0x3088d81` -- session 3's two guessed
+"type dispatch" candidate sites -- confirming they were never reachable for
+real achievement calls in the first place, not merely untested.
+
+### The branch never showed up where expected
+
+Repeating the identical sweep with mods **active** was inconsistent: the
+very first attempt (immediately after a fresh mods-on relaunch) hit *zero*
+of the 19 sites -- the virtual dispatch fired (entry breakpoint matched
+`rdi==0x80001669`) but nothing downstream did, suggesting a very early
+bailout. But every subsequent attempt, on fresh achievement ids in the same
+mods-on session, reproduced the **exact same 12-hit path as mods off**,
+call-for-call. Fine-grained single-instruction sweeps of the handler's first
+~10 instructions (the `test r14,r14; je 0x3088d6e` guard right after entry)
+showed non-null arguments and normal fall-through in every mods-on capture.
+Live user confirmation nailed it down further: even a call that reproduced
+the mods-off path exactly (all 12 hits) still did **not** produce a Steam
+toast. Conclusion: whatever gates achievements is not a stable branch inside
+this specific traced function, or is a branch the 19 tested call/jmp sites
+don't cover (the handler continues past `0x3088e6a` without further
+calls/jmps in either mod state, based on this sweep, so the divergence -- if
+it's in this function at all -- happens in plain code between existing call
+sites, or in a part of the function this technique can't see). Chasing it
+further here stopped being worth it.
+
+### Finding the real Steam call site directly, and pivoting
+
+Rather than keep guessing inside Osiris internals, targeted the actual Steam
+API entry point instead. `bin/libsteam_api.so` exports
+`SteamAPI_ISteamUserStats_SetAchievement`, but disassembling it
+(`objdump -d --start-address=... --stop-address=...`) shows it's just
+`mov rax,[rdi]; jmp [rax+0x38]` -- a thin C-ABI shim over the real
+`ISteamUserStats` vtable slot. `bg3`'s own PLT has zero relocations against
+that exported symbol (confirmed via `readelf -r`): it's a normal C++
+Steamworks SDK consumer that calls straight through the vtable, so a
+breakpoint on the exported wrapper never fires for real game calls. Resolved
+the vtable slot at runtime instead: called the exported accessor
+`SteamAPI_SteamUserStats_v012()` live from gdb
+(`print ((void*(*)())0xADDR)()`), read `*iface` for the vtable pointer, then
+`*(vtable+7)` (slot `+0x38`) for the real `SetAchievement` target, and set a
+breakpoint directly there.
+
+With mods active: the resolved real `SetAchievement` target **never fires**,
+for any achievement id, confirming (independent of the Osiris-side tracing
+above) that the block is real and sits somewhere between Osiris dispatch and
+this exact call. With mods inactive: it fires, and the backtrace's frame 0 is
+`(anonymous namespace)::hooked_set_achievement` inside **bg3le's own
+`libbg3le.so`** -- session 2 had already installed a diagnostic vtable hook
+on this exact slot (`preload.cpp`, "Steam achievement diagnostics") to log
+real calls for the mods-on/off A/B test. bg3le already had the interception
+point this fix needed; it just hadn't been used to *act* on the block yet.
+
+### The fix: force the call, don't chase the check
+
+Since the exact internal branch never pinned down cleanly, and bg3le already
+had (a) a working hook on the real `SetAchievement` vtable slot with the real
+function pointer cached (`g_real_set_achievement`) and the live interface
+pointer (`g_user_stats_iface`), and (b) a working generic DIV-call
+interception point (`call_wrapper`/`g_real_call`) that sees every
+`Osi.*` dispatch by function id *before* the internal per-function handler
+runs (so it fires regardless of what that handler decides) -- the simplest
+fix is to skip finding the check entirely: when the dispatched function id is
+`0x80001669` (`UnlockAchievement`), pull the achievement name straight out of
+the `COsiArgumentDesc` chain and call the real Steam functions directly,
+whatever the engine's own (possibly-blocked) handler goes on to do.
+
+`maybe_force_unlock_achievement(id, arg_desc)` (`preload.cpp`):
+walks the argument chain using the engine's own accessors
+(`COsiArgumentDesc::GetOpaqueType`/`GetAnyString`, already resolved
+elsewhere in this file via `next<...>`) looking for the **STRING**-typed
+node (type `4`) -- the achievement id -- as opposed to the CHARACTER
+argument, which is a **GUIDSTRING** (type `5`) and so can't be confused with
+it even though both are "stringy". Then calls `g_real_set_achievement`
+followed by a newly-added `g_real_store_stats` (found the same way: exported
+`SteamAPI_ISteamUserStats_StoreStats` disassembles to `jmp [rax+0x50]`, slot
+`+0x50`/index 10 -- cached, not hooked, since nothing needs to intercept it).
+`SetAchievement` alone only stages the change in Steam's local cache;
+**`StoreStats` is what actually syncs it and fires the toast** -- without it,
+the very first successful forced call only showed up in Steam *after the
+game process exited* (Steam's own idle/exit-time flush), not live, which is
+what led to finding this.
+
+Two bugs found and fixed getting this wired up:
+
+1. **Anonymous-namespace scope mismatch.** The pre-existing Steam-hook code
+   (`g_real_set_achievement` and friends) lived in its own `namespace { ... }`
+   block declared *after* `namespace bg3le { ... }` had already closed --
+   i.e. a completely different anonymous namespace at global scope, not
+   nested inside `bg3le`'s. A forward declaration of
+   `maybe_force_unlock_achievement` placed inside `bg3le`'s anonymous
+   namespace (to call it from `call_wrapper`) silently created a second,
+   unrelated internal-linkage function with the same name -- compiles fine,
+   two warnings (`internal linkage but not defined` /
+   `unused function`), completely dead at runtime. Fixed by moving the
+   shared globals and the real function body up into `bg3le`'s own anonymous
+   namespace, ahead of `call_wrapper`; the Steam-hook functions later in the
+   file still find them via ordinary outward name lookup.
+2. **`osi::set_handlers` got the pre-wrap pointers.** `maybe_wrap_div_table`
+   calls `osi::set_handlers(copy[1], copy[2])` (wiring up `osi.cpp`'s own
+   `g_call`/`g_query`, used by `osi::invoke()` -- bg3le's Lua `Osi.*` bridge)
+   *before* overwriting `copy[1]`/`copy[2]` with the wrapper. Story-script
+   (`.osi`) driven calls go through the DIV table itself and would have hit
+   the wrapper; **Lua-triggered `Osi.UnlockAchievement(...)` calls -- i.e.
+   every test this session used -- went straight to the raw original
+   handler and never touched the wrapper at all.** This is why the first
+   working build produced zero `EnableAchievements` log lines despite
+   `call_wrapper` being correctly installed. Fixed by moving the
+   `osi::set_handlers` call to after the (possibly-wrapped) assignment in
+   both the always-on and `BG3LE_WRAP_DIV=1` diagnostic paths, so both entry
+   points -- story-script and Lua -- share the same wrapper.
+3. Made the DIV-call wrapping **always active**, not gated behind
+   `BG3LE_WRAP_DIV=1` (that flag now only controls the *diagnostic*
+   verbose-logging variant, `call_wrapper`). A new lean
+   `achievement_gate_wrapper` (no per-call logging) is installed
+   unconditionally as the DIV call handler so the fix ships by default.
+
+### Live validation
+
+With mods active, freshly loaded save, calling
+`Osi.UnlockAchievement("BG3_Quest34", host)` via the Lua debug console:
+
+```
+DIV Call SAW UnlockAchievement id            [temporary; removed after confirming]
+EnableAchievements: forced SetAchievement("BG3_Quest34") -> true
+EnableAchievements: forced StoreStats() -> true
+```
+
+...and the achievement toast appeared in Steam immediately, no game restart
+or exit required. Repeated successfully across multiple achievement ids.
+
+Because `achievement_gate_wrapper` is installed both as the DIV table's call
+slot (what story-script-authored `.osi` rules dispatch through) and as
+`osi::invoke()`'s handler (what Lua's `Osi.*` bridge dispatches through), a
+**real, gameplay-triggered** achievement unlock (a compiled story rule
+calling `UnlockAchievement` on quest completion, as the game does natively)
+should hit the same gate -- this session only exercised the Lua-triggered
+path directly, so confirming a genuine in-game quest completion still
+produces a toast with mods active is the natural next real-world check, not
+yet done.
+
+### Open ends
+
+- The engine's actual internal mod-check (`ls::ModuleSettings::IsModded`'s
+  Linux equivalent) was never conclusively located. This fix works by
+  bypassing it, not neutralizing it, so unlike bg3se's tidy two-branch patch
+  there's no single byte-level "this is the check" answer here. Acceptable
+  for the goal (achievements work with mods active) but worth flagging for
+  anyone hunting the check itself later.
+- The pre-existing `osi.cpp` crash when `Osi.UnlockAchievement` is called
+  Lua-side on an **already-earned** achievement is untouched by this fix --
+  `maybe_force_unlock_achievement` runs *before* `g_real_call`/the internal
+  engine handler, which is still invoked afterward and can still crash on
+  that specific input. Steam's own `SetAchievement`/`StoreStats` are
+  documented idempotent, so the forced calls themselves are safe to repeat;
+  the crash risk is entirely in the pre-existing internal-handler call this
+  fix doesn't touch. Still parked, still a separate bug.
