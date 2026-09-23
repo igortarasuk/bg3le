@@ -16,6 +16,7 @@
 #include "ecs_world.h"
 #include "mem.h"
 #include "log.h"
+#include "vendor/ls_string.h"
 #include "vendor/mods.h"
 
 // Norbyte's Lua fork is compiled as C++, as bg3se compiles it, so these must
@@ -526,8 +527,8 @@ std::optional<std::int32_t> component_index(const char* name) {
 // Mirrors bg3le::FieldKind in src/component_meta_abi.h.
 enum class FieldKind : std::uint8_t {
     Unsupported = 0, Bool, Float, Double, Int8, Uint8, Int16, Uint16,
-    Int32, Uint32, Int64, Uint64, Guid, Entity, FixedString, ScalarArray,
-    Struct, DynArray, Map, Optional, Variant, Inherit,
+    Int32, Uint32, Int64, Uint64, Guid, Entity, FixedString, LSString,
+    ScalarArray, Struct, DynArray, Map, Optional, Variant, Inherit,
 };
 
 extern "C" const char* bg3le_meta_kind_name(std::uint8_t kind);
@@ -673,6 +674,12 @@ bool push_field(lua_State* L, const void* address, FieldKind kind,
             double d = 0;
             if (!safe_read(address, &d, 8)) return false;
             lua_pushnumber(L, d);
+            return true;
+        }
+        case FieldKind::LSString: {
+            std::string text;
+            if (!read_ls_string(address, &text)) return false;
+            lua_pushlstring(L, text.data(), text.size());
             return true;
         }
         case FieldKind::FixedString: {
@@ -1085,6 +1092,10 @@ extern "C" char const* bg3le_stats_attr_translated(int raw);
 extern "C" char const* bg3le_loca_get(char const* handle);
 extern "C" std::size_t bg3le_loca_count();
 extern "C" char const* bg3le_loca_handle_at(std::size_t index);
+extern "C" std::size_t bg3le_templates_count();
+extern "C" char const* bg3le_templates_id_at(std::size_t index);
+extern "C" void* bg3le_templates_find(char const* id);
+extern "C" char const* bg3le_templates_type(char const* id);
 extern "C" char const* bg3le_stats_attr_condition(int raw);
 extern "C" char const* bg3le_stats_ai_flags(void const* object);
 extern "C" char const* bg3le_stats_enum_label(char const* enumeration,
@@ -1727,6 +1738,35 @@ int l_stats_list_attrs(lua_State* L) {
         lua_setfield(L, -2, "Name");
         lua_pushstring(L, type != nullptr ? type : "");
         lua_setfield(L, -2, "Type");
+        lua_rawseti(L, -2, (int)i + 1);
+    }
+    return 1;
+}
+
+// Ext._Internal.TemplateFind(id) -> address, engine type name
+int l_template_find(lua_State* L) {
+    char const* id = luaL_checkstring(L, 1);
+    void* at = bg3le_templates_find(id);
+    if (at == nullptr) return 0;
+
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)at);
+    char const* type = bg3le_templates_type(id);
+    if (type != nullptr) {
+        lua_pushstring(L, type);
+    } else {
+        lua_pushnil(L);
+    }
+    return 2;
+}
+
+// Ext._Internal.TemplateIds() -> every template id
+int l_template_ids(lua_State* L) {
+    const std::size_t count = bg3le_templates_count();
+    lua_createtable(L, (int)count, 0);
+    for (std::size_t i = 0; i < count; ++i) {
+        char const* id = bg3le_templates_id_at(i);
+        if (id == nullptr) break;
+        lua_pushstring(L, id);
         lua_rawseti(L, -2, (int)i + 1);
     }
     return 1;
@@ -2843,6 +2883,10 @@ void lua_init() {
     lua_setfield(g_lua, -2, "StatsEnumIndex");
     lua_pushcfunction(g_lua, l_stats_list_attrs);
     lua_setfield(g_lua, -2, "StatsListAttrs");
+    lua_pushcfunction(g_lua, l_template_find);
+    lua_setfield(g_lua, -2, "TemplateFind");
+    lua_pushcfunction(g_lua, l_template_ids);
+    lua_setfield(g_lua, -2, "TemplateIds");
     lua_pushcfunction(g_lua, l_loca_get);
     lua_setfield(g_lua, -2, "Loca");
     lua_pushcfunction(g_lua, l_loca_keys);
@@ -5415,13 +5459,70 @@ for _, name in ipairs({"UpdateTranslatedString", "UpdateTranslatedStringKey"}) d
 end
 
 -- ---- Ext.Template ----
-for _, name in ipairs({"GetTemplate", "GetRootTemplate", "GetLocalTemplate",
-                       "GetCacheTemplate", "GetLocalCacheTemplate",
-                       "GetAllRootTemplates", "GetAllLocalTemplates",
-                       "GetAllCacheTemplates", "GetAllLocalCacheTemplates"}) do
+--
+-- The template managers have no symbol, so the templates themselves are
+-- found instead: see src/vendor/templates.cpp. A template's concrete type
+-- comes from its own vtable, decoded rather than called, and decides which
+-- class the reflective reader expands it as.
+
+-- The engine's type name to the class bg3se describes. The types with no
+-- entry -- terrain, fogVolume, Spline, lightProbe, TileConstruction --
+-- have no property map upstream either, so they read as the base class,
+-- which is every field bg3se would expose for them anyway.
+local TEMPLATE_CLASS = {
+  character = "CharacterTemplate",
+  item = "ItemTemplate",
+  trigger = "TriggerTemplate",
+  LevelTemplate = "LevelTemplate",
+  scenery = "SceneryTemplate",
+}
+
+local function read_template(id)
+  local address, engineType = Ext._Internal.TemplateFind(id)
+  if address == nil then return nil end
+
+  local class = TEMPLATE_CLASS[engineType] or "GameObjectTemplate"
+  local out = Ext._Internal.ReadObject(address, class, "", {})
+  -- What the engine calls it, which is not a field on the object.
+  out.TemplateType = engineType
+  return out
+end
+
+function Ext.Template.GetTemplate(id)
+  if type(id) ~= "string" then return nil end
+  return read_template(id)
+end
+
+-- Root, local and cache templates are three managers upstream, holding the
+-- authored templates, the level's own, and the runtime clones. bg3le finds
+-- the objects rather than the managers, so it cannot say which manager a
+-- template came from: all four getters resolve the same set, and the two
+-- that would return only a subset are not pretended to.
+Ext.Template.GetRootTemplate = Ext.Template.GetTemplate
+
+function Ext.Template.GetAllRootTemplates()
+  local out = {}
+  for _, id in ipairs(Ext._Internal.TemplateIds()) do
+    out[id] = read_template(id)
+  end
+  return out
+end
+
+for _, name in ipairs({"GetLocalTemplate", "GetCacheTemplate",
+                       "GetLocalCacheTemplate"}) do
   Ext.Template[name] = needs(
-    "Ext.Template." .. name .. " needs the engine's template managers, "
-    .. "which bg3le has not located")
+    "Ext.Template." .. name .. " needs the engine's " .. name:sub(4)
+    .. " manager to tell it apart from a root template; bg3le finds the "
+    .. "template objects but not which manager holds them, so use "
+    .. "Ext.Template.GetTemplate")
+end
+
+for _, name in ipairs({"GetAllLocalTemplates", "GetAllCacheTemplates",
+                       "GetAllLocalCacheTemplates"}) do
+  Ext.Template[name] = needs(
+    "Ext.Template." .. name .. " needs the engine's template managers to "
+    .. "separate local and cache templates from root ones; use "
+    .. "Ext.Template.GetAllRootTemplates")
 end
 
 -- ---- Ext.Level ----

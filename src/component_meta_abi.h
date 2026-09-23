@@ -31,6 +31,11 @@ enum class FieldKind : std::uint8_t {
     // A 32-bit index into the engine's global string table, readable only once
     // that table has been found -- see src/vendor/fixed_string.cpp.
     FixedString,
+    // Larian's own string, sixteen bytes: inline up to fifteen characters
+    // with the length in the last byte, otherwise a pointer with a size and
+    // a capacity. See vendor/bg3se/CoreLib/Base/LSString.h -- it is not any
+    // std::string, which is why it needs a kind of its own.
+    LSString,
     // A fixed-extent array of one of the scalar kinds above, which is how the
     // engine stores the per-ability and per-skill tables. ElemKind and
     // ElemCount describe the elements.

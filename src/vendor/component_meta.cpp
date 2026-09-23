@@ -281,6 +281,11 @@ constexpr FieldKind scalar_kind_of() {
     // A FixedString is a four-byte index, so it behaves as a scalar here even
     // though resolving it needs the engine's string table.
     else if constexpr (std::is_same_v<T, FixedString>) return FieldKind::FixedString;
+    // Larian's string. Reported as a scalar because it is read in place,
+    // like a FixedString -- it was Unsupported before, which is why every
+    // reflected object's string fields, a template's Name among them, read
+    // as "<unsupported>".
+    else if constexpr (std::is_same_v<T, STDString>) return FieldKind::LSString;
     else return FieldKind::Unsupported;
 }
 
@@ -1817,6 +1822,7 @@ extern "C" char const* bg3le_meta_kind_name(std::uint8_t kind) {
         case FieldKind::Guid: return "guid";
         case FieldKind::Entity: return "entity";
         case FieldKind::FixedString: return "string";
+        case FieldKind::LSString: return "string";
         case FieldKind::ScalarArray: return "array";
         case FieldKind::Struct: return "struct";
         case FieldKind::DynArray: return "array";
