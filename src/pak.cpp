@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <utility>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -300,6 +301,89 @@ bool pak_read(char const* path,
         sink(e.Name, contents.data(), contents.size());
     }
 
+    std::fclose(f);
+    return true;
+}
+
+bool pak_write(char const* path,
+               std::vector<std::pair<std::string, std::string>> const& files) {
+    std::FILE* f = std::fopen(path, "wb");
+    if (f == nullptr) return false;
+
+    // Contents first, then the list, then the header: the header names the
+    // list's offset, so it is written last with a seek back.
+    unsigned char header[kHeaderSize] = {};
+    if (std::fwrite(header, 1, sizeof(header), f) != sizeof(header)) {
+        std::fclose(f);
+        return false;
+    }
+
+    std::vector<Entry18> entries;
+    entries.reserve(files.size());
+    std::uint64_t at = kHeaderSize;
+    for (auto const& file : files) {
+        if (file.first.size() >= sizeof(Entry18::Name)) {
+            std::fclose(f);
+            return false;
+        }
+        if (std::fwrite(file.second.data(), 1, file.second.size(), f)
+            != file.second.size()) {
+            std::fclose(f);
+            return false;
+        }
+
+        Entry18 e{};
+        std::memcpy(e.Name, file.first.c_str(), file.first.size() + 1);
+        e.OffsetLow = (std::uint32_t)(at & 0xffffffffu);
+        e.OffsetHigh = (std::uint16_t)(at >> 32);
+        e.Part = 0;
+        e.Flags = kMethodNone;
+        e.SizeOnDisk = (std::uint32_t)file.second.size();
+        // A stored entry leaves the uncompressed size at zero, the way the
+        // reader above expects.
+        e.UncompressedSize = 0;
+        entries.push_back(e);
+        at += file.second.size();
+    }
+
+    const std::uint64_t listOffset = at;
+    const std::uint32_t count = (std::uint32_t)entries.size();
+    const int raw = (int)(entries.size() * sizeof(Entry18));
+    std::vector<char> packed((std::size_t)LZ4_compressBound(raw));
+    const int compressed = LZ4_compress_default(
+        (char const*)entries.data(), packed.data(), raw, (int)packed.size());
+    if (compressed <= 0) {
+        std::fclose(f);
+        return false;
+    }
+
+    const std::uint32_t compressedSize = (std::uint32_t)compressed;
+    if (std::fwrite(&count, 1, sizeof(count), f) != sizeof(count)
+        || std::fwrite(&compressedSize, 1, sizeof(compressedSize), f)
+               != sizeof(compressedSize)
+        || std::fwrite(packed.data(), 1, compressedSize, f)
+               != compressedSize) {
+        std::fclose(f);
+        return false;
+    }
+
+    const std::uint32_t version = 18;
+    const std::uint16_t parts = 1;
+    std::memcpy(header, "LSPK", 4);
+    std::memcpy(header + 4, &version, sizeof(version));
+    std::memcpy(header + 8, &listOffset, sizeof(listOffset));
+    // The field counts the whole list block, the two counts included --
+    // writing just the compressed size made an archive the engine
+    // refused, and refusing one archive stopped it loading any mod at all.
+    const std::uint32_t listSize = compressedSize + 8;
+    std::memcpy(header + 16, &listSize, sizeof(listSize));
+    std::memcpy(header + 38, &parts, sizeof(parts));
+
+    if (std::fseek(f, 0, SEEK_SET) != 0
+        || std::fwrite(header, 1, sizeof(header), f) != sizeof(header)) {
+        std::fclose(f);
+        return false;
+    }
     std::fclose(f);
     return true;
 }

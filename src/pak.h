@@ -4,6 +4,9 @@
 
 #include <cstddef>
 #include <functional>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace bg3le {
 
@@ -22,5 +25,11 @@ bool pak_read(char const* path,
               std::function<bool(char const* name)> const& accept,
               std::function<void(char const* name, char const* data,
                                  std::size_t size)> const& sink);
+
+// Writes an LSPK v18 archive with the given files, stored uncompressed.
+// For rebuilding an archive whose contents have been edited; the engine
+// reads stored entries as readily as compressed ones.
+bool pak_write(char const* path,
+               std::vector<std::pair<std::string, std::string>> const& files);
 
 }  // namespace bg3le

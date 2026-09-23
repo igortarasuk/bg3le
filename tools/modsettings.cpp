@@ -229,6 +229,209 @@ int main(int argc, char** argv) {
         return found ? 0 : 1;
     }
 
+    // --repack <in.pak> <out.pak> <meta.lsx>: copies an archive, replacing
+    // the module's meta.lsx with the given file. For answering "is it the
+    // metadata or the content?" about a mod the engine refuses to load.
+    if (argc == 5 && std::strcmp(argv[1], "--repack") == 0) {
+        std::string replacement;
+        {
+            std::FILE* f = std::fopen(argv[4], "rb");
+            if (f == nullptr) {
+                std::fprintf(stderr, "modsettings: cannot read %s\n", argv[4]);
+                return 1;
+            }
+            char block[65536];
+            std::size_t got = 0;
+            while ((got = std::fread(block, 1, sizeof(block), f)) > 0) {
+                replacement.append(block, got);
+            }
+            std::fclose(f);
+        }
+
+        std::vector<std::pair<std::string, std::string>> files;
+        const bool ok = bg3le::pak_read(
+            argv[2], [](char const*) { return true; },
+            [&](char const* name, char const* data, std::size_t size) {
+                files.emplace_back(name, std::string(data, size));
+            });
+        if (!ok) {
+            std::fprintf(stderr, "modsettings: cannot read %s\n", argv[2]);
+            return 1;
+        }
+
+        for (auto& file : files) {
+            const std::size_t len = file.first.size();
+            if (len >= 8 && file.first.compare(len - 8, 8, "meta.lsx") == 0) {
+                file.second = replacement;
+            }
+        }
+
+        if (!bg3le::pak_write(argv[3], files)) {
+            std::fprintf(stderr, "modsettings: cannot write %s\n", argv[3]);
+            return 1;
+        }
+        std::fprintf(stderr, "%zu files written to %s\n", files.size(),
+                     argv[3]);
+        return 0;
+    }
+
+    // --only <in.pak> <out.pak> <substring>: copies just the entries whose
+    // name contains the substring. For bisecting which part of a mod's
+    // content the engine objects to.
+    if (argc == 5 && std::strcmp(argv[1], "--only") == 0) {
+        std::vector<std::pair<std::string, std::string>> files;
+        const bool ok = bg3le::pak_read(
+            argv[2],
+            [&](char const* name) {
+                return std::strstr(name, argv[4]) != nullptr;
+            },
+            [&](char const* name, char const* data, std::size_t size) {
+                files.emplace_back(name, std::string(data, size));
+            });
+        if (!ok) {
+            std::fprintf(stderr, "modsettings: cannot read %s\n", argv[2]);
+            return 1;
+        }
+        if (!bg3le::pak_write(argv[3], files)) {
+            std::fprintf(stderr, "modsettings: cannot write %s\n", argv[3]);
+            return 1;
+        }
+        std::fprintf(stderr, "%zu files written to %s\n", files.size(),
+                     argv[3]);
+        return 0;
+    }
+
+    // --make <out.pak> <name> <file> [<name> <file> ...]: builds an
+    // archive from files on disk, under the names given. For a synthetic
+    // mod to test the engine's rules against.
+    if (argc >= 5 && (argc % 2) == 1
+        && std::strcmp(argv[1], "--make") == 0) {
+        std::vector<std::pair<std::string, std::string>> files;
+        for (int i = 3; i + 1 < argc; i += 2) {
+            std::FILE* f = std::fopen(argv[i + 1], "rb");
+            if (f == nullptr) {
+                std::fprintf(stderr, "modsettings: cannot read %s\n",
+                             argv[i + 1]);
+                return 1;
+            }
+            std::string contents;
+            char block[65536];
+            std::size_t got = 0;
+            while ((got = std::fread(block, 1, sizeof(block), f)) > 0) {
+                contents.append(block, got);
+            }
+            std::fclose(f);
+            files.emplace_back(argv[i], std::move(contents));
+        }
+        if (!bg3le::pak_write(argv[2], files)) {
+            std::fprintf(stderr, "modsettings: cannot write %s\n", argv[2]);
+            return 1;
+        }
+        std::fprintf(stderr, "%zu files written to %s\n", files.size(),
+                     argv[2]);
+        return 0;
+    }
+
+    // --rename <in.pak> <out.pak> <from> <to>: copies an archive with
+    // every occurrence of a folder name replaced, in the entry paths and
+    // in the text of meta.lsx. For asking whether the engine cares about
+    // a mod's folder name or only about its consistency.
+    if (argc == 6 && std::strcmp(argv[1], "--rename") == 0) {
+        std::string const from = argv[4];
+        std::string const to = argv[5];
+
+        auto const swap = [&](std::string text) {
+            std::size_t at = 0;
+            while ((at = text.find(from, at)) != std::string::npos) {
+                text.replace(at, from.size(), to);
+                at += to.size();
+            }
+            return text;
+        };
+
+        std::vector<std::pair<std::string, std::string>> files;
+        const bool ok = bg3le::pak_read(
+            argv[2], [](char const*) { return true; },
+            [&](char const* name, char const* data, std::size_t size) {
+                std::string contents(data, size);
+                const std::size_t len = std::strlen(name);
+                if (len >= 4
+                    && (std::strcmp(name + len - 4, ".lsx") == 0
+                        || std::strcmp(name + len - 4, "json") == 0)) {
+                    contents = swap(contents);
+                }
+                files.emplace_back(swap(name), std::move(contents));
+            });
+        if (!ok) {
+            std::fprintf(stderr, "modsettings: cannot read %s\n", argv[2]);
+            return 1;
+        }
+        if (!bg3le::pak_write(argv[3], files)) {
+            std::fprintf(stderr, "modsettings: cannot write %s\n", argv[3]);
+            return 1;
+        }
+        std::fprintf(stderr, "%zu files written to %s\n", files.size(),
+                     argv[3]);
+        return 0;
+    }
+
+    // --without <in.pak> <out.pak> <substring>: everything except the
+    // entries whose name contains the substring.
+    if (argc == 5 && std::strcmp(argv[1], "--without") == 0) {
+        std::vector<std::pair<std::string, std::string>> files;
+        const bool ok = bg3le::pak_read(
+            argv[2],
+            [&](char const* name) {
+                return std::strstr(name, argv[4]) == nullptr;
+            },
+            [&](char const* name, char const* data, std::size_t size) {
+                files.emplace_back(name, std::string(data, size));
+            });
+        if (!ok) {
+            std::fprintf(stderr, "modsettings: cannot read %s\n", argv[2]);
+            return 1;
+        }
+        if (!bg3le::pak_write(argv[3], files)) {
+            std::fprintf(stderr, "modsettings: cannot write %s\n", argv[3]);
+            return 1;
+        }
+        std::fprintf(stderr, "%zu files written to %s\n", files.size(),
+                     argv[3]);
+        return 0;
+    }
+
+    // --merge <out.pak> <in.pak> [<in.pak> ...]: one archive from several,
+    // later ones winning on a name clash. For building a hybrid of a mod
+    // the engine loads and one it refuses.
+    if (argc >= 4 && std::strcmp(argv[1], "--merge") == 0) {
+        std::vector<std::pair<std::string, std::string>> files;
+        for (int i = 3; i < argc; ++i) {
+            const bool ok = bg3le::pak_read(
+                argv[i], [](char const*) { return true; },
+                [&](char const* name, char const* data, std::size_t size) {
+                    for (auto& file : files) {
+                        if (file.first == name) {
+                            file.second.assign(data, size);
+                            return;
+                        }
+                    }
+                    files.emplace_back(name, std::string(data, size));
+                });
+            if (!ok) {
+                std::fprintf(stderr, "modsettings: cannot read %s\n",
+                             argv[i]);
+                return 1;
+            }
+        }
+        if (!bg3le::pak_write(argv[2], files)) {
+            std::fprintf(stderr, "modsettings: cannot write %s\n", argv[2]);
+            return 1;
+        }
+        std::fprintf(stderr, "%zu files written to %s\n", files.size(),
+                     argv[2]);
+        return 0;
+    }
+
     if (argc < 3) {
         std::fprintf(stderr, "usage: modsettings <pak-directory> "
                              "<out.lsx> [game-data-directory]\n");
