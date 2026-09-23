@@ -3,8 +3,7 @@
 Goal: port bg3se's `EnableAchievements` option (Windows) to bg3le, so mods
 do not silently block Steam achievements. **Status: done, validated live on
 2026-09-23.** Address-level detail for every function named below is in
-[PREDICATE-ANALYSIS.md](PREDICATE-ANALYSIS.md); the live test protocol and
-gdb tooling are in [tools/gdb_scripts/RUNBOOK.md](../tools/gdb_scripts/RUNBOOK.md).
+[PREDICATE-ANALYSIS.md](PREDICATE-ANALYSIS.md).
 
 Every claim is tagged: `[LIVE]` confirmed in a running process, `[DISASM]`
 read from objdump output, `[DECOMP]` from a decompiler, `[HYP]` hypothesis.
