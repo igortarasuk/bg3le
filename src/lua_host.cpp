@@ -5243,11 +5243,11 @@ local PROTOTYPE_KIND = {Spell = 0, Status = 1}
 local function cached_prototype(kind, class)
   return function(name)
     if type(name) ~= "string" then return nil end
-    -- An empty table means the search has not published yet. Saying so
-    -- beats nil, which a caller cannot tell from "no such spell".
+    -- An empty table means the search has not finished yet, which a
+    -- caller cannot tell from "no such spell" if this returns nil.
     if #Ext._Internal.PrototypeNames(PROTOTYPE_KIND[kind]) == 0 then
       error("bg3le: the " .. kind:lower() .. " prototype manager has not "
-            .. "been found yet", 2)
+            .. "been found yet; it is still being searched for", 2)
     end
     local address = Ext._Internal.PrototypeFind(PROTOTYPE_KIND[kind], name)
     if address == nil then return nil end
@@ -5255,8 +5255,8 @@ local function cached_prototype(kind, class)
   end
 end
 
-Ext.Stats.GetCachedSpell = cached_prototype("Spell", "SpellPrototype")
-Ext.Stats.GetCachedStatus = cached_prototype("Status", "StatusPrototype")
+Ext.Stats.GetCachedSpell = cached_prototype("Spell", "stats::SpellPrototype")
+Ext.Stats.GetCachedStatus = cached_prototype("Status", "stats::StatusPrototype")
 
 -- Passives and interrupts store their prototypes inline in the map rather
 -- than behind a pointer, and boosts are keyed by GUID; none of the three

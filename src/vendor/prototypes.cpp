@@ -333,6 +333,15 @@ bool build() {
     if (candidates.size() > kClassify) candidates.resize(kClassify);
 
     for (Candidate const& candidate : candidates) {
+        // Both found: stop. Classifying a leftover costs a linear walk of
+        // every stat per key, and doing that for the remaining candidates
+        // put over two minutes between finding the maps and publishing
+        // them -- long enough that a caller in between saw nothing.
+        if (!found.Kinds[kSpell].ByName.empty()
+            && !found.Kinds[kStatus].ByName.empty()) {
+            break;
+        }
+
         const int kind = kind_of(candidate.Keys, candidate.Count);
         if (kind < 0) continue;
         if (!found.Kinds[kind].ByName.empty()) continue;
@@ -368,6 +377,9 @@ bool build() {
         live.Kinds[k] = std::move(found.Kinds[k]);
     }
     live.Built.store(true, std::memory_order_release);
+    logf("prototypes: %zu spells and %zu statuses available",
+         live.Kinds[kSpell].ByName.size(),
+         live.Kinds[kStatus].ByName.size());
     return true;
 }
 
