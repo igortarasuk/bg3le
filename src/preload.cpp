@@ -738,8 +738,21 @@ void dump_once(void* self) {
 }
 
 void dump_osiris_api(void* self) {
+    // Every phase here runs on the story thread between Osiris finishing
+    // and the level being up, so each one is time the player waits. They
+    // are timed individually because "level load got slower" is otherwise
+    // a guess -- and twice now the cause has been something added here.
+    const double storyStarted = now_s();
+    double mark = storyStarted;
+    auto const phase = [&mark](char const* what) {
+        const double took = now_s() - mark;
+        mark = now_s();
+        if (took >= 0.05) statusf("story: %s took %.2fs", what, took);
+    };
+
     auto gen = next<long (*)(void*)>("_ZN7COsiris20GenerateFunctionListEv");
     if (gen != nullptr) gen(self);  // mappings are generated on demand
+    phase("GenerateFunctionList");
 
     auto get_types = next<GetMappings>("_ZN7COsiris15GetTypeMappingsEPP11MappingInfoPj");
     auto get_funcs = next<GetMappings>("_ZN7COsiris19GetFunctionMappingsEPP11MappingInfoPj");
@@ -809,15 +822,26 @@ void dump_osiris_api(void* self) {
     }
     // Osiris knows which parameters are outputs; without this the split is
     // inferred from how many arguments the caller passed.
-    const std::size_t typed = osi::load_out_param_counts(&bindable);
+    // The story's version identifies the compiled story, and the function
+    // database is a property of it, so the signature walk's answer can be
+    // cached under it rather than repeated at every level load.
+    char storyVersion[128] = {};
+    auto version = next<long (*)(void const*, char*)>(
+        "_ZNK7COsiris21GetStoryVersionStringEPc");
+    if (version != nullptr) version(self, storyVersion);
+
+    const std::size_t typed =
+        osi::load_out_param_counts(&bindable, storyVersion);
     statusf("Signature walk: resolved out-params for %zu of %zu functions",
             typed, bindable.size());
+    phase("the signature walk");
 
     // The story's own procedures, user queries and databases. The engine's
     // mapping lists only what the engine implements; everything a goal
     // script declares -- Proc_CharacterFullRestore and the rest of what
     // mods actually call -- lives in Osiris' function database instead.
     std::vector<osi::Function> const story = osi::story_functions(bindable);
+    phase("reading the story's own functions");
     if (!story.empty()) {
         statusf("Osiris: %zu story-defined functions (procedures, queries, "
                 "databases)", story.size());
@@ -825,6 +849,7 @@ void dump_osiris_api(void* self) {
     }
 
     lua_bind_osi(bindable);
+    phase("binding Osi.*");
 
     // Before the mods, not after: whatever they ask for on load has to be
     // there already.
@@ -835,8 +860,15 @@ void dump_osiris_api(void* self) {
     // seconds of level load.
     bg3le_mods_rescan();
     run_searches_now("story");
+    phase("the searches");
 
     lua_load_mods();  // after Osi, so a mod's load-time code can call it
+    phase("loading mods");
+
+    const double total = now_s() - storyStarted;
+    if (total >= 0.05) {
+        statusf("story: bg3le used %.2fs of the level load", total);
+    }
 
     auto free_types = next<FreeMappings>("_ZN7COsiris16FreeTypeMappingsEP11MappingInfoj");
     auto free_funcs = next<FreeMappings>("_ZN7COsiris20FreeFunctionMappingsEP11MappingInfoj");

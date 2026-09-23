@@ -50,9 +50,16 @@ struct Function {
     }
 };
 
-// Reads out-parameter counts from Osiris' own function database, keyed by
-// name. Returns the number recovered, or 0 if the walk failed.
-std::size_t load_out_param_counts(std::vector<Function>* functions);
+// Reads out-parameter counts and parameter types from Osiris' own function
+// database, keyed by name. Returns the number recovered, or 0 if it could
+// not be read at all.
+//
+// `story` identifies the compiled story, and the answer is cached under
+// it: the database is a property of the story, and walking it costs a
+// hundred and thirty thousand reads on the story thread during level
+// load. Pass nullptr to walk unconditionally.
+std::size_t load_out_param_counts(std::vector<Function>* functions,
+                                  char const* story);
 
 // The functions the story itself defines -- procedures, user queries and
 // databases -- which the engine's own mapping does not list. `known` is

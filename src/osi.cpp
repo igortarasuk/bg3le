@@ -1,7 +1,9 @@
 #include <algorithm>
 #include "osi.h"
 
+#include <cctype>
 #include <dlfcn.h>
+#include <sys/stat.h>
 
 #include <cstring>
 #include <link.h>
@@ -175,18 +177,44 @@ bool peek(std::uintptr_t addr, T* out) {
     return safe_read(reinterpret_cast<const void*>(addr), out, sizeof(T));
 }
 
+// One object, read in a single call and then parsed locally.
+//
+// Every field of these structures used to cost a process_vm_readv, and
+// the walk touches four thousand of them: the signature walk was 1.75s
+// of the level load, nearly all of it syscall overhead. A block read per
+// object keeps the fault tolerance -- a wrong offset still yields a
+// failed read rather than a segfault -- at a tenth of the calls.
+template <std::size_t N>
+struct Block {
+    std::uintptr_t Base = 0;
+    unsigned char Bytes[N] = {};
+    bool Ok = false;
+
+    explicit Block(std::uintptr_t base) : Base(base) {
+        if (base < 0x1000) return;
+        Ok = safe_read(reinterpret_cast<void const*>(base), Bytes, N);
+    }
+
+    template <typename T>
+    T at(std::size_t off) const {
+        T value{};
+        if (off + sizeof(T) <= N) std::memcpy(&value, Bytes + off, sizeof(T));
+        return value;
+    }
+};
+
 // Bitmask is MSB-first within each byte, as bg3se's isOutParam does.
-int count_out_params(std::uintptr_t signature) {
-    std::uintptr_t bits = 0;
-    std::uint32_t bytes = 0;
-    if (!peek(signature + 0x18, &bits) || !peek(signature + 0x20, &bytes)) return -1;
+int count_out_params(std::uintptr_t bits, std::uint32_t bytes) {
     if (bits == 0 || bytes == 0 || bytes > 64) return 0;
+
+    unsigned char mask[64] = {};
+    if (!safe_read(reinterpret_cast<void const*>(bits), mask, bytes)) {
+        return -1;
+    }
 
     int total = 0;
     for (std::uint32_t i = 0; i < bytes; ++i) {
-        std::uint8_t b = 0;
-        if (!peek(bits + i, &b)) return -1;
-        total += __builtin_popcount(b);
+        total += __builtin_popcount(mask[i]);
     }
     return total;
 }
@@ -195,11 +223,15 @@ int count_out_params(std::uintptr_t signature) {
 // FunctionType field.
 bool read_type_and_handle(std::uintptr_t def, std::uintptr_t at,
                           std::uint32_t* type, std::uint32_t* handle) {
-    std::uint32_t kind = 0;
+    const Block<0x40> block(def);
+    if (!block.Ok) return false;
+
+    const auto kind = block.at<std::uint32_t>(at);
+    if (kind == 0 || kind > 8) return false;
+
     std::uint32_t key[4] = {};
-    if (!peek(def + at, &kind) || kind == 0 || kind > 8) return false;
     for (int i = 0; i < 4; ++i) {
-        if (!peek(def + at + 4 + i * 4, &key[i])) return false;
+        key[i] = block.at<std::uint32_t>(at + 4 + i * 4);
     }
     *type = kind;
     *handle = function_handle(key[0], key[1], key[2], key[3]);
@@ -212,22 +244,21 @@ bool read_type_and_handle(std::uintptr_t def, std::uintptr_t at,
 // a count, each node holds Next, Prev and the descriptor, and the type is
 // the first sixteen bits of the descriptor. The nodes run in reverse
 // declaration order, which is why the result is flipped.
-std::vector<std::uint8_t> read_param_types(std::uintptr_t signature) {
+std::vector<std::uint8_t> read_param_types(std::uintptr_t list) {
     std::vector<std::uint8_t> types;
+    if (list < 0x1000) return types;
 
-    std::uintptr_t list = 0;
-    std::uint64_t count = 0;
-    if (!peek(signature + 0x10, &list) || list < 0x1000) return types;
-    if (!peek(list + 0x18, &count) || count == 0 || count > 32) return types;
+    const Block<0x20> header(list);
+    if (!header.Ok) return types;
+    const auto count = header.at<std::uint64_t>(0x18);
+    if (count == 0 || count > 32) return types;
 
-    std::uintptr_t node = 0;
-    if (!peek(list + 0x08, &node)) return types;
-
+    std::uintptr_t node = header.at<std::uintptr_t>(0x08);
     for (std::uint64_t i = 0; i < count && node >= 0x1000; ++i) {
-        std::uint16_t type = 0;
-        if (!peek(node + 0x10, &type)) return {};
-        types.push_back((std::uint8_t)type);
-        if (!peek(node + 0x00, &node)) return {};
+        const Block<0x18> entry(node);
+        if (!entry.Ok) return {};
+        types.push_back((std::uint8_t)entry.at<std::uint16_t>(0x10));
+        node = entry.at<std::uintptr_t>(0x00);
     }
     if (types.size() != count) return {};
 
@@ -235,30 +266,31 @@ std::vector<std::uint8_t> read_param_types(std::uintptr_t signature) {
     return types;
 }
 
-// libc++ std::string. Short form keeps the data inline with the length in
-// the final byte; long form is {pointer, size, capacity|MSB}.
-bool read_osi_string(std::uintptr_t str, std::string* out) {
-    std::uint8_t last = 0;
-    if (!peek(str + 23, &last)) return false;
-
+// libc++ std::string from the twenty-four bytes of it already read. Only
+// the long form needs another read, and most keys are short.
+bool parse_osi_string(unsigned char const* bytes, std::string* out) {
+    const std::uint8_t last = bytes[23];
     if ((last & 0x80) == 0) {
         const std::size_t len = last;
         if (len > 22) return false;
-        char buf[24] = {};
-        if (!safe_read(reinterpret_cast<const void*>(str), buf, 23)) return false;
-        out->assign(buf, len);
+        out->assign(reinterpret_cast<char const*>(bytes), len);
         return true;
     }
 
     std::uintptr_t data = 0;
     std::uint64_t size = 0;
-    if (!peek(str + 0x00, &data) || !peek(str + 0x08, &size)) return false;
+    std::memcpy(&data, bytes + 0x00, sizeof(data));
+    std::memcpy(&size, bytes + 0x08, sizeof(size));
     if (data < 0x1000 || size == 0 || size > 512) return false;
+
     std::vector<char> buf(size + 1, 0);
-    if (!safe_read(reinterpret_cast<const void*>(data), buf.data(), size)) return false;
+    if (!safe_read(reinterpret_cast<void const*>(data), buf.data(), size)) {
+        return false;
+    }
     out->assign(buf.data(), size);
     return true;
 }
+
 
 // What the walk keeps about one function in Osiris' own database.
 struct DbEntry {
@@ -266,6 +298,8 @@ struct DbEntry {
     std::uintptr_t Def = 0;  // the Function object behind the tree node
     std::vector<std::uint8_t> Types;
 };
+
+std::size_t g_visited = 0;
 
 void visit_tree(std::uintptr_t node,
                 std::unordered_map<std::string, DbEntry>* out,
@@ -278,22 +312,39 @@ void visit_tree(std::uintptr_t node,
     // depth bound are sufficient termination.
     if (node < 0x1000 || depth > 128) return;
     if (!seen->insert(node).second) return;
+    ++g_visited;
 
-    std::uintptr_t left = 0, right = 0, def = 0;
-    if (!peek(node + 0x00, &left) || !peek(node + 0x10, &right) ||
-        !peek(node + 0x38, &def)) {
-        return;
-    }
+    // One read for the whole tree node: the links, the key string and the
+    // pointer to the function.
+    const Block<0x40> entry(node);
+    if (!entry.Ok) return;
+
+    const auto left = entry.at<std::uintptr_t>(0x00);
+    const auto right = entry.at<std::uintptr_t>(0x10);
+    const auto def = entry.at<std::uintptr_t>(0x38);
 
     // Key on the tree's own key ("Name/Arity"), not the bare signature name:
     // Osiris overloads by arity, so 1303 functions collapse onto far fewer
     // names and most matches are lost.
-    std::uintptr_t signature = 0;
-    if (def >= 0x1000 && peek(def + 0x18, &signature) && signature >= 0x1000) {
-        const int outs = count_out_params(signature);
-        std::string key;
-        if (outs >= 0 && read_osi_string(node + 0x20, &key) && !key.empty()) {
-            (*out)[key] = DbEntry{outs, def, read_param_types(signature)};
+    if (def >= 0x1000) {
+        const Block<0x28> function(def);
+        const auto signature = function.Ok
+                                   ? function.at<std::uintptr_t>(0x18)
+                                   : 0;
+        if (signature >= 0x1000) {
+            const Block<0x28> sig(signature);
+            if (sig.Ok) {
+                const int outs = count_out_params(
+                    sig.at<std::uintptr_t>(0x18),
+                    sig.at<std::uint32_t>(0x20));
+                std::string key;
+                if (outs >= 0 && parse_osi_string(entry.Bytes + 0x20, &key)
+                    && !key.empty()) {
+                    (*out)[key] = DbEntry{
+                        outs, def,
+                        read_param_types(sig.at<std::uintptr_t>(0x10))};
+                }
+            }
         }
     }
 
@@ -370,13 +421,105 @@ std::uintptr_t& type_offset() {
     return at;
 }
 
-std::size_t load_out_param_counts(std::vector<Function>* functions) {
+// Where the signature cache lives, alongside the static-pointer cache.
+std::string cache_path(char const* story) {
+    char const* home = std::getenv("HOME");
+    if (home == nullptr || story == nullptr || story[0] == '\0') return {};
+
+    std::string safe;
+    for (char const* at = story; *at != '\0'; ++at) {
+        safe += (std::isalnum((unsigned char)*at) != 0) ? *at : '-';
+    }
+    return std::string(home) + "/.local/share/bg3le/osiris-" + safe + ".txt";
+}
+
+// name/arity outs type,type,...
+bool load_cached_signatures(char const* story,
+                            std::vector<Function>* functions,
+                            std::size_t* applied) {
+    const std::string path = cache_path(story);
+    if (path.empty()) return false;
+
+    std::FILE* f = std::fopen(path.c_str(), "r");
+    if (f == nullptr) return false;
+
+    std::unordered_map<std::string, DbEntry> loaded;
+    char line[1024];
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+        char key[512] = {};
+        int outs = 0;
+        char types[256] = {};
+        const int got = std::sscanf(line, "%511s %d %255s", key, &outs, types);
+        if (got < 2) continue;
+
+        DbEntry entry;
+        entry.Outs = outs;
+        if (got == 3) {
+            for (char* at = std::strtok(types, ","); at != nullptr;
+                 at = std::strtok(nullptr, ",")) {
+                entry.Types.push_back((std::uint8_t)std::strtoul(at, nullptr, 10));
+            }
+        }
+        loaded.emplace(key, std::move(entry));
+    }
+    std::fclose(f);
+    if (loaded.empty()) return false;
+
+    std::size_t hits = 0;
+    for (Function& fn : *functions) {
+        auto it = loaded.find(fn.name + "/" + std::to_string(fn.params.size()));
+        if (it == loaded.end()) continue;
+        fn.out_params = it->second.Outs;
+        ++hits;
+    }
+    if (hits == 0) return false;
+
+    database() = std::move(loaded);
+    *applied = hits;
+    logf("osiris: %zu signatures from %s, no walk needed", database().size(),
+         path.c_str());
+    return true;
+}
+
+void save_cached_signatures(char const* story) {
+    const std::string path = cache_path(story);
+    if (path.empty()) return;
+
+    const std::size_t slash = path.rfind('/');
+    if (slash != std::string::npos) {
+        ::mkdir(path.substr(0, slash).c_str(), 0755);
+    }
+
+    std::FILE* f = std::fopen(path.c_str(), "w");
+    if (f == nullptr) return;
+    for (auto const& entry : database()) {
+        std::fprintf(f, "%s %d", entry.first.c_str(), entry.second.Outs);
+        for (std::size_t i = 0; i < entry.second.Types.size(); ++i) {
+            std::fprintf(f, "%s%u", i == 0 ? " " : ",",
+                         (unsigned)entry.second.Types[i]);
+        }
+        std::fputc('\n', f);
+    }
+    std::fclose(f);
+    logf("osiris: wrote %zu signatures to %s", database().size(),
+         path.c_str());
+}
+
+std::size_t load_out_param_counts(std::vector<Function>* functions,
+                                  char const* story) {
     std::uintptr_t base = 0;
     ::dl_iterate_phdr(find_osiris, &base);
     if (base == 0) {
         logf("osiris: libOsiris.so not found; cannot read signatures");
         return 0;
     }
+
+    // The node list is wanted either way, and finding it is a handful of
+    // reads rather than a walk.
+    find_node_db(base);
+
+    std::size_t cached = 0;
+    if (load_cached_signatures(story, functions, &cached)) return cached;
 
     std::uintptr_t holder = 0;
     if (!peek(base + kFunctionDbHolder, &holder) || holder < 0x1000) {
@@ -428,6 +571,7 @@ std::size_t load_out_param_counts(std::vector<Function>* functions) {
 
     std::unordered_map<std::string, DbEntry>& by_name = database();
     by_name.clear();
+    g_visited = 0;
     for (std::size_t i = 0; i < kBuckets; ++i) {
         std::uintptr_t root = 0;
         if (!peek(holder + 0x10 + i * kSlotStride + 0x08, &root)) continue;
@@ -477,8 +621,7 @@ std::size_t load_out_param_counts(std::vector<Function>* functions) {
         }
     }
     type_offset() = bestHits > applied / 2 ? bestAt : 0;
-
-    find_node_db(base);
+    save_cached_signatures(story);
     // One known signature, dumped, so the parameter type list can be read
     // off rather than guessed at. BG3LE_DUMP_SIG=1.
     if (std::getenv("BG3LE_DUMP_SIG") != nullptr) {
@@ -566,8 +709,9 @@ std::size_t load_out_param_counts(std::vector<Function>* functions) {
     logf("osiris: parameter types agree for %zu functions, differ for %zu",
          typed, typedWrong);
 
-    logf("osiris: signature walk found %zu entries, matched %zu of %zu functions",
-         by_name.size(), applied, functions->size());
+    logf("osiris: signature walk visited %zu nodes, found %zu entries, "
+         "matched %zu of %zu functions", g_visited, by_name.size(), applied,
+         functions->size());
     return applied;
 }
 
@@ -579,7 +723,6 @@ std::vector<Function> story_functions(std::vector<Function> const& known) {
 
     std::vector<Function> out;
     std::size_t already = 0;
-    std::size_t noTypes = 0;
     std::size_t noId = 0;
     std::size_t kinds[9] = {};
     for (auto const& entry : database()) {
@@ -596,10 +739,7 @@ std::vector<Function> story_functions(std::vector<Function> const& known) {
         const std::string name = entry.first.substr(0, slash);
         const std::size_t arity = (std::size_t)std::strtoul(
             entry.first.c_str() + slash + 1, nullptr, 10);
-        if (entry.second.Types.size() != arity) {
-            ++noTypes;
-            continue;
-        }
+        if (entry.second.Types.size() != arity) continue;
 
         std::uint32_t type = 0;
         std::uint32_t handle = 0;

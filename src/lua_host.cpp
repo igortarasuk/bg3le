@@ -4832,11 +4832,56 @@ function Ext.Mod.IsModLoaded(uuid)
   return Ext._Internal.ModFind(uuid) ~= nil
 end
 
+-- What the archives say about a mod the engine has not loaded, keyed by
+-- UUID. Built once, from each mod's own meta.lsx -- the same file the
+-- engine reads -- so a mod that is installed and enabled can still be
+-- described.
+local installed_mods = nil
+
+local function installed_mod(uuid)
+  if installed_mods == nil then
+    installed_mods = {}
+    for _, module in ipairs(Ext._Internal.PakModules()) do
+      if module.Uuid ~= nil and module.Uuid ~= "" then
+        installed_mods[module.Uuid] = {
+          Info = {
+            ModuleUUIDString = module.Uuid,
+            Name = module.ModName,
+            Directory = module.Name,
+            Author = module.Author,
+            Description = module.Description,
+            Hash = "",
+            StartLevelName = "",
+            MenuLevelName = "",
+            LobbyLevelName = "",
+            CharacterCreationLevelName = "",
+            PhotoBoothLevelName = "",
+            ModVersion = {0, 0, 0, 0},
+            PublishVersion = {0, 0, 0, 0},
+            NumPlayers = 0,
+            FileSize = 0,
+            PublishHandle = 0,
+          },
+          Dependencies = {},
+          ModConflicts = {},
+          Addons = {},
+        }
+      end
+    end
+  end
+  return installed_mods[uuid]
+end
+
 function Ext.Mod.GetMod(uuid)
   if type(uuid) ~= "string" then return nil end
   local addr = Ext._Internal.ModFind(uuid)
-  if addr == nil then return nil end
-  return make_mod(addr)
+  if addr ~= nil then return make_mod(addr) end
+
+  -- Not in the engine's list. On this build that happens to mods that are
+  -- installed and enabled all the same -- see reference/MOD-LOADING.md --
+  -- and returning nil for them breaks any mod that looks its neighbours
+  -- up, Mod Configuration Menu included.
+  return installed_mod(uuid)
 end
 
 -- ModManager::BaseModule, which is the campaign module rather than the first
@@ -5382,18 +5427,24 @@ local function load_mod_from(name, uuid, read)
   -- A mod's globals live in its own table, as upstream's do: writing
   -- `function Foo() end` in a mod makes Mods.<ModTable>.Foo, and other mods
   -- reach it that way. Reads fall through to the real globals.
-  Mods[table_name] = Mods[table_name] or {}
+  -- ModuleUUID goes in before the table does. Mod Configuration Menu
+  -- puts a __newindex on Mods to notice new mods and reads ModuleUUID off
+  -- the value as it arrives, so assigning an empty table first and
+  -- filling it afterwards makes every mod look anonymous.
   local env = Mods[table_name]
-  if getmetatable(env) == nil then setmetatable(env, { __index = _G }) end
+  if env == nil then
+    env = setmetatable({ ModuleUUID = uuid }, { __index = _G })
+    Mods[table_name] = env
+  elseif getmetatable(env) == nil then
+    setmetatable(env, { __index = _G })
+  end
 
   -- ModuleUUID is the mod being loaded, set for the duration and cleared
   -- after, the way bg3se's LuaLoadGameBootstrap does it. Mods pass it
   -- straight to Ext.Vars and Ext.Mod, so without it they fail on line one.
   local previous = ModuleUUID
   ModuleUUID = uuid
-  -- And in the mod's own table, where it outlives the load: upstream's
-  -- mods read Mods[other].ModuleUUID to identify each other, and Mod
-  -- Configuration Menu warns about every mod that has none.
+  -- Also for the case where the table already existed.
   env.ModuleUUID = uuid
 
   local reader = { Name = name, Read = read, Env = env }
@@ -5470,9 +5521,14 @@ local function load_positions(modules)
   end
 
   if extra > 0 then
-    Ext.Log.PrintWarning(string.format(
-      "bg3le: %d mods are enabled in modsettings.lsx but not in the "
-      .. "engine's load order; their scripts are loaded after it", extra))
+    -- Not a warning: on this build the engine's module list holds only
+    -- what it needs where you are standing, and the rest of what the
+    -- player enabled is still installed and still theirs to script
+    -- against. reference/MOD-LOADING.md has the evidence.
+    Ext.Log.Print(string.format(
+      "bg3le: the engine's load order has %d modules; %d mods enabled in "
+      .. "modsettings.lsx are not among them, and their scripts load "
+      .. "after it", #Ext.Mod.GetLoadOrder(), extra))
   end
   return positions
 end

@@ -352,9 +352,15 @@ extern "C" int bg3le_ext_show_error(lua_State* L) {
 namespace {
 
 struct PakModule {
-    std::string Pak;   // file name within the profile's Mods directory
+    std::string Pak;   // path of the archive it was found in
     std::string Name;  // the folder under Mods/ inside the archive
     std::string Uuid;
+    // Straight out of the mod's own meta.lsx, so a mod the engine has not
+    // loaded can still be described.
+    std::string ModName;
+    std::string Author;
+    std::string Description;
+    std::string Version;
 };
 
 // Where installed mods live. The native build reads both: the profile's
@@ -387,12 +393,15 @@ std::string module_of_config(char const* entry) {
     return name;
 }
 
-std::string uuid_in_meta(std::string const& meta) {
+// One attribute of the meta's ModuleInfo node.
+std::string meta_attribute(std::string const& meta, char const* id) {
     const std::size_t info = meta.find("id=\"ModuleInfo\"");
     if (info == std::string::npos) return {};
-    const std::size_t uuid = meta.find("id=\"UUID\"", info);
-    if (uuid == std::string::npos) return {};
-    const std::size_t value = meta.find("value=\"", uuid);
+
+    const std::string needle = std::string("id=\"") + id + "\"";
+    const std::size_t at = meta.find(needle, info);
+    if (at == std::string::npos) return {};
+    const std::size_t value = meta.find("value=\"", at);
     if (value == std::string::npos) return {};
     const std::size_t from = value + 7;
     const std::size_t to = meta.find('"', from);
@@ -476,7 +485,17 @@ std::vector<PakModule> const& pak_modules() {
         for (std::string const& name : names) {
             PakModule module{path, name, {}};
             auto it = metas.find("Mods/" + name + "/meta.lsx");
-            if (it != metas.end()) module.Uuid = uuid_in_meta(it->second);
+            if (it != metas.end()) {
+                std::string const& meta = it->second;
+                module.Uuid = meta_attribute(meta, "UUID");
+                module.ModName = meta_attribute(meta, "Name");
+                module.Author = meta_attribute(meta, "Author");
+                module.Description = meta_attribute(meta, "Description");
+                module.Version = meta_attribute(meta, "Version64");
+                if (module.Version.empty()) {
+                    module.Version = meta_attribute(meta, "Version");
+                }
+            }
             modules.push_back(std::move(module));
         }
     }
@@ -556,6 +575,15 @@ extern "C" int bg3le_ext_pak_modules(lua_State* L) {
         lua_setfield(L, -2, "Name");
         lua_pushstring(L, module.Uuid.c_str());
         lua_setfield(L, -2, "Uuid");
+        lua_pushstring(L, module.ModName.empty() ? module.Name.c_str()
+                                                 : module.ModName.c_str());
+        lua_setfield(L, -2, "ModName");
+        lua_pushstring(L, module.Author.c_str());
+        lua_setfield(L, -2, "Author");
+        lua_pushstring(L, module.Description.c_str());
+        lua_setfield(L, -2, "Description");
+        lua_pushstring(L, module.Version.c_str());
+        lua_setfield(L, -2, "Version");
         lua_rawseti(L, -2, index++);
     }
     return 1;
