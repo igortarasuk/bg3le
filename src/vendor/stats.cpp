@@ -66,6 +66,9 @@ extern "C" bool bg3le_static_record_exact(char const* key,
                                           std::uint64_t delta);
 extern "C" bool bg3le_static_record(char const* key,
                                     void const* object);
+extern "C" bool bg3le_static_record_path(char const* key,
+                                         void const* target,
+                                         std::uint64_t first_window);
 extern "C" char const* bg3le_fixed_string(std::uint32_t index,
                                           std::uint32_t* length);
 
@@ -934,9 +937,19 @@ bool search_for_stats() {
                            "stats.rarities",
                            (void const*)(run - kRaritiesInStats),
                            kRaritiesInStats)) {
-                    // No exact match, so fall back to the windowed search
-                    // and let the next run sort it out by validation.
-                    bg3le_static_record("stats.rarities", (void const*)run);
+                    // No exact match, so either the engine keeps no
+                    // static pointer to RPGStats or that member offset is
+                    // wrong for this build. Either way, walk backwards
+                    // from the run itself until a static is reached.
+                    //
+                    // The windowed search is not worth trying here: it
+                    // found 48 statics within a megabyte below RPGStats
+                    // and every one was a neighbour in the same arena,
+                    // which moved on the next run.
+                    constexpr std::uint64_t kManagerWindow = 1u << 16;
+                    bg3le_static_record_path("stats.rarities",
+                                             (void const*)run,
+                                             kManagerWindow);
                 }
                 return true;
             }
