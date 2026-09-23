@@ -504,22 +504,91 @@ committed alongside this file) are sparse and inconclusive**, and notably
   addresses already known from objdump) to be more useful than the manual
   approach was. Not investigated further this session.
 
-**Bottom line for next time**: Ghidra is installed and working
+**Bottom line for that session**: Ghidra is installed and working
 (`tools/ghidra_project/bg3proj`, `tools/ghidra_scripts/FindIsModded.java`),
 but its default-settings automated analysis of this specific binary is not
-yet better than manual objdump work, just different. The comparison function
-gating achievements is **still not located**. The most promising unexplored
-leads, in order:
-1. Fix the `osi.cpp` marshalling bug (real signature for `UnlockAchievement`
-   is likely wrong -- check/fix `load_out_param_counts`' handling of it, or
-   hardcode its known-correct arity/types) so `Osi.UnlockAchievement("BG3_Quest01", host)`
-   can be safely re-tried as a live oracle, this time correlated with the
-   already-working Steam vtable hook, across a real mods-active vs.
-   mods-inactive comparison (the one experiment that would settle this
-   conclusively and was never completed).
-2. In Ghidra's GUI (not headless) with the existing analyzed project, jump
-   directly to the three functions objdump found manually
-   (`0x4ca37ef`, `0x740ac11`, `0x41eafa0`, and the six GUID addresses
-   themselves) and force Ghidra to (re-)disassemble/create functions there by
-   hand if it hasn't -- interactive fix-up rather than trusting default
-   auto-analysis.
+yet better than manual objdump work, just different.
+
+## Session 3: the block is now conclusively located (inside `UnlockAchievement`'s native handler)
+
+First, resolved the open question from session 2 about `UnlockAchievement`'s
+real signature *without guessing*: bg3le already dumps every Osiris
+function's real name/id/param types straight from the engine's own function
+table on every launch, unconditionally, to `/tmp/bg3le-osi.<pid>.txt`
+(`BG3LE_OSI_DUMP` env var to override the path) -- this was sitting right
+there in `preload.cpp` the whole time. It confirms:
+
+```
+func 0x80001669 UnlockAchievement(STRING, CHARACTER)
+```
+
+-- exactly the shape we'd been calling it with (`Osi.UnlockAchievement(name, host)`).
+So the earlier signature-mismatch theory for the `osi.cpp` crash was wrong.
+Also found in the same dump that BG3's *real* Steam achievement API names are
+`BG3_Quest01`..`BG3_Quest54` (confirmed independently by parsing
+`UserGameStatsSchema_1086940.bin`'s `name` field, not just its display-string
+tokens) -- `NEW_ACHIEVEMENT_1_N` are display-string tokens only, never valid
+arguments to `UnlockAchievement`.
+
+Re-tested `Osi.UnlockAchievement` with **the correct signature, real IDs,
+carefully chosen values**:
+
+- `Osi.UnlockAchievement("BG3_Quest01", host)` (already-earned-by-this-save
+  achievement) -- still **crashes**, reproducing session 2's SIGSEGV in
+  `COsiArgumentDesc::SetAnyString`. Root cause still unconfirmed, but now
+  narrowed: it is specific to *re-triggering an already-unlocked* achievement,
+  not to real names or the `(STRING, CHARACTER)` shape in general (see next
+  point). Parked again -- a real, separate bg3le bug, not a blocker.
+- `Osi.UnlockAchievement("BG3_Quest54", host)` (a real, not-yet-earned
+  achievement -- "Unbreakable Hammer") -- **does not crash**, in either mod
+  state, and gives a clean, repeatable, conclusive result:
+  - **Mods active** (12 loaded modules, confirmed live -- see below): call
+    returns normally, but the Steam vtable hook (from session 2) never fires.
+    No error, no crash, no toast. Silent no-op.
+  - **Mods inactive** (1 loaded module, confirmed live, same save): call
+    returns normally, **the vtable hook fires**
+    (`ISteamUserStats::SetAchievement -> true` in the log), **and the
+    achievement actually unlocked in Steam** (user confirmed the "Unbreakable
+    Hammer" toast/unlock live).
+
+**This is the conclusive result the whole investigation was after.** The
+mod-block sits somewhere *inside the native code path that
+`UnlockAchievement` (Osiris function `0x80001669`) dispatches to*, strictly
+before any Steam call -- not in a separate, later check, not something that
+only affects the save-list UI badge. Confirms the bg3se analogy exactly:
+same shape as `ls::ModuleSettings::IsModded` gating achievement-relevant
+calls on Windows.
+
+Also fixed, in passing: the `ModuleSettings::Mods` container is **not**
+`{begin, end, capacity}` (std::vector-shaped) as assumed all through session
+1 -- it is bg3se's own `Array<T>` ABI, `{void* Begin; uint32_t Size;
+uint32_t Capacity;}` (confirmed live: reading `settings+16` as one 8-byte
+value and splitting it into two 32-bit halves gives sane, matching
+Size==Capacity numbers, `12` with mods active and `1` without). The
+*offsets* used throughout session 1 (`Settings=0x198`, `Mods=8`,
+`ModuleUUID=8`, stride 96) are still correct -- only the *second and third
+fields'* interpretation was wrong. Session 1's live mod-name reads happened
+to work anyway because they only ever used `Begin` + stride, never `End`.
+
+### Next step: find `UnlockAchievement`'s native handler directly
+
+This changes the search from "find the IsModded comparison somewhere in a
+90MB `.text`" to a much narrower one: **find the single native function
+Osiris function id `0x80001669` dispatches to**, and read the mod check
+directly out of it. Two ways in, not yet tried:
+
+1. The Osiris function table bg3le already reads (`get_funcs`/`MappingInfo`
+   in `preload.cpp`, feeding the `/tmp/bg3le-osi.*.txt` dump) may carry a
+   handler function pointer per entry alongside id/name/params -- check
+   `MappingInfo`'s full field layout (`preload.cpp`/wherever it's declared)
+   for anything pointer-shaped besides `param_types`, and if present, read it
+   live for id `0x80001669` the same way the debug console already reads
+   other struct fields.
+2. Failing that: `COsiris::Event`/the DIV dispatch path bg3le already
+   interposes (`_ZN7COsiris5EventEjP16COsiArgumentDesc` in `preload.cpp`)
+   must eventually reach this handler through the engine's own function
+   table -- a live `rwatch`/`break` on that specific dispatch, filtered to
+   event/call id `0x80001669`, would land directly in the right function on
+   the very next real or synthetic `UnlockAchievement` call (once the
+   `osi.cpp` crash on repeat-unlock is understood well enough to make that
+   safe, or by using a fresh not-yet-earned id each time to sidestep it).
