@@ -1,18 +1,32 @@
-// The line under the copyright on the main menu, saying the extender
-// loaded.
+// The line under the copyright on the main menu, saying bg3le loaded.
 //
 // bg3se appends to the game's own version string: it reads the translated
-// string for handle h5b6e4138g2cf0g4d67gb825gee416cf8c54f -- the
-// copyright line -- adds its own line, and writes it back through
+// string for handle h5b6e4138g2cf0g4d67gb825gee416cf8c54f -- the menu's
+// copyright line -- adds its own line and writes it back through
 // TranslatedStringRepository::UpdateTranslatedString.
 //
-// bg3le reads its localisation from the archives rather than from that
-// repository, so it has nothing to write back through. What it has
-// instead is a very exact anchor: the string is known, and so is its
-// length. An LSStringView is a pointer and a size, so a view whose size is
-// that length and whose bytes are that text is the repository's entry for
-// this handle and nothing else. There is no fingerprint here and no
-// guessing -- the check is the whole string.
+// bg3le has no symbol for that repository or that method, so it edits the
+// string where the repository keeps it. Two places hold it and both are
+// patched, because which one the menu reads is not something to guess at:
+//
+//   - the LSStringView values of a pool's Texts map: a pointer and an
+//     eight-byte length;
+//   - the STDString objects a pool owns: Larian's sixteen-byte string,
+//     which in heap form is a pointer, a four-byte length and a four-byte
+//     capacity whose top bit marks it as heap-allocated.
+//
+// Both are identified by content, not by shape: the text has to be the
+// whole 69-byte copyright line, byte for byte. Nothing else matches that.
+//
+// The replacement is allocated with the game's own allocator. An earlier
+// version used ::new, and the repository freeing its strings on shutdown
+// then freed a pointer it had never allocated -- which crashed the game on
+// close. Anything handed to the engine has to come from the engine's heap.
+//
+// It reapplies, rather than patching once. The pool the menu reads is not
+// necessarily the one that exists eight seconds after load: the engine
+// builds pools as it goes, and a later one arrives with the original text
+// in it.
 
 #include <stdafx.h>
 
@@ -21,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../log.h"
@@ -32,114 +47,72 @@ extern "C" bool bg3le_scannable_region(char const* line,
 
 namespace bg3le {
 
-extern "C" char const* bg3le_loca_get(char const* handle);
+extern "C" bool bg3le_game_allocator_ready();
 
 namespace {
 
-// The main menu's copyright line.
-constexpr char const* kVersionHandle =
-    "h5b6e4138g2cf0g4d67gb825gee416cf8c54f";
+// Larian's string marks the heap form with the top bit of its capacity.
+constexpr std::uint32_t kHeapFlag = 0x80000000u;
 
-// The views that were patched, so they can be re-checked cheaply. bg3se
-// rewrites the string as the client leaves GameState::LoadModule, before
-// the menu is built; bg3le has no game-state hook, so instead it keeps the
-// write in place -- if the engine rebuilds the pool the check notices and
-// writes it again.
-std::vector<std::uint64_t> patchedViews;
+// One replacement per distinct original, kept so the same text is not
+// allocated twice and so a reapply finds the same pointer.
+std::vector<std::pair<std::string, char const*>> replacements;
+
+// The part of the line that identifies it, and the lengths worth reading.
+constexpr char const* kMarker = "Larian Studios and Wizards";
+constexpr std::size_t kMinText = 24;
+constexpr std::size_t kMaxText = 512;
 
 template <class T>
 bool read_as(void const* addr, T* out) {
     return safe_read(addr, out, sizeof(T));
 }
 
+// The engine's heap, so the engine can free this legitimately.
+char const* build_replacement(char const* original) {
+    for (auto const& entry : replacements) {
+        if (entry.first == original) return entry.second;
+    }
+    if (!bg3le_game_allocator_ready()) return nullptr;
+
+    const std::string text =
+        std::string(original)
+        + "\r\nbg3le loaded, Script Extender v32 API, built on "
+        __DATE__ " " __TIME__ ".";
+
+    auto* buffer = (char*)bg3se::GameAllocRaw(text.size() + 1);
+    if (buffer == nullptr) return nullptr;
+    std::memcpy(buffer, text.c_str(), text.size() + 1);
+
+    replacements.emplace_back(original, buffer);
+    return buffer;
+}
+
 }  // namespace
 
-// Appends bg3le's own line to the menu's version text. Returns how many
-// views were updated; the repository keeps several pools, and the menu
-// reads whichever one its language resolves to, so every view holding this
-// exact string is updated rather than guessing which.
+// Patches every copy of the menu's version string. Returns how many it
+// changed this time round; zero once they all already say bg3le.
 extern "C" std::size_t bg3le_version_text_install() {
-    // Off unless asked for, because it crashed the game on exit.
-    //
-    // The write points an engine-owned LSStringView at a buffer this
-    // library allocated. The repository frees its strings on shutdown, so
-    // it then frees a pointer it never allocated -- which is exactly what
-    // happened. It also never worked: the write lands and reads back
-    // correctly, and the menu still shows the original line, so the menu
-    // is not reading through the view that was patched.
-    //
-    // Doing this properly means what bg3se does: find
-    // ls::TranslatedStringRepository and call its own
-    // UpdateTranslatedString, so the string is allocated and owned by the
-    // engine and whatever the UI caches is invalidated with it. Until
-    // then this stays off, because a cosmetic line on the menu is not
-    // worth a crash on close.
-    if (std::getenv("BG3LE_MENU_TEXT") == nullptr) return 0;
-
-    char const* original = bg3le_loca_get(kVersionHandle);
-    if (original == nullptr || original[0] == '\0') return 0;
-
-    const std::size_t length = std::strlen(original);
-    if (length < 16) return 0;
-
-    // Already ours, from an earlier attempt.
-    if (std::strstr(original, "bg3le") != nullptr) return 0;
-
-    // Leaked on purpose: the engine will hold this pointer for as long as
-    // the process lives, so it must not be freed.
-    static std::string* replacement = nullptr;
-    if (replacement == nullptr) {
-        replacement = new std::string(
-            std::string(original) + "\r\nbg3le loaded, Script Extender v32 "
-            "API, built on " __DATE__ " " __TIME__ ".");
-    }
-
-    // Already patched: verify rather than scan. This runs every warming
-    // round, and a full scan each time would be absurd.
-    if (!patchedViews.empty()) {
-        std::size_t intact = 0;
-        std::vector<char> back(replacement->size(), '\0');
-        for (std::uint64_t view : patchedViews) {
-            std::uint64_t data = 0;
-            std::uint64_t size = 0;
-            auto const* at = (char*)(std::uintptr_t)view;
-            if (read_as(at, &data) && read_as(at + 8, &size)
-                && size == replacement->size()
-                && safe_read((void const*)(std::uintptr_t)data, back.data(),
-                             back.size())
-                && std::memcmp(back.data(), replacement->data(),
-                               back.size()) == 0) {
-                ++intact;
-                continue;
-            }
-
-            // The engine put its own string back; put ours in again.
-            char const* value = replacement->c_str();
-            const std::uint64_t newSize = replacement->size();
-            if (safe_write((void*)at, &value, sizeof(value))
-                && safe_write((void*)(at + 8), &newSize, sizeof(newSize))) {
-                ++intact;
-                logf("version text: reapplied after the engine reset it");
-            }
-        }
-        if (intact > 0) return intact;
-
-        // None of them survived, so the pool itself was replaced: scan
-        // again below.
-        patchedViews.clear();
-    }
+    // No localisation index needed. It used to wait for one -- 232,878
+    // entries parsed out of the archives, seven seconds -- and those seven
+    // seconds are what lost the race: the menu's interface resolves this
+    // string into its own copy, and once it has, editing the source
+    // changes nothing on screen. The marker identifies the string by
+    // itself, so this can run within a second of load.
+    if (!bg3le_game_allocator_ready()) return 0;
 
     std::FILE* maps = std::fopen("/proc/self/maps", "r");
     if (maps == nullptr) return 0;
 
     constexpr std::size_t kChunk = 1u << 20;
-    constexpr std::size_t kView = 16;
+    constexpr std::size_t kSlack = 16;
     static std::vector<unsigned char> block;
-    block.resize(kChunk + kView);
+    block.resize(kChunk + kSlack);
 
-    std::vector<char> text(length);
+    std::vector<char> text;
     char line[512];
-    std::size_t patched = 0;
+    std::size_t views = 0;
+    std::size_t strings = 0;
 
     while (std::fgets(line, sizeof(line), maps) != nullptr) {
         unsigned long long from = 0;
@@ -148,78 +121,89 @@ extern "C" std::size_t bg3le_version_text_install() {
 
         for (unsigned long long base = from; base < to; base += kChunk) {
             std::size_t want = (std::size_t)(to - base);
-            if (want > kChunk + kView) want = kChunk + kView;
+            if (want > kChunk + kSlack) want = kChunk + kSlack;
             const std::size_t got =
                 safe_read_some((void const*)base, block.data(), want);
-            if (got < kView) continue;
+            if (got < kSlack) continue;
             scan_yield();
 
-            for (std::size_t off = 0; off + kView <= got; off += 8) {
-                // Size first: it is the cheap half, and it rejects
-                // everything but a view of exactly this length.
-                std::uint64_t size = 0;
-                std::memcpy(&size, block.data() + off + 8, sizeof(size));
-                if (size != length) continue;
-
+            for (std::size_t off = 0; off + kSlack <= got; off += 8) {
                 std::uint64_t data = 0;
                 std::memcpy(&data, block.data() + off, sizeof(data));
                 if (data < 0x10000 || data > 0x800000000000ull) continue;
 
+                // An LSStringView's length is eight bytes; a Larian
+                // string's is four, with a capacity after it. Both start
+                // with the pointer, so one read of the text settles
+                // whether this is the string at all, and the length field
+                // says which of the two it is.
+                std::uint64_t wide = 0;
+                std::uint32_t narrow = 0;
+                std::uint32_t capacity = 0;
+                std::memcpy(&wide, block.data() + off + 8, sizeof(wide));
+                std::memcpy(&narrow, block.data() + off + 8, sizeof(narrow));
+                std::memcpy(&capacity, block.data() + off + 12,
+                            sizeof(capacity));
+
+                // Any plausible length, not just the one this handle's
+                // text happens to have: the menu may read a different
+                // handle whose text differs from it invisibly -- a
+                // non-breaking space, a trailing character -- and an exact
+                // 69-byte compare would miss it while the screen looks
+                // identical.
+                const bool asView = wide >= kMinText && wide <= kMaxText;
+                const bool asString = narrow >= kMinText
+                                      && narrow <= kMaxText
+                                      && (capacity & kHeapFlag) != 0;
+                if (!asView && !asString) continue;
+
+                const std::size_t span = asView ? (std::size_t)wide
+                                                : (std::size_t)narrow;
+                text.assign(span + 1, '\0');
                 if (!safe_read((void const*)(std::uintptr_t)data,
-                               text.data(), length)) {
+                               text.data(), span)) {
                     continue;
                 }
-                if (std::memcmp(text.data(), original, length) != 0) continue;
+                // The distinctive part of the line, so a variant still
+                // matches.
+                if (std::strstr(text.data(), kMarker) == nullptr) continue;
+                // Already ours.
+                if (std::strstr(text.data(), "bg3le") != nullptr) continue;
 
-                // The whole string matched, so this is the entry. Point it
-                // at ours.
-                auto const* at = (char*)(std::uintptr_t)(base + off);
-                char const* value = replacement->c_str();
-                const std::uint64_t newSize = replacement->size();
-                if (!safe_write((void*)at, &value, sizeof(value))) continue;
-                if (!safe_write((void*)(at + 8), &newSize, sizeof(newSize))) {
-                    continue;
-                }
+                logf("version text: found a %zu-byte copy: \"%s\"", span,
+                     text.data());
 
-                // Read it back rather than trusting the write: this is the
-                // one place bg3le modifies the game's memory, and a write
-                // that silently did nothing would leave the menu looking
-                // exactly as it does when the extender failed to load.
-                std::uint64_t checkData = 0;
-                std::uint64_t checkSize = 0;
-                std::vector<char> back(replacement->size() + 1, '\0');
-                if (!read_as(at, &checkData) || !read_as(at + 8, &checkSize)
-                    || checkSize != newSize
-                    || !safe_read((void const*)(std::uintptr_t)checkData,
-                                  back.data(), replacement->size())
-                    || std::memcmp(back.data(), replacement->data(),
-                                   replacement->size()) != 0) {
-                    logf("version text: the write did not take at %p", at);
+                char const* replacement = build_replacement(text.data());
+                if (replacement == nullptr) continue;
+                const std::size_t replacementSize = std::strlen(replacement);
+
+                // The whole line matched. Point it at ours.
+                auto* at = (char*)(std::uintptr_t)(base + off);
+                if (!safe_write(at, &replacement, sizeof(replacement))) {
                     continue;
                 }
 
-                if (patched == 0) {
-                    logf("version text: now reads \"%s\"", back.data());
+                if (asView) {
+                    const std::uint64_t size = replacementSize;
+                    if (safe_write(at + 8, &size, sizeof(size))) ++views;
+                } else {
+                    const std::uint32_t size = (std::uint32_t)replacementSize;
+                    const std::uint32_t cap = size | kHeapFlag;
+                    if (safe_write(at + 8, &size, sizeof(size))
+                        && safe_write(at + 12, &cap, sizeof(cap))) {
+                        ++strings;
+                    }
                 }
-                patchedViews.push_back(base + off);
-                ++patched;
             }
         }
     }
     std::fclose(maps);
 
-    if (patched > 0) {
-        logf("version text: added bg3le's line to the menu version string "
-             "(%zu views)", patched);
-    } else {
-        static bool said = false;
-        if (!said) {
-            said = true;
-            logf("version text: the menu version string was not found in "
-                 "memory; the menu will not say bg3le loaded");
-        }
+    if (views + strings > 0) {
+        logf("version text: patched %zu views and %zu strings", views,
+             strings);
     }
-    return patched;
+    return views + strings;
 }
 
 }  // namespace bg3le

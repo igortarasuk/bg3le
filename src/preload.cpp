@@ -177,18 +177,17 @@ void warm_stats_search() {
             {"prototypes", &bg3le_prototypes_ready, false, true},
         };
 
-        // The localisation and the menu's version line come first, and
-        // do not wait behind the memory scans.
+        // The localisation comes first; the version line no longer waits
+        // for it.
         //
         // bg3se writes that line as the client leaves GameState::LoadModule
         // -- before the menu is built. Having it queued behind five
         // whole-address-space searches put it minutes late, so the menu
         // came up with no line on it at all. Reading the .loca archives
         // takes about a second, so this costs nothing to do first.
-        // A fallback now: the searches proper run before the mods load,
-        // and the version line is written from the menu pump. This keeps
-        // them warm for a session that never loads a story, and reapplies
-        // the version line if the engine resets it.
+        // The version line is reapplied for as long as this loop runs.
+        // The pool the menu reads is not necessarily the one that exists
+        // a few seconds after load, so patching once is not enough.
         std::this_thread::sleep_for(std::chrono::seconds(2));
 
         bool statsReady = false;
@@ -203,9 +202,9 @@ void warm_stats_search() {
         // never got a turn at all, and the first Lua call for it then ran
         // the scan on the story thread.
         int delay = 5;
-        for (int attempt = 0; attempt < 40; ++attempt) {
+        for (int attempt = 0; attempt < 120; ++attempt) {
             std::this_thread::sleep_for(std::chrono::seconds(delay));
-            if (delay < 10) delay *= 2;
+            if (delay < 4) delay *= 2;
 
             // Kept in place every round: the engine rebuilds the string
             // pool while the module loads, and whichever side writes last
@@ -237,7 +236,7 @@ void warm_stats_search() {
             }
             // The version line is re-checked for as long as the loop
             // runs, so finishing early would stop maintaining it.
-            if (all && attempt > 8) return;
+            if (all && attempt > 30) return;
         }
 
         for (Search const& search : searches) {
@@ -428,6 +427,38 @@ void ensure_symbols() {
         logf("  sentinel esv TagComponentTypeContext::m_State -> %p", p);
         lua_init();
         debug_server_start();
+
+        // The menu's version line, on a thread of its own.
+        //
+        // The string does not exist at load -- the engine reads the
+        // localisation about a minute in -- and the menu's interface
+        // resolves it into its own copy within moments of it appearing.
+        // After that, editing the source changes nothing on screen. So
+        // this watches for it continuously and patches it the instant it
+        // shows up, rather than polling every few seconds and losing by a
+        // hair. It stops as soon as it succeeds.
+        //
+        // Opt-in, and a thread of its own, because a tight scan loop is
+        // not something to inflict on a game that is not asking for it.
+        if (std::getenv("BG3LE_MENU_TEXT") != nullptr) {
+            std::thread([] {
+                scan_enable_on_this_thread();
+                for (int attempt = 0; attempt < 2000; ++attempt) {
+                    if (bg3le_version_text_install() > 0) {
+                        // Reapply for a while: the engine may build a
+                        // second pool after the first.
+                        for (int again = 0; again < 30; ++again) {
+                            std::this_thread::sleep_for(
+                                std::chrono::seconds(1));
+                            bg3le_version_text_install();
+                        }
+                        return;
+                    }
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(50));
+                }
+            }).detach();
+        }
         warm_stats_search();
         if (const char* e = std::getenv("BG3LE_CLOCK_STATS")) {
             g_clock_stats.store(e[0] == '1');
