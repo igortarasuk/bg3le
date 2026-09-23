@@ -61,6 +61,9 @@ namespace bg3le {
 extern "C" void* bg3le_static_get(char const* key, std::size_t which);
 extern "C" std::size_t bg3le_static_count(char const* key);
 extern "C" void bg3le_static_confirm(char const* key, std::size_t which);
+extern "C" bool bg3le_static_record_exact(char const* key,
+                                          void const* pointer,
+                                          std::uint64_t delta);
 extern "C" bool bg3le_static_record(char const* key,
                                     void const* object);
 extern "C" char const* bg3le_fixed_string(std::uint32_t index,
@@ -916,8 +919,25 @@ bool search_for_stats() {
                      scanned, regions);
                 // Recorded so the next run reads the engine's own pointer
                 // instead of scanning for it.
-                bg3le_static_record("stats.rarities",
-                                    (void const*)(base + off));
+                //
+                // The base is computable rather than guessed: the run is
+                // RPGStats::TreasureRarities, and this build puts it 3,648
+                // bytes into the object -- established when the stats
+                // search was written, and the reason none of bg3se's own
+                // member offsets could be used directly. So a static
+                // holding that address exactly is the pointer the engine
+                // keeps, with no window and no ambiguity.
+                constexpr std::uint64_t kRaritiesInStats = 3648;
+                const unsigned long long run = base + off;
+                if (run > kRaritiesInStats
+                    && !bg3le_static_record_exact(
+                           "stats.rarities",
+                           (void const*)(run - kRaritiesInStats),
+                           kRaritiesInStats)) {
+                    // No exact match, so fall back to the windowed search
+                    // and let the next run sort it out by validation.
+                    bg3le_static_record("stats.rarities", (void const*)run);
+                }
                 return true;
             }
         }

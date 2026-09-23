@@ -131,9 +131,18 @@ std::string build_key() {
 // through RPGStats -- while the static holds the base. Recording the gap
 // means neither the struct's layout nor the manager's size has to be
 // known.
+// A path from a static to something bg3le found.
+//
+// One hop covers a manager a static points at directly. Two cover the
+// common case: a static names an owning object, and the manager hangs off
+// a member of it. RPGStats is reached that way -- eight statics were found
+// within a megabyte below it and not one of them held on the next run,
+// because none of them pointed at it; they pointed at neighbours in the
+// same arena.
 struct Entry {
     std::uint64_t Offset{0};   // of the static, within the image
-    std::uint64_t Delta{0};    // from the pointer to what was wanted
+    std::uint64_t Delta{0};    // from what the static holds, to the target
+    std::uint64_t Hop{0};      // read a pointer here first, if non-zero
 };
 
 struct Cache {
@@ -182,13 +191,14 @@ void load_cache() {
         char const* at = line + consumed;
         for (;;) {
             unsigned long long offset = 0;
+            unsigned long long hop = 0;
             unsigned long long delta = 0;
             int used = 0;
-            if (std::sscanf(at, " %llx:%llx%n", &offset, &delta, &used)
-                != 2) {
+            if (std::sscanf(at, " %llx:%llx:%llx%n", &offset, &hop, &delta,
+                            &used) != 3) {
                 break;
             }
-            entries.push_back(Entry{offset, delta});
+            entries.push_back(Entry{offset, delta, hop});
             at += used;
         }
         if (!entries.empty()) c.Offsets[key] = std::move(entries);
@@ -207,8 +217,9 @@ void save_cache() {
     for (auto const& entry : c.Offsets) {
         std::fprintf(f, "%s", entry.first.c_str());
         for (Entry const& candidate : entry.second) {
-            std::fprintf(f, " %llx:%llx",
+            std::fprintf(f, " %llx:%llx:%llx",
                          (unsigned long long)candidate.Offset,
+                         (unsigned long long)candidate.Hop,
                          (unsigned long long)candidate.Delta);
         }
         std::fprintf(f, "\n");
@@ -242,6 +253,16 @@ extern "C" void* bg3le_static_get(char const* key, std::size_t which) {
         return nullptr;
     }
     if (value == nullptr) return nullptr;   // the engine has not filled it in
+
+    if (entry.Hop != 0) {
+        void* next = nullptr;
+        if (!safe_read((void const*)((char*)value + entry.Hop), &next,
+                       sizeof(next))) {
+            return nullptr;
+        }
+        if (next == nullptr) return nullptr;
+        value = next;
+    }
     return (void*)((char*)value + entry.Delta);
 }
 
@@ -278,6 +299,168 @@ extern "C" void bg3le_static_confirm(char const* key, std::size_t which) {
 // the word at it really holds this address. Several statics can hold the
 // same pointer; the first is taken, and being wrong about which is
 // harmless since they are interchangeable by definition.
+namespace {
+
+// The executable's writable data, copied once.
+//
+// It is a few megabytes, and every candidate check reads it -- doing that
+// with a syscall per eight bytes is how the earlier searches came to stall
+// the game, so it is read in bulk and matched in memory.
+struct ImageData {
+    std::vector<std::pair<unsigned long long, std::vector<unsigned char>>>
+        Regions;
+};
+
+ImageData const& image_data() {
+    static ImageData data;
+    if (!data.Regions.empty()) return data;
+
+    for (auto const& region : writable_image_regions()) {
+        const std::size_t size = (std::size_t)(region.second - region.first);
+        std::vector<unsigned char> bytes(size);
+        const std::size_t got =
+            safe_read_some((void const*)region.first, bytes.data(), size);
+        if (got < 8) continue;
+        bytes.resize(got);
+        data.Regions.emplace_back(region.first, std::move(bytes));
+    }
+    return data;
+}
+
+// Every pointer-looking value in the image's writable data, sorted by
+// value, with the offset it lives at.
+//
+// Sorted because the two-hop search asks the same question thousands of
+// times -- "is there a static pointing just below this address?" -- and
+// walking megabytes per question is what made the first attempt
+// unaffordable, so it only had budget for 32 candidates and missed the
+// real one. A binary search makes thousands affordable.
+std::vector<std::pair<std::uint64_t, std::uint64_t>> const&
+sorted_statics(std::uintptr_t base) {
+    static std::vector<std::pair<std::uint64_t, std::uint64_t>> values;
+    if (!values.empty()) return values;
+
+    for (auto const& region : image_data().Regions) {
+        unsigned char const* bytes = region.second.data();
+        const std::size_t size = region.second.size();
+        for (std::size_t off = 0; off + 8 <= size; off += 8) {
+            std::uint64_t word = 0;
+            std::memcpy(&word, bytes + off, sizeof(word));
+            if (word < 0x10000 || word > 0x800000000000ull) continue;
+            values.emplace_back(word, (region.first + off) - base);
+        }
+    }
+    std::sort(values.begin(), values.end());
+    logf("statics: %zu pointer-shaped words in the image's writable data",
+         values.size());
+    return values;
+}
+
+// Statics whose value points at or shortly below `wanted`.
+void statics_pointing_near(std::uint64_t wanted, std::uint64_t window,
+                           std::uintptr_t base,
+                           std::vector<std::pair<std::uint64_t,
+                                                 std::uint64_t>>* out) {
+    auto const& values = sorted_statics(base);
+    auto upper = std::upper_bound(
+        values.begin(), values.end(),
+        std::make_pair(wanted, (std::uint64_t)~0ull));
+
+    while (upper != values.begin()) {
+        --upper;
+        if (wanted - upper->first >= window) break;
+        // offset within the image, and how far past the value the target
+        // sits.
+        out->emplace_back(upper->second, wanted - upper->first);
+    }
+}
+
+// Everything anywhere in the process that holds a pointer at or shortly
+// below `wanted`. These are the candidate owning objects for a two-hop
+// path: something points at them from a static.
+std::vector<std::uint64_t> holders_of(std::uint64_t wanted,
+                                      std::uint64_t window,
+                                      std::size_t limit) {
+    std::vector<std::uint64_t> out;
+
+    std::FILE* maps = std::fopen("/proc/self/maps", "r");
+    if (maps == nullptr) return out;
+
+    constexpr std::size_t kChunk = 1u << 20;
+    static std::vector<unsigned char> block;
+    block.resize(kChunk + 8);
+
+    char line[1024];
+    while (std::fgets(line, sizeof(line), maps) != nullptr
+           && out.size() < limit) {
+        unsigned long long from = 0;
+        unsigned long long to = 0;
+        if (!bg3le_scannable_region(line, &from, &to)) continue;
+
+        for (unsigned long long at = from; at < to && out.size() < limit;
+             at += kChunk) {
+            std::size_t want = (std::size_t)(to - at);
+            if (want > kChunk + 8) want = kChunk + 8;
+            const std::size_t got =
+                safe_read_some((void const*)at, block.data(), want);
+            if (got < 8) continue;
+            scan_yield();
+
+            for (std::size_t off = 0; off + 8 <= got && out.size() < limit;
+                 off += 8) {
+                std::uint64_t word = 0;
+                std::memcpy(&word, block.data() + off, sizeof(word));
+                if (word == 0 || word > wanted) continue;
+                if (wanted - word >= window) continue;
+                out.push_back(at + off);
+            }
+        }
+    }
+    std::fclose(maps);
+    return out;
+}
+
+}  // namespace
+
+// Records a static that holds exactly `pointer`, with `delta` from it to
+// what the caller actually wants.
+//
+// This is the version to prefer whenever the containing object's base is
+// known. The windowed search below has to guess which of dozens of nearby
+// statics is the right one -- for RPGStats it found 48 and every one was a
+// neighbour in the same arena, identical-looking until the next run moved
+// them. An exact match has no such ambiguity.
+extern "C" bool bg3le_static_record_exact(char const* key,
+                                          void const* pointer,
+                                          std::uint64_t delta) {
+    load_cache();
+    if (key == nullptr || pointer == nullptr) return false;
+
+    const std::uintptr_t base = image_base();
+    if (base == 0) return false;
+
+    const auto wanted = (std::uint64_t)(std::uintptr_t)pointer;
+    std::vector<Entry> candidates;
+    for (auto const& entry : sorted_statics(base)) {
+        if (entry.first != wanted) continue;
+        candidates.push_back(Entry{entry.second, delta, 0});
+    }
+
+    if (candidates.empty()) {
+        logf("statics: no static holds %s's base exactly", key);
+        return false;
+    }
+
+    cache().Offsets[key] = candidates;
+    cache().Dirty = true;
+    save_cache();
+    logf("statics: %s is image+%#llx plus %#llx, matched exactly (%zu "
+         "statics hold it)", key,
+         (unsigned long long)candidates[0].Offset,
+         (unsigned long long)delta, candidates.size());
+    return true;
+}
+
 extern "C" bool bg3le_static_record(char const* key, void const* object) {
     load_cache();
     if (key == nullptr || object == nullptr) return false;
@@ -298,39 +481,52 @@ extern "C" bool bg3le_static_record(char const* key, void const* object) {
     const auto wanted = (std::uint64_t)(std::uintptr_t)object;
     std::vector<Entry> candidates;
 
-    constexpr std::size_t kChunk = 1u << 20;
-    std::vector<unsigned char> block(kChunk + 8);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> direct;
+    statics_pointing_near(wanted, kWindow, base, &direct);
+    for (auto const& hit : direct) {
+        candidates.push_back(Entry{hit.first, hit.second, 0});
+    }
 
-    for (auto const& region : writable_image_regions()) {
-        for (unsigned long long at = region.first; at < region.second;
-             at += kChunk) {
-            std::size_t want = (std::size_t)(region.second - at);
-            if (want > kChunk + 8) want = kChunk + 8;
-            const std::size_t got =
-                safe_read_some((void const*)at, block.data(), want);
-            if (got < 8) continue;
-
-            for (std::size_t off = 0; off + 8 <= got; off += 8) {
-                std::uint64_t word = 0;
-                std::memcpy(&word, block.data() + off, sizeof(word));
-                if (word == 0 || word > wanted) continue;
-                if (wanted - word >= kWindow) continue;
-
-                candidates.push_back(
-                    Entry{(at + off) - base, wanted - word});
-            }
+    // Two-hop paths as well, always -- not only when no static points at
+    // the object directly. The single-hop candidates are mostly
+    // neighbours: RPGStats sits in an arena with other allocations, and a
+    // static pointing at one of those looks identical until the next run
+    // moves them relative to each other. Two-hop paths are the ones that
+    // survive, so they are recorded alongside and the caller validates.
+    for (std::uint64_t holder : holders_of(wanted, kWindow, 20000)) {
+        std::uint64_t owner = 0;
+        if (!safe_read((void const*)(std::uintptr_t)holder, &owner,
+                       sizeof(owner))) {
+            continue;
         }
+
+        // A member of an owning object, so the static points close by --
+        // a narrow window here keeps the coincidences down.
+        constexpr std::uint64_t kMemberWindow = 1u << 14;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> reaching;
+        statics_pointing_near(holder, kMemberWindow, base, &reaching);
+        for (auto const& hop : reaching) {
+            candidates.push_back(
+                Entry{hop.first, wanted - owner, hop.second});
+            if (candidates.size() >= kMaxCandidates * 4) break;
+        }
+        if (candidates.size() >= kMaxCandidates * 4) break;
     }
 
     if (!candidates.empty()) {
         // Nearest first: the innermost enclosing object is the likeliest,
         // and the caller stops at the first that validates.
-        std::sort(candidates.begin(), candidates.end(),
-                  [](Entry const& a, Entry const& b) {
-                      return a.Delta < b.Delta;
-                  });
-        if (candidates.size() > kMaxCandidates) {
-            candidates.resize(kMaxCandidates);
+        // Two-hop paths first, then by proximity: a path through an
+        // owning object survives a restart, a neighbour does not.
+        std::stable_sort(candidates.begin(), candidates.end(),
+                         [](Entry const& a, Entry const& b) {
+                             if ((a.Hop != 0) != (b.Hop != 0)) {
+                                 return a.Hop != 0;
+                             }
+                             return a.Delta < b.Delta;
+                         });
+        if (candidates.size() > kMaxCandidates * 2) {
+            candidates.resize(kMaxCandidates * 2);
         }
 
         cache().Offsets[key] = candidates;
