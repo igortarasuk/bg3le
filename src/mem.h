@@ -14,6 +14,11 @@ bool safe_cstr(const void* addr, char* buf, std::size_t buf_size);
 
 // Reads up to n bytes, returning how many were actually read.
 //
+// Writes into our own memory without risking a fault on a bad pointer,
+// the counterpart to safe_read. Used only where the target has already
+// been identified exactly -- see src/vendor/version_text.cpp.
+bool safe_write(void* addr, const void* in, std::size_t n);
+
 // For scanning rather than probing. safe_read costs one process_vm_readv
 // syscall per call, so checking a candidate at every offset of a writable
 // region means hundreds of millions of syscalls and never finishes; reading a

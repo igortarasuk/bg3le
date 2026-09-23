@@ -73,6 +73,7 @@ extern "C" bool bg3le_stat_origins_ready();
 extern "C" bool bg3le_loca_ready();
 extern "C" bool bg3le_templates_ready();
 extern "C" bool bg3le_prototypes_ready();
+extern "C" std::size_t bg3le_version_text_install();
 
 // Finds the stats manager on a thread of our own.
 //
@@ -121,7 +122,14 @@ void warm_stats_search() {
             {"origins", &bg3le_stat_origins_ready, false, false},
             // Reads the archives rather than memory, so it is cheap and
             // settles on the first attempt.
-            {"loca", &bg3le_loca_ready, false, false},
+            // Reads the archives rather than memory, so it is cheap and
+            // settles on the first attempt. The menu's version line is
+            // rewritten once it has, since that needs the original text.
+            {"loca", [] {
+                 if (!bg3le_loca_ready()) return false;
+                 bg3le_version_text_install();
+                 return true;
+             }, false, false},
             {"templates", &bg3le_templates_ready, false, false},
             // Classifying the prototype maps asks the stats what their
             // names are, so there is no point before stats is up.

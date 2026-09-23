@@ -5238,7 +5238,7 @@ Ext.Stats.PrepareFunctorParams = needs(
 -- what the .txt said, the prototype is what the engine runs. The spell and
 -- status managers are found by validating each candidate against its own
 -- contents; see src/vendor/prototypes.cpp.
-local PROTOTYPE_KIND = {Spell = 0, Status = 1}
+local PROTOTYPE_KIND = {Spell = 0, Status = 1, Interrupt = 2, Passive = 3}
 
 local function cached_prototype(kind, class)
   return function(name)
@@ -5258,17 +5258,13 @@ end
 Ext.Stats.GetCachedSpell = cached_prototype("Spell", "stats::SpellPrototype")
 Ext.Stats.GetCachedStatus = cached_prototype("Status", "stats::StatusPrototype")
 
--- Passives and interrupts store their prototypes inline in the map rather
--- than behind a pointer, and boosts are keyed by GUID; none of the three
--- can be validated the way the other two are -- there is no pointer to
--- follow and check the name of -- so they are not guessed at.
-Ext.Stats.GetCachedPassive = needs(
-  "Ext.Stats.GetCachedPassive needs the passive prototype manager, whose "
-  .. "map stores prototypes inline rather than behind a pointer, so the "
-  .. "self-check the spell and status maps allow does not apply")
-Ext.Stats.GetCachedInterrupt = needs(
-  "Ext.Stats.GetCachedInterrupt needs the interrupt prototype manager, "
-  .. "whose map stores prototypes inline rather than behind a pointer")
+-- Passives and interrupts keep their prototypes in the map rather than
+-- behind a pointer. The name still has to match the key, which is what
+-- derives the stride between them.
+Ext.Stats.GetCachedInterrupt =
+  cached_prototype("Interrupt", "stats::InterruptPrototype")
+Ext.Stats.GetCachedPassive =
+  cached_prototype("Passive", "stats::PassivePrototype")
 Ext.Stats.GetCachedBoost = needs(
   "Ext.Stats.GetCachedBoost needs the boost prototype manager, whose map "
   .. "is keyed by GUID rather than by a name that could be checked "

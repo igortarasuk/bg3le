@@ -61,7 +61,9 @@ constexpr std::uint32_t kNullFixedString = 0xffffffffu;
 // How many entries have to agree before a candidate is believed, and how
 // many a real manager holds at the least.
 constexpr std::uint32_t kAgreeing = 8;
-constexpr std::uint32_t kMinEntries = 200;
+// Low enough for the smaller managers: the interrupt map holds hundreds
+// where the spell map holds thousands.
+constexpr std::uint32_t kMinEntries = 50;
 constexpr std::uint32_t kMaxEntries = 1u << 20;
 
 template <class T>
@@ -81,9 +83,19 @@ struct Kind {
 constexpr Kind kKinds[] = {
     {"spell", 8},
     {"status", 8},
+    // Interrupts and passives are stored in their map rather than behind a
+    // pointer, so what varies is the stride between them; the name still
+    // has to match the key, which is what derives it.
+    {"interrupt", 0},
+    // Passives are a LegacyRefMap -- chained nodes rather than parallel
+    // arrays -- so this scan cannot see them; the entry is kept so the
+    // table indices stay stable.
+    {"passive", 4},
 };
 constexpr std::size_t kSpell = 0;
 constexpr std::size_t kStatus = 1;
+constexpr std::size_t kInterrupt = 2;
+constexpr std::size_t kPassive = 3;
 
 // Which kind a validated map holds, from the stats its names belong to: a
 // spell prototype is named after a SpellData stat and a status after a
@@ -165,6 +177,62 @@ bool self_consistent(void const* keys, void const* values,
         if (own != key) return false;
     }
     return probe == kAgreeing;
+}
+
+// The stride between inline prototypes, derived rather than assumed:
+// sizeof(InterruptPrototype) as this build computes it is not the
+// engine's, as every other struct here has shown. The right stride is the
+// one where every sampled entry names itself the way its key does; a
+// wrong one disagrees on the first.
+std::size_t inline_stride(void const* keys, void const* values,
+                          std::uint32_t count, std::size_t nameOffset) {
+    const std::uint32_t probe = count < kAgreeing ? count : kAgreeing;
+    if (probe < kAgreeing) return 0;
+
+    for (std::size_t stride = 8; stride <= 512; stride += 8) {
+        bool ok = true;
+        for (std::uint32_t i = 0; i < probe && ok; ++i) {
+            std::uint32_t key = 0;
+            if (!read_as((char const*)keys + i * kKeyStride, &key)
+                || key == 0 || key == kNullFixedString) {
+                ok = false;
+                break;
+            }
+            std::uint32_t own = 0;
+            if (!read_as((char const*)values + i * stride + nameOffset,
+                         &own)) {
+                ok = false;
+                break;
+            }
+            ok = own == key;
+        }
+        if (ok) return stride;
+    }
+    return 0;
+}
+
+std::size_t harvest_inline(void const* keys, void const* values,
+                           std::uint32_t count, std::size_t nameOffset,
+                           std::size_t stride, Table* into) {
+    std::size_t added = 0;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        std::uint32_t key = 0;
+        if (!read_as((char const*)keys + i * kKeyStride, &key)) break;
+        if (key == 0 || key == kNullFixedString) continue;
+
+        auto const* at = (char const*)values + i * stride;
+        std::uint32_t own = 0;
+        if (!read_as(at + nameOffset, &own) || own != key) continue;
+
+        char const* name = bg3le_fixed_string(key, nullptr);
+        if (name == nullptr || name[0] == '\0') continue;
+
+        if (into->ByName.emplace(name, (std::uint64_t)(std::uintptr_t)at)
+                .second) {
+            ++added;
+        }
+    }
+    return added;
 }
 
 std::size_t harvest(void const* keys, void const* values,
@@ -330,6 +398,12 @@ bool build() {
               [](Candidate const& a, Candidate const& b) {
                   return a.Count > b.Count;
               });
+    // Every candidate, before the pointer pass narrows to the largest
+    // few: the passive and interrupt managers hold hundreds where the
+    // spell and status ones hold thousands, so truncating first left them
+    // out entirely. The inline test costs reads rather than stat lookups,
+    // so it can afford the whole list.
+    std::vector<Candidate> const inlineCandidates = candidates;
     if (candidates.size() > kClassify) candidates.resize(kClassify);
 
     for (Candidate const& candidate : candidates) {
@@ -352,6 +426,29 @@ bool build() {
         if (added > 0) {
             logf("prototypes: %zu %s prototypes at %#llx", added,
                  kKinds[kind].Name, candidate.At);
+        }
+    }
+
+    // The inline-valued managers. Same candidates, different value
+    // layout: the prototype sits in the map rather than behind a pointer,
+    // so the stride is derived and the name still has to match the key.
+    for (Candidate const& candidate : inlineCandidates) {
+        for (std::size_t k = kInterrupt; k <= kPassive; ++k) {
+            if (!found.Kinds[k].ByName.empty()) continue;
+
+            const std::size_t stride = inline_stride(
+                candidate.Keys, candidate.Values, candidate.Count,
+                kKinds[k].NameOffset);
+            if (stride == 0) continue;
+
+            const std::size_t added = harvest_inline(
+                candidate.Keys, candidate.Values, candidate.Count,
+                kKinds[k].NameOffset, stride, &found.Kinds[k]);
+            if (added > 0) {
+                logf("prototypes: %zu %s prototypes at %#llx, stride %zu",
+                     added, kKinds[k].Name, candidate.At, stride);
+            }
+            break;
         }
     }
 

@@ -26,6 +26,13 @@ bool safe_read(const void* addr, void* out, std::size_t n) {
     return read_raw(addr, out, n);
 }
 
+bool safe_write(void* addr, const void* in, std::size_t n) {
+    iovec local{const_cast<void*>(in), n};
+    iovec remote{addr, n};
+    return ::process_vm_writev(::getpid(), &local, 1, &remote, 1, 0) ==
+           static_cast<ssize_t>(n);
+}
+
 std::size_t safe_read_some(const void* addr, void* out, std::size_t n) {
     if (addr == nullptr || reinterpret_cast<std::uintptr_t>(addr) < 0x1000) {
         return 0;
