@@ -51,6 +51,11 @@ struct Strings {
     std::vector<std::string> Blobs;
     std::unordered_map<std::string_view, std::string_view> ByHandle;
     std::vector<std::string_view> Order;
+
+    // What mods have set. Kept separately because these are owned copies
+    // rather than views into a blob, and because the distinction is worth
+    // keeping: everything else here came out of the game's own files.
+    std::vector<std::pair<std::string, std::string>> Written;
 };
 
 Strings& state() {
@@ -254,8 +259,48 @@ extern "C" char const* bg3le_loca_get(char const* handle) {
 
     auto it = state().ByHandle.find(std::string_view(handle));
     if (it == state().ByHandle.end()) return nullptr;
-    // NUL-terminated where it lies, inside the blob.
+    // NUL-terminated where it lies, inside the blob or in the copy a mod
+    // wrote.
     return it->second.data();
+}
+
+// What Ext.Loca.UpdateTranslatedString writes.
+//
+// Into this index, which is where every read here comes from: the strings
+// are taken from the .loca files in the archives rather than from
+// ls::TranslatedStringRepository, which has no symbol and did not survive
+// being fingerprinted. So a handle a mod sets reads back as the mod set
+// it, which is the contract a mod that sets one and then displays it
+// depends on -- Mod Configuration Menu registers every label in its
+// interface this way.
+//
+// What it does not do is change what the *engine* renders from its own
+// repository. Upstream writes that repository and this does not, so a mod
+// that expects the game's own tooltip to change will not see it. Said
+// once, by the caller, rather than refused: refusing blocked MCM's client
+// script at its fifth line.
+extern "C" bool bg3le_loca_set(char const* handle, char const* text) {
+    if (handle == nullptr || text == nullptr || handle[0] == '\0') {
+        return false;
+    }
+    // Build first, because building replaces the whole index and would
+    // throw away anything written before it.
+    ready();
+
+    Strings& strings = state();
+    strings.Written.emplace_back(handle, text);
+    auto const& stored = strings.Written.back();
+
+    const std::string_view key(stored.first);
+    const std::string_view value(stored.second);
+    auto it = strings.ByHandle.find(key);
+    if (it == strings.ByHandle.end()) {
+        strings.ByHandle.emplace(key, value);
+        strings.Order.push_back(key);
+    } else {
+        it->second = value;
+    }
+    return true;
 }
 
 extern "C" std::size_t bg3le_loca_count() {

@@ -1400,6 +1400,7 @@ extern "C" char const* bg3le_stats_attr_label(void const* object,
 extern "C" char const* bg3le_stats_attr_string(int raw);
 extern "C" char const* bg3le_stats_attr_translated(int raw);
 extern "C" char const* bg3le_loca_get(char const* handle);
+extern "C" bool bg3le_loca_set(char const* handle, char const* text);
 extern "C" std::size_t bg3le_loca_count();
 extern "C" char const* bg3le_loca_handle_at(std::size_t index);
 extern "C" std::size_t bg3le_templates_count();
@@ -2116,6 +2117,27 @@ int l_loca_get(lua_State* L) {
     char const* text = bg3le_loca_get(luaL_checkstring(L, 1));
     if (text == nullptr) return 0;
     lua_pushstring(L, text);
+    return 1;
+}
+
+// Ext._Internal.LocaSet(handle, text) -> bool
+int l_loca_set(lua_State* L) {
+    char const* handle = luaL_checkstring(L, 1);
+    char const* text = luaL_checkstring(L, 2);
+    const bool ok = bg3le_loca_set(handle, text);
+
+    // Once per session: the index this writes is bg3le's own, read from
+    // the game's .loca files, not ls::TranslatedStringRepository. A handle
+    // set here reads back here, and the engine's own interface does not
+    // see it.
+    static bool said = false;
+    if (ok && !said) {
+        said = true;
+        logf("loca: a mod is setting translated strings; they read back "
+             "through Ext.Loca but the engine's own string repository is "
+             "not modified, so the game's interface will not show them");
+    }
+    lua_pushboolean(L, ok ? 1 : 0);
     return 1;
 }
 
@@ -3262,6 +3284,8 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "Loca");
     lua_pushcfunction(g_lua, l_loca_keys);
     lua_setfield(g_lua, -2, "LocaKeys");
+    lua_pushcfunction(g_lua, l_loca_set);
+    lua_setfield(g_lua, -2, "LocaSet");
     lua_pushcfunction(g_lua, l_all_entities);
     lua_setfield(g_lua, -2, "AllEntities");
     lua_pushcfunction(g_lua, l_component_type_names);
@@ -6495,17 +6519,31 @@ end
 -- DisplayName is the handle, and it is what the .loca file is keyed by --
 -- so the lookup is the same one, returning nil when nothing is keyed by it
 -- rather than inventing a mapping.
+-- Writes into the index Ext.Loca reads, which is bg3le's own: the strings
+-- come from the game's .loca files, not from its string repository. A
+-- handle set here reads back here, which is what a mod that registers its
+-- own interface labels depends on; the engine's own interface does not see
+-- it, and bg3le says so once.
+function Ext.Loca.UpdateTranslatedString(handle, value)
+  if type(handle) ~= "string" or type(value) ~= "string" then
+    error("Ext.Loca.UpdateTranslatedString(handle, value)", 2)
+  end
+  return Ext._Internal.LocaSet(handle, value)
+end
+
 function Ext.Loca.GetTranslatedStringKey(key)
   if type(key) ~= "string" then return nil end
   if Ext._Internal.Loca(key) == nil then return nil end
   return key
 end
 
-for _, name in ipairs({"UpdateTranslatedString", "UpdateTranslatedStringKey"}) do
-  Ext.Loca[name] = needs(
-    "Ext.Loca." .. name .. " writes to the translated string repository, "
-    .. "which bg3le reads but does not modify")
-end
+-- UpdateTranslatedString is implemented above, against bg3le's own index.
+-- The key variant still is not: a key maps to a handle through a second
+-- structure, and this one reads handles only.
+Ext.Loca.UpdateTranslatedStringKey = needs(
+  "Ext.Loca.UpdateTranslatedStringKey writes the key-to-handle map, which "
+  .. "bg3le does not read either; Ext.Loca.UpdateTranslatedString takes a "
+  .. "handle and works")
 
 -- ---- Ext.Template ----
 --

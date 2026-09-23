@@ -85,7 +85,15 @@ component's declared size with the size the engine recorded, and
   state they are asked in. The console switches with `:client` / `:server` —
   the LuaDebug protocol has carried a context on every request all along.
   Osiris is server-side, as upstream has it, and says so in the client
-  context rather than blaming the save
+  context rather than blaming the save. `Ext.Loca.UpdateTranslatedString`
+  writes into the index `Ext.Loca` reads — which is bg3le's own, built from
+  the game's `.loca` files, since `ls::TranslatedStringRepository` has no
+  symbol and did not survive being fingerprinted — so a handle a mod sets
+  reads back as it set it. That is what MCM registers every interface label
+  through, and refusing it stopped its client script at line five. The
+  engine's own repository is still not written, so the game's own interface
+  does not show them; bg3le says so once rather than leaving it to be
+  discovered
 - **The engine's own managers found once and remembered.** Everything located
   by content — `RPGStats`, the mod load order, the spell and status
   prototype managers — has the path from a static pointer to it recorded
