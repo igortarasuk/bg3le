@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -39,7 +40,12 @@ namespace {
 constexpr char const* kVersionHandle =
     "h5b6e4138g2cf0g4d67gb825gee416cf8c54f";
 
-bool installed = false;
+// The views that were patched, so they can be re-checked cheaply. bg3se
+// rewrites the string as the client leaves GameState::LoadModule, before
+// the menu is built; bg3le has no game-state hook, so instead it keeps the
+// write in place -- if the engine rebuilds the pool the check notices and
+// writes it again.
+std::vector<std::uint64_t> patchedViews;
 
 template <class T>
 bool read_as(void const* addr, T* out) {
@@ -53,7 +59,22 @@ bool read_as(void const* addr, T* out) {
 // reads whichever one its language resolves to, so every view holding this
 // exact string is updated rather than guessing which.
 extern "C" std::size_t bg3le_version_text_install() {
-    if (installed) return 0;
+    // Off unless asked for, because it crashed the game on exit.
+    //
+    // The write points an engine-owned LSStringView at a buffer this
+    // library allocated. The repository frees its strings on shutdown, so
+    // it then frees a pointer it never allocated -- which is exactly what
+    // happened. It also never worked: the write lands and reads back
+    // correctly, and the menu still shows the original line, so the menu
+    // is not reading through the view that was patched.
+    //
+    // Doing this properly means what bg3se does: find
+    // ls::TranslatedStringRepository and call its own
+    // UpdateTranslatedString, so the string is allocated and owned by the
+    // engine and whatever the UI caches is invalidated with it. Until
+    // then this stays off, because a cosmetic line on the menu is not
+    // worth a crash on close.
+    if (std::getenv("BG3LE_MENU_TEXT") == nullptr) return 0;
 
     char const* original = bg3le_loca_get(kVersionHandle);
     if (original == nullptr || original[0] == '\0') return 0;
@@ -71,6 +92,41 @@ extern "C" std::size_t bg3le_version_text_install() {
         replacement = new std::string(
             std::string(original) + "\r\nbg3le loaded, Script Extender v32 "
             "API, built on " __DATE__ " " __TIME__ ".");
+    }
+
+    // Already patched: verify rather than scan. This runs every warming
+    // round, and a full scan each time would be absurd.
+    if (!patchedViews.empty()) {
+        std::size_t intact = 0;
+        std::vector<char> back(replacement->size(), '\0');
+        for (std::uint64_t view : patchedViews) {
+            std::uint64_t data = 0;
+            std::uint64_t size = 0;
+            auto const* at = (char*)(std::uintptr_t)view;
+            if (read_as(at, &data) && read_as(at + 8, &size)
+                && size == replacement->size()
+                && safe_read((void const*)(std::uintptr_t)data, back.data(),
+                             back.size())
+                && std::memcmp(back.data(), replacement->data(),
+                               back.size()) == 0) {
+                ++intact;
+                continue;
+            }
+
+            // The engine put its own string back; put ours in again.
+            char const* value = replacement->c_str();
+            const std::uint64_t newSize = replacement->size();
+            if (safe_write((void*)at, &value, sizeof(value))
+                && safe_write((void*)(at + 8), &newSize, sizeof(newSize))) {
+                ++intact;
+                logf("version text: reapplied after the engine reset it");
+            }
+        }
+        if (intact > 0) return intact;
+
+        // None of them survived, so the pool itself was replaced: scan
+        // again below.
+        patchedViews.clear();
     }
 
     std::FILE* maps = std::fopen("/proc/self/maps", "r");
@@ -145,6 +201,7 @@ extern "C" std::size_t bg3le_version_text_install() {
                 if (patched == 0) {
                     logf("version text: now reads \"%s\"", back.data());
                 }
+                patchedViews.push_back(base + off);
                 ++patched;
             }
         }
@@ -152,12 +209,15 @@ extern "C" std::size_t bg3le_version_text_install() {
     std::fclose(maps);
 
     if (patched > 0) {
-        installed = true;
         logf("version text: added bg3le's line to the menu version string "
              "(%zu views)", patched);
     } else {
-        logf("version text: the menu version string was not found in "
-             "memory; the menu will not say bg3le loaded");
+        static bool said = false;
+        if (!said) {
+            said = true;
+            logf("version text: the menu version string was not found in "
+                 "memory; the menu will not say bg3le loaded");
+        }
     }
     return patched;
 }

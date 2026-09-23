@@ -96,6 +96,51 @@ extern "C" std::size_t bg3le_version_text_install();
 //
 // Detached on purpose: nothing waits on the result, and a failure only
 // means the module in question reports itself unavailable.
+// Every search, once, on the calling thread.
+//
+// This is the one that matters. A mod's load-time code calls Ext.Stats.Get
+// or Ext.Loca.GetTranslatedString the moment it runs, and a background
+// thread that is still looking cannot answer it -- the call fails, which
+// is a wrong answer rather than a slow one. So the searches run to
+// completion at the point where the engine's data exists and nothing has
+// asked yet: after Osiris has loaded and before mod scripts do.
+//
+// bg3se has no equivalent problem because it does not search for data at
+// all; it pattern-matches the executable once at startup to recover the
+// addresses of the engine's static manager pointers, and then just
+// dereferences them. Doing the same here is the right long-term answer --
+// it would make all of this immediate instead of merely early.
+void run_searches_now(char const* when) {
+    scan_enable_on_this_thread();
+
+    struct Step {
+        char const* Name;
+        bool (*Ready)();
+    };
+    const Step steps[] = {
+        {"loca", &bg3le_loca_ready},
+        {"stats", [] { return bg3le_stats_manager() != nullptr; }},
+        {"mods", [] { return bg3le_mods_count() > 0; }},
+        {"origins", &bg3le_stat_origins_ready},
+        {"templates", &bg3le_templates_ready},
+        {"prototypes", &bg3le_prototypes_ready},
+    };
+
+    using clock = std::chrono::steady_clock;
+    auto const elapsed = [](clock::time_point from) {
+        return std::chrono::duration<double>(clock::now() - from).count();
+    };
+
+    const auto started = clock::now();
+    for (Step const& step : steps) {
+        const auto at = clock::now();
+        const bool ok = step.Ready();
+        logf("search(%s): %s %s in %.2fs", when, step.Name,
+             ok ? "ready" : "NOT FOUND", elapsed(at));
+    }
+    logf("search(%s): all searches took %.2fs", when, elapsed(started));
+}
+
 void warm_stats_search() {
     // BG3LE_NO_WARM=1 skips every search, so a problem can be told apart
     // from the searches that look for the structures behind them.
@@ -125,16 +170,26 @@ void warm_stats_search() {
             // Reads the archives rather than memory, so it is cheap and
             // settles on the first attempt. The menu's version line is
             // rewritten once it has, since that needs the original text.
-            {"loca", [] {
-                 if (!bg3le_loca_ready()) return false;
-                 bg3le_version_text_install();
-                 return true;
-             }, false, false},
+            {"loca", &bg3le_loca_ready, false, false},
             {"templates", &bg3le_templates_ready, false, false},
             // Classifying the prototype maps asks the stats what their
             // names are, so there is no point before stats is up.
             {"prototypes", &bg3le_prototypes_ready, false, true},
         };
+
+        // The localisation and the menu's version line come first, and
+        // do not wait behind the memory scans.
+        //
+        // bg3se writes that line as the client leaves GameState::LoadModule
+        // -- before the menu is built. Having it queued behind five
+        // whole-address-space searches put it minutes late, so the menu
+        // came up with no line on it at all. Reading the .loca archives
+        // takes about a second, so this costs nothing to do first.
+        // A fallback now: the searches proper run before the mods load,
+        // and the version line is written from the menu pump. This keeps
+        // them warm for a session that never loads a story, and reapplies
+        // the version line if the engine resets it.
+        std::this_thread::sleep_for(std::chrono::seconds(2));
 
         bool statsReady = false;
         bool modsReady = false;
@@ -151,6 +206,11 @@ void warm_stats_search() {
         for (int attempt = 0; attempt < 40; ++attempt) {
             std::this_thread::sleep_for(std::chrono::seconds(delay));
             if (delay < 10) delay *= 2;
+
+            // Kept in place every round: the engine rebuilds the string
+            // pool while the module loads, and whichever side writes last
+            // is what the menu shows.
+            bg3le_version_text_install();
 
             bool all = true;
             for (Search& search : searches) {
@@ -175,7 +235,9 @@ void warm_stats_search() {
             for (Search const& search : searches) {
                 if (!search.Done) all = false;
             }
-            if (all) return;
+            // The version line is re-checked for as long as the loop
+            // runs, so finishing early would stop maintaining it.
+            if (all && attempt > 8) return;
         }
 
         for (Search const& search : searches) {
@@ -708,6 +770,11 @@ void dump_osiris_api(void* self) {
             typed, bindable.size());
 
     lua_bind_osi(bindable);
+
+    // Before the mods, not after: whatever they ask for on load has to be
+    // there already.
+    run_searches_now("story");
+
     lua_load_mods();  // after Osi, so a mod's load-time code can call it
 
     auto free_types = next<FreeMappings>("_ZN7COsiris16FreeTypeMappingsEP11MappingInfoj");
@@ -766,6 +833,17 @@ extern "C" long _ZN7COsiris5EventEjP16COsiArgumentDesc(
 
 extern "C" long _ZNK7COsiris13NoStoryLoadedEv(void* self) {
     static auto real = next<long (*)(void*)>("_ZNK7COsiris13NoStoryLoadedEv");
+
+    // The first of these means the module has loaded and the menu is
+    // coming up, which is when bg3se writes its version line -- it does it
+    // as the client leaves GameState::LoadModule. Doing it from a timer
+    // put it long after the menu had already resolved the string.
+    static bool versioned = false;
+    if (!versioned) {
+        versioned = true;
+        scan_enable_on_this_thread();
+        if (bg3le_loca_ready()) bg3le_version_text_install();
+    }
     static std::atomic<unsigned long> calls{0};
     static double last = 0.0;
 
