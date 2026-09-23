@@ -14,6 +14,10 @@
 #include "log.h"
 #include "mem.h"
 
+extern "C" bool bg3le_scannable_region(char const* line,
+                                       unsigned long long* from,
+                                       unsigned long long* to);
+
 namespace bg3le::osi {
 namespace {
 
@@ -598,6 +602,340 @@ void dump_database_facts() {
     }
 }
 
+// ---- finding the string pool ----
+//
+// Osiris interns its strings, so a stored value is a handle. Reading one
+// back, or building one for a procedure's argument, needs the pool that
+// resolves it, and the pool is not laid out the way bg3se describes for
+// Windows. So it is found from the other end: take a string Osiris
+// certainly holds, find it in memory, and look at what points at it.
+
+// Which mapping an address falls in, for telling heap from file-backed.
+std::string mapping_of(std::uintptr_t at) {
+    std::FILE* maps = std::fopen("/proc/self/maps", "r");
+    if (maps == nullptr) return "maps unavailable";
+
+    char line[1024];
+    std::string found = "unmapped";
+    while (std::fgets(line, sizeof(line), maps) != nullptr) {
+        unsigned long long from = 0;
+        unsigned long long to = 0;
+        if (std::sscanf(line, "%llx-%llx", &from, &to) != 2) continue;
+        if (at < from || at >= to) continue;
+        found = line;
+        while (!found.empty() && (found.back() == '\n' || found.back() == ' ')) {
+            found.pop_back();
+        }
+        break;
+    }
+    std::fclose(maps);
+    return found;
+}
+
+std::vector<std::uintptr_t> find_bytes(char const* needle) {
+    std::vector<std::uintptr_t> out;
+    const std::size_t length = std::strlen(needle) + 1;  // with the NUL
+
+    std::FILE* maps = std::fopen("/proc/self/maps", "r");
+    if (maps == nullptr) return out;
+
+    constexpr std::size_t kChunk = 1u << 20;
+    std::vector<unsigned char> block(kChunk + 64);
+
+    char line[1024];
+    while (std::fgets(line, sizeof(line), maps) != nullptr
+           && out.size() < 64) {
+        unsigned long long from = 0;
+        unsigned long long to = 0;
+        if (!bg3le_scannable_region(line, &from, &to)) continue;
+
+        for (unsigned long long at = from; at < to && out.size() < 64;
+             at += kChunk) {
+            std::size_t want = (std::size_t)(to - at);
+            if (want > block.size()) want = block.size();
+            const std::size_t got =
+                safe_read_some((void const*)at, block.data(), want);
+            if (got < length) continue;
+            scan_yield();
+
+            for (std::size_t off = 0; off + length <= got; ++off) {
+                if (std::memcmp(block.data() + off, needle, length) != 0) {
+                    continue;
+                }
+                out.push_back((std::uintptr_t)(at + off));
+                if (out.size() >= 64) break;
+            }
+        }
+    }
+    std::fclose(maps);
+    return out;
+}
+
+std::vector<std::uintptr_t> find_pointers_to(std::uintptr_t wanted,
+                                             std::size_t limit) {
+    std::vector<std::uintptr_t> out;
+
+    std::FILE* maps = std::fopen("/proc/self/maps", "r");
+    if (maps == nullptr) return out;
+
+    constexpr std::size_t kChunk = 1u << 20;
+    std::vector<unsigned char> block(kChunk + 8);
+
+    char line[1024];
+    while (std::fgets(line, sizeof(line), maps) != nullptr
+           && out.size() < limit) {
+        unsigned long long from = 0;
+        unsigned long long to = 0;
+        if (!bg3le_scannable_region(line, &from, &to)) continue;
+
+        for (unsigned long long at = from; at < to && out.size() < limit;
+             at += kChunk) {
+            std::size_t want = (std::size_t)(to - at);
+            if (want > block.size()) want = block.size();
+            const std::size_t got =
+                safe_read_some((void const*)at, block.data(), want);
+            if (got < 8) continue;
+            scan_yield();
+
+            for (std::size_t off = 0; off + 8 <= got; off += 8) {
+                std::uintptr_t word = 0;
+                std::memcpy(&word, block.data() + off, sizeof(word));
+                if (word != wanted) continue;
+                out.push_back((std::uintptr_t)(at + off));
+                if (out.size() >= limit) break;
+            }
+        }
+    }
+    std::fclose(maps);
+    return out;
+}
+
+// Whether `at` holds a pointer to printable text.
+bool slot_points_at_text(std::uintptr_t at) {
+    std::uintptr_t str = 0;
+    if (!peek(at, &str) || str < 0x1000) return false;
+
+    char text[8] = {};
+    if (!safe_read(reinterpret_cast<void const*>(str), text, sizeof(text))) {
+        return false;
+    }
+    for (char ch : text) {
+        if (ch == '\0') return true;
+        if ((unsigned char)ch < 0x20 || (unsigned char)ch > 0x7e) return false;
+    }
+    return true;
+}
+
+// Candidate encodings for a string handle, given the text.
+//
+// Osiris stores a copy of the text per instance -- eleven copies of the
+// host character's UUID are in memory, eight of them in one array of
+// pointers -- so a handle is unlikely to be an index into a table of
+// unique strings. The likelier shape is something derived from the text,
+// which is testable: derive it every plausible way and look for the answer
+// among the handles the databases actually hold.
+struct Candidate {
+    char const* Name;
+    std::uint64_t Value;
+};
+
+std::vector<Candidate> handle_candidates(char const* text) {
+    const std::size_t length = std::strlen(text);
+
+    std::uint64_t fnv1a64 = 0xcbf29ce484222325ull;
+    for (std::size_t i = 0; i < length; ++i) {
+        fnv1a64 ^= (unsigned char)text[i];
+        fnv1a64 *= 0x100000001b3ull;
+    }
+
+    std::uint32_t fnv1a32 = 0x811c9dc5u;
+    for (std::size_t i = 0; i < length; ++i) {
+        fnv1a32 ^= (unsigned char)text[i];
+        fnv1a32 *= 0x01000193u;
+    }
+
+    std::uint64_t djb2 = 5381;
+    for (std::size_t i = 0; i < length; ++i) {
+        djb2 = djb2 * 33 + (unsigned char)text[i];
+    }
+
+    std::uint32_t crc = 0xffffffffu;
+    for (std::size_t i = 0; i < length; ++i) {
+        crc ^= (unsigned char)text[i];
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc >> 1) ^ (0xedb88320u & (~(crc & 1) + 1));
+        }
+    }
+    crc = ~crc;
+
+    // A GUID string also parses as two 64-bit halves, which is what
+    // DivTools::ParseGuidString returns -- a handle could just be that.
+    std::uint64_t high = 0;
+    std::uint64_t low = 0;
+    int digits = 0;
+    for (std::size_t i = 0; i < length; ++i) {
+        const char ch = text[i];
+        int value = -1;
+        if (ch >= '0' && ch <= '9') value = ch - '0';
+        if (ch >= 'a' && ch <= 'f') value = ch - 'a' + 10;
+        if (ch >= 'A' && ch <= 'F') value = ch - 'A' + 10;
+        if (value < 0) continue;
+        if (digits < 16) {
+            high = (high << 4) | (std::uint64_t)value;
+        } else {
+            low = (low << 4) | (std::uint64_t)value;
+        }
+        ++digits;
+    }
+
+    return {
+        {"fnv1a64", fnv1a64},
+        {"fnv1a32", fnv1a32},
+        {"djb2", djb2},
+        {"crc32", crc},
+        {"guid high", high},
+        {"guid low", low},
+    };
+}
+
+// Every handle the databases hold, so a derived value can be looked for
+// among them.
+std::vector<std::uint64_t> stored_handles(std::size_t limit) {
+    std::vector<std::uint64_t> out;
+    if (g_databases.First == 0) return out;
+
+    for (std::uint32_t i = 0; i < g_databases.Count && out.size() < limit;
+         ++i) {
+        std::uintptr_t db = 0;
+        if (!peek(g_databases.First + (std::uintptr_t)i * 8, &db)
+            || db < 0x1000) {
+            continue;
+        }
+
+        std::uintptr_t head = 0;
+        std::uint64_t facts = 0;
+        if (!peek(db + kFactsHead, &head) || !peek(db + kFactsCount, &facts)) {
+            continue;
+        }
+        if (facts == 0 || facts > (1u << 20) || head < 0x1000) continue;
+
+        std::uintptr_t node = head;
+        for (std::uint64_t f = 0; f < facts && out.size() < limit; ++f) {
+            std::uintptr_t values = 0;
+            std::uint64_t width = 0;
+            if (!peek(node + 0x10, &values) || !peek(node + 0x18, &width)
+                || values < 0x1000 || width == 0 || width > 32) {
+                break;
+            }
+
+            for (std::uint64_t k = 0; k < width && out.size() < limit; ++k) {
+                std::uint64_t raw = 0;
+                std::uint16_t type = 0;
+                if (!peek(values + k * 16, &raw)
+                    || !peek(values + k * 16 + 8, &type)) {
+                    break;
+                }
+                // String and GuidString, and the story's own types alias
+                // to one of them.
+                if (type == 4 || type == 5 || type >= 6) out.push_back(raw);
+            }
+
+            if (!peek(node + 0x00, &node) || node < 0x1000) break;
+        }
+    }
+    return out;
+}
+
+// The facts of one database, by the name of the function that stands for
+// it, so a handle can be paired with text that is known by other means.
+std::vector<std::uint64_t> handles_of(char const* key) {
+    std::vector<std::uint64_t> out;
+
+    auto entry = database().find(key);
+    if (entry == database().end() || entry->second.Def == 0) return out;
+
+    const std::uintptr_t node = node_for(entry->second.Def);
+    if (node == 0) return out;
+
+    std::uint32_t dbId = 0;
+    if (!peek(node + 0x18, &dbId) || dbId == 0 || dbId > g_databases.Count) {
+        return out;
+    }
+
+    std::uintptr_t db = 0;
+    if (!peek(g_databases.First + (std::uintptr_t)(dbId - 1) * 8, &db)
+        || db < 0x1000) {
+        return out;
+    }
+
+    std::uintptr_t head = 0;
+    std::uint64_t facts = 0;
+    if (!peek(db + kFactsHead, &head) || !peek(db + kFactsCount, &facts)) {
+        return out;
+    }
+    if (facts == 0 || facts > 4096 || head < 0x1000) return out;
+
+    std::uintptr_t at = head;
+    for (std::uint64_t f = 0; f < facts; ++f) {
+        std::uintptr_t values = 0;
+        std::uint64_t width = 0;
+        if (!peek(at + 0x10, &values) || !peek(at + 0x18, &width)
+            || values < 0x1000 || width == 0 || width > 32) {
+            break;
+        }
+        for (std::uint64_t k = 0; k < width; ++k) {
+            std::uint64_t raw = 0;
+            if (!peek(values + k * 16, &raw)) break;
+            out.push_back(raw);
+        }
+        if (!peek(at + 0x00, &at) || at < 0x1000) break;
+    }
+    return out;
+}
+
+void probe_string_pool(char const* text) {
+    if (text == nullptr || std::strlen(text) < 8) return;
+
+    // A database whose contents are known by other means gives the pairing
+    // this needs: whatever handle stands for the host character in a
+    // player database is the handle for this text. The names are searched
+    // for rather than guessed -- the story's own naming is not something
+    // to assume.
+    std::size_t reported = 0;
+    for (auto const& entry : database()) {
+        if (reported >= 6) break;
+        if (entry.first.rfind("DB_", 0) != 0) continue;
+        if (entry.first.find("layer") == std::string::npos
+            && entry.first.find("Party") == std::string::npos) {
+            continue;
+        }
+
+        const std::vector<std::uint64_t> handles = handles_of(entry.first.c_str());
+        if (handles.empty()) continue;
+
+        std::string shown;
+        for (std::size_t i = 0; i < handles.size() && i < 8; ++i) {
+            char one[32] = {};
+            std::snprintf(one, sizeof(one), "%#llx ",
+                          (unsigned long long)handles[i]);
+            shown += one;
+        }
+        logf("strings: %s holds %zu values: %s", entry.first.c_str(),
+             handles.size(), shown.c_str());
+        ++reported;
+    }
+
+    // And where the text itself lives, to compare against.
+    const std::vector<std::uintptr_t> places = find_bytes(text);
+    std::string addresses;
+    for (std::size_t i = 0; i < places.size() && i < 12; ++i) {
+        char one[32] = {};
+        std::snprintf(one, sizeof(one), "%#lx ", (unsigned long)places[i]);
+        addresses += one;
+    }
+    logf("strings: \"%s\" is at %s", text, addresses.c_str());
+}
+
 // Which offset holds FunctionType, decided once by agreement with the
 // engine's mapping.
 std::uintptr_t& type_offset() {
@@ -1022,6 +1360,8 @@ std::vector<Function> story_functions(std::vector<Function> const& known) {
 std::size_t story_function_count() { return g_story_functions; }
 
 std::size_t node_count() { return g_nodes.Count; }
+
+void probe_strings(char const* text) { probe_string_pool(text); }
 
 void set_handlers(void* call, void* query) {
     g_call = reinterpret_cast<Thunk6>(call);

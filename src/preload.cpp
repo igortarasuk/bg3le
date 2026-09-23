@@ -908,6 +908,22 @@ void dump_osiris_api(void* self) {
     phase("the searches");
 
     lua_load_mods();  // after Osi, so a mod's load-time code can call it
+
+    // BG3LE_PROBE_STRINGS=1: work back from a string Osiris certainly holds
+    // to the pool that interns it. The host character's UUID comes back
+    // through the DIV boundary as plain text, and the same string is in
+    // Osiris' own storage as a handle.
+    if (std::getenv("BG3LE_PROBE_STRINGS") != nullptr) {
+        std::string host;
+        std::string error;
+        lua_eval("return Osi.GetHostCharacter()", &host, &error);
+        if (!error.empty()) {
+            logf("strings: GetHostCharacter failed: %s", error.c_str());
+        } else {
+            logf("strings: host character is %s", host.c_str());
+            osi::probe_strings(host.c_str());
+        }
+    }
     phase("loading mods");
 
     const double total = now_s() - storyStarted;

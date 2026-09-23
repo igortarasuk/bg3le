@@ -75,6 +75,11 @@ std::size_t story_function_count();
 // How many nodes Osiris' node list holds, or 0 if it was not found.
 std::size_t node_count();
 
+// Looks for Osiris' string pool by working back from a string it is known
+// to hold. A diagnostic: it scans the process twice and logs what it
+// finds. BG3LE_PROBE_STRINGS=1 in the story path drives it.
+void probe_strings(char const* text);
+
 // A value crossing the boundary in either direction.
 struct Value {
     unsigned short type = kNone;
