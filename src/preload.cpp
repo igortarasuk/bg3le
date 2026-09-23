@@ -755,6 +755,8 @@ void test_requery(unsigned id, void* args) {
 // Whichever of InitGame / the first Event happens first does the work.
 void dump_osiris_api(void* self);
 
+std::atomic<bool> g_story_ready{false};
+
 void dump_once(void* self) {
     std::call_once(g_story_once, [self] {
         ensure_symbols();
@@ -766,6 +768,7 @@ void dump_once(void* self) {
         }
         dump_osiris_api(self);
         test_integer_sum();
+        g_story_ready.store(true);
     });
 }
 
@@ -1011,6 +1014,22 @@ extern "C" long _ZN7COsiris4LoadER12COsiSmartBuf(void* self, void* buf) {
     const int which = ++loads;
     double t0 = now_s();
     long rc = real != nullptr ? real(self, buf) : 0;
+    // A story loading after the first session is up means a new session:
+    // the player went back to the menu and loaded something else. Upstream
+    // resets its Lua state and reloads every mod for that; bg3le keeps
+    // what it has, because it cannot yet tell a new session from the
+    // several story loads that make up one, and resetting at the wrong
+    // moment is worse than not resetting. Said once, so the player knows
+    // to restart rather than wondering why a mod is behaving oddly.
+    if (g_story_ready.load()) {
+        static std::once_flag told;
+        std::call_once(told, [] {
+            statusf("bg3le: this session is using the Lua state and mod "
+                    "scripts from the previous one; restart the game when "
+                    "changing saves");
+        });
+    }
+
     // bg3se reports the node count here too; it is the size of the story
     // the game just loaded, and a useful thing to see change.
     if (osi::node_count() > 0) {
