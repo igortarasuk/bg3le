@@ -21,6 +21,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "inflate.h"
@@ -130,10 +133,32 @@ bool read_entry(std::FILE* f, Entry const& e, std::vector<char>* out) {
 
 }  // namespace
 
-bool pak_read(char const* path,
-              std::function<bool(char const* name)> const& accept,
-              std::function<void(char const* name, char const* data,
-                                 std::size_t size)> const& sink) {
+namespace {
+
+// One archive's file list, kept after the first read.
+//
+// Decoding it means decompressing an LZ4 block that is megabytes wide for
+// a large archive, and mod loading asks the same archive for file after
+// file: reading MCM's forty-odd Lua files re-decoded its list forty-odd
+// times, which put seconds into the level load.
+// Only small archives are kept. A mod pak holds a few hundred entries;
+// the game's own hold hundreds of thousands, at 288 bytes each, and those
+// are read once per process anyway.
+constexpr std::size_t kCacheableEntries = 8192;
+
+std::mutex g_lists_lock;
+std::map<std::string, std::vector<Entry>> g_lists;
+
+bool read_list(char const* path, std::vector<Entry>* out) {
+    {
+        std::lock_guard<std::mutex> held(g_lists_lock);
+        auto cached = g_lists.find(path);
+        if (cached != g_lists.end()) {
+            *out = cached->second;
+            return true;
+        }
+    }
+
     std::FILE* f = std::fopen(path, "rb");
     if (f == nullptr) return false;
 
@@ -225,6 +250,45 @@ bool pak_read(char const* path,
         }
         entries.push_back(e);
     }
+
+    std::fclose(f);
+    if (entries.size() <= kCacheableEntries) {
+        std::lock_guard<std::mutex> held(g_lists_lock);
+        g_lists.emplace(path, entries);
+    }
+    *out = std::move(entries);
+    return true;
+}
+
+}  // namespace
+
+bool pak_list(char const* path,
+              std::function<void(char const* name)> const& sink) {
+    std::vector<Entry> entries;
+    if (!read_list(path, &entries)) return false;
+    for (Entry const& e : entries) sink(e.Name);
+    return true;
+}
+
+bool pak_read(char const* path,
+              std::function<bool(char const* name)> const& accept,
+              std::function<void(char const* name, char const* data,
+                                 std::size_t size)> const& sink) {
+    std::vector<Entry> entries;
+    if (!read_list(path, &entries)) return false;
+
+    // Nothing wanted: no need to open the archive at all.
+    bool any = false;
+    for (Entry const& e : entries) {
+        if (accept(e.Name)) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) return true;
+
+    std::FILE* f = std::fopen(path, "rb");
+    if (f == nullptr) return false;
 
     std::vector<char> contents;
     for (Entry const& e : entries) {

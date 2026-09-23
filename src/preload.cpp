@@ -69,6 +69,8 @@ void install_game_allocator() {
 
 extern "C" void* bg3le_stats_manager();
 extern "C" std::size_t bg3le_mods_count();
+extern "C" void bg3le_mods_rescan();
+extern "C" void bg3le_pak_modules_prewarm();
 extern "C" bool bg3le_stat_origins_ready();
 extern "C" bool bg3le_loca_ready();
 extern "C" bool bg3le_templates_ready();
@@ -117,13 +119,20 @@ void run_searches_now(char const* when) {
         char const* Name;
         bool (*Ready)();
     };
+    // What a mod needs before its first line runs, and nothing more.
+    //
+    // Templates and prototypes used to be here too. They are the two
+    // searches with no recorded pointer to resolve from, so they scan
+    // every time -- fifteen seconds of story thread at level load, which
+    // is exactly the stall this list exists to avoid. They keep running on
+    // the warming thread and are ready a few seconds later; a mod that
+    // asks for one at load time waits for it there instead.
     const Step steps[] = {
+        {"paks", [] { bg3le_pak_modules_prewarm(); return true; }},
         {"loca", &bg3le_loca_ready},
         {"stats", [] { return bg3le_stats_manager() != nullptr; }},
         {"mods", [] { return bg3le_mods_count() > 0; }},
         {"origins", &bg3le_stat_origins_ready},
-        {"templates", &bg3le_templates_ready},
-        {"prototypes", &bg3le_prototypes_ready},
     };
 
     using clock = std::chrono::steady_clock;
@@ -151,6 +160,12 @@ void warm_stats_search() {
 
     std::thread([] {
         scan_enable_on_this_thread();
+
+        // The archive index first, and on this thread: it is pure file
+        // work, it does not depend on the game being up, and the only
+        // other place it could happen is the story thread during level
+        // load.
+        bg3le_pak_modules_prewarm();
 
         struct Search {
             char const* Name;
@@ -205,11 +220,6 @@ void warm_stats_search() {
         for (int attempt = 0; attempt < 120; ++attempt) {
             std::this_thread::sleep_for(std::chrono::seconds(delay));
             if (delay < 4) delay *= 2;
-
-            // Kept in place every round: the engine rebuilds the string
-            // pool while the module loads, and whichever side writes last
-            // is what the menu shows.
-            bg3le_version_text_install();
 
             bool all = true;
             for (Search& search : searches) {
@@ -438,9 +448,12 @@ void ensure_symbols() {
         // shows up, rather than polling every few seconds and losing by a
         // hair. It stops as soon as it succeeds.
         //
-        // Opt-in, and a thread of its own, because a tight scan loop is
-        // not something to inflict on a game that is not asking for it.
-        if (std::getenv("BG3LE_MENU_TEXT") != nullptr) {
+        // On by default, on a thread of its own, and it stops as soon as
+        // the line is ours: patching the repository copy before the menu
+        // resolves it does reach the screen, which an earlier round of
+        // this concluded it could not. BG3LE_MENU_TEXT=0 turns it off.
+        if (const char* menu = std::getenv("BG3LE_MENU_TEXT");
+            menu == nullptr || menu[0] != '0') {
             std::thread([] {
                 scan_enable_on_this_thread();
                 for (int attempt = 0; attempt < 2000; ++attempt) {
@@ -804,6 +817,12 @@ void dump_osiris_api(void* self) {
 
     // Before the mods, not after: whatever they ask for on load has to be
     // there already.
+    //
+    // The mod list is re-resolved first: the manager the main menu had is
+    // not necessarily the one a loaded game uses. That goes through the
+    // recorded pointers, not a scan -- forcing a scan here cost fifteen
+    // seconds of level load.
+    bg3le_mods_rescan();
     run_searches_now("story");
 
     lua_load_mods();  // after Osi, so a mod's load-time code can call it
@@ -903,6 +922,7 @@ extern "C" long _ZN7COsiris4LoadER12COsiSmartBuf(void* self, void* buf) {
     double t0 = now_s();
     long rc = real != nullptr ? real(self, buf) : 0;
     statusf("OnAfterOsirisLoad: story loaded in %.2fs", now_s() - t0);
+
     g_story_ready_at = now_s();
     start_stall_profile();
 

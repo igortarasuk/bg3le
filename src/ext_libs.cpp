@@ -35,6 +35,12 @@ namespace {
 std::chrono::steady_clock::time_point const kStart =
     std::chrono::steady_clock::now();
 
+// Defined with the archive scanning further down; a data read falls back
+// to the mod archives, and the scan is what knows where they are.
+std::vector<std::string>& mod_archives();
+std::map<std::string, std::string>& mod_files();
+void scan_mod_archives();
+
 // Where SaveFile writes and LoadFile reads by default, matching upstream's
 // PathRootType::UserProfile.
 std::string profile_root() {
@@ -254,7 +260,31 @@ extern "C" int bg3le_ext_load_file(lua_State* L) {
     if (!resolve_under(root, relative, &path)) return 0;
 
     std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (f == nullptr) return 0;
+    if (f == nullptr) {
+        // Not on disk. Upstream reads this context through the engine's
+        // virtual file system, which has the mod archives mounted, so a
+        // packed mod's file is found there -- Mod Configuration Menu
+        // reads every other mod's blueprint that way.
+        if (std::strcmp(context, "data") != 0) return 0;
+        scan_mod_archives();
+
+        auto const in = mod_files().find(relative);
+        if (in == mod_files().end()) return 0;
+
+        std::string contents;
+        bool found = false;
+        pak_read(
+            in->second.c_str(),
+            [&](char const* name) { return std::strcmp(name, relative) == 0; },
+            [&](char const*, char const* data, std::size_t size) {
+                contents.assign(data, size);
+                found = true;
+            });
+        if (!found) return 0;
+
+        lua_pushlstring(L, contents.data(), contents.size());
+        return 1;
+    }
 
     std::string contents;
     char block[65536];
@@ -327,10 +357,17 @@ struct PakModule {
     std::string Uuid;
 };
 
-std::string mods_root() {
-    const std::string root = profile_root();
-    if (root.empty()) return {};
-    return root + "/Mods";
+// Where installed mods live. The native build reads both: the profile's
+// Mods directory, which is the Windows AppData location's counterpart, and
+// the install's own Data/Mods, which is where the game keeps its unpacked
+// modules and where a Linux install is usually told to put mod paks.
+std::vector<std::string> mods_roots() {
+    std::vector<std::string> roots;
+    const std::string profile = profile_root();
+    if (!profile.empty()) roots.push_back(profile + "/Mods");
+    const std::string data = data_root();
+    if (!data.empty()) roots.push_back(data + "/Mods");
+    return roots;
 }
 
 // The module name in "Mods/<name>/ScriptExtender/Config.json", or empty.
@@ -365,32 +402,57 @@ std::string uuid_in_meta(std::string const& meta) {
 
 // Every archive in the profile's Mods directory that carries a script
 // extender module, scanned once.
+std::vector<std::string>& mod_archives() {
+    static std::vector<std::string> archives;
+    return archives;
+}
+
+// Which archive holds a given file, for the paths a mod is likely to ask
+// for by name. Only the Mods/ tree is indexed: that is where a mod keeps
+// its blueprints and configuration, it is a few thousand entries across
+// every installed mod, and indexing Public/ as well would be a hundred
+// times the memory for files nothing reads this way.
+std::map<std::string, std::string>& mod_files() {
+    static std::map<std::string, std::string> files;
+    return files;
+}
+
+std::vector<PakModule> const& pak_modules();
+
+// Builds the archive index if it has not been built yet.
+void scan_mod_archives() { (void)pak_modules(); }
+
 std::vector<PakModule> const& pak_modules() {
     static std::vector<PakModule> modules;
     static bool scanned = false;
     if (scanned) return modules;
     scanned = true;
 
-    const std::string root = mods_root();
-    if (root.empty()) return modules;
-
-    DIR* dir = opendir(root.c_str());
-    if (dir == nullptr) return modules;
-
-    std::vector<std::string> paks;
-    while (dirent* entry = readdir(dir)) {
-        const std::string name = entry->d_name;
-        if (name.size() < 5
-            || name.compare(name.size() - 4, 4, ".pak") != 0) {
-            continue;
+    std::vector<std::pair<std::string, std::string>> paks;  // root, name
+    for (std::string const& root : mods_roots()) {
+        DIR* dir = opendir(root.c_str());
+        if (dir == nullptr) continue;
+        while (dirent* entry = readdir(dir)) {
+            const std::string name = entry->d_name;
+            if (name.size() < 5
+                || name.compare(name.size() - 4, 4, ".pak") != 0) {
+                continue;
+            }
+            paks.emplace_back(root, name);
         }
-        paks.push_back(name);
+        closedir(dir);
     }
-    closedir(dir);
     std::sort(paks.begin(), paks.end());
 
-    for (std::string const& pak : paks) {
+    for (auto const& entry : paks) {
+        std::string const& root = entry.first;
+        std::string const& pak = entry.second;
         const std::string path = root + "/" + pak;
+        mod_archives().push_back(path);
+        pak_list(path.c_str(), [&](char const* name) {
+            if (std::strncmp(name, "Mods/", 5) != 0) return;
+            mod_files().emplace(name, path);
+        });
         std::vector<std::string> names;
         std::map<std::string, std::string> metas;
         pak_read(
@@ -412,19 +474,74 @@ std::vector<PakModule> const& pak_modules() {
             });
 
         for (std::string const& name : names) {
-            PakModule module{pak, name, {}};
+            PakModule module{path, name, {}};
             auto it = metas.find("Mods/" + name + "/meta.lsx");
             if (it != metas.end()) module.Uuid = uuid_in_meta(it->second);
             modules.push_back(std::move(module));
         }
     }
 
-    logf("mods: %zu script extender modules in %zu archives under %s",
-         modules.size(), paks.size(), root.c_str());
+    logf("mods: %zu script extender modules in %zu archives",
+         modules.size(), paks.size());
     return modules;
 }
 
 }  // namespace
+
+// The load order the player wrote, from modsettings.lsx.
+//
+// Not a substitute for the engine's list, which is what upstream uses and
+// what bg3le uses when it has one. It is the fallback for the case where
+// the engine has loaded no add-on at all: the mods are installed, the
+// player has enabled them, and their scripts would otherwise never run.
+extern "C" int bg3le_ext_mod_settings_order(lua_State* L) {
+    const std::string root = profile_root();
+    if (root.empty()) return 0;
+
+    const std::string path =
+        root + "/PlayerProfiles/Public/modsettings.lsx";
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) return 0;
+
+    std::string text;
+    char block[65536];
+    std::size_t got = 0;
+    while ((got = std::fread(block, 1, sizeof(block), f)) > 0) {
+        text.append(block, got);
+    }
+    std::fclose(f);
+
+    lua_newtable(L);
+    int index = 1;
+    std::size_t at = 0;
+    for (;;) {
+        // Each entry is a ModuleShortDesc; its UUID is the only field the
+        // caller needs, and the attribute name is unambiguous within one.
+        const std::size_t entry = text.find("<node id=\"ModuleShortDesc\"", at);
+        if (entry == std::string::npos) break;
+        const std::size_t end = text.find("</node>", entry);
+        const std::size_t uuid = text.find("id=\"UUID\"", entry);
+        if (uuid == std::string::npos || (end != std::string::npos && uuid > end)) {
+            at = entry + 1;
+            continue;
+        }
+        const std::size_t value = text.find("value=\"", uuid);
+        if (value == std::string::npos) break;
+        const std::size_t from = value + 7;
+        const std::size_t to = text.find('"', from);
+        if (to == std::string::npos) break;
+
+        lua_pushlstring(L, text.data() + from, to - from);
+        lua_rawseti(L, -2, index++);
+        at = end == std::string::npos ? to : end;
+    }
+    return 1;
+}
+
+// Builds the archive index ahead of time, so the story thread does not pay
+// for it during level load: reading 57 file lists is seconds of work, and
+// mod loading happens at the worst possible moment for it.
+extern "C" void bg3le_pak_modules_prewarm() { (void)pak_modules(); }
 
 // Ext._Internal.PakModules() -> { {Pak=, Name=, Uuid=}, ... }
 extern "C" int bg3le_ext_pak_modules(lua_State* L) {
@@ -449,18 +566,22 @@ extern "C" int bg3le_ext_pak_modules(lua_State* L) {
 extern "C" int bg3le_ext_pak_read(lua_State* L) {
     char const* pak = luaL_checkstring(L, 1);
     char const* entry = luaL_checkstring(L, 2);
-    if (std::strchr(pak, '/') != nullptr
-        || std::strstr(pak, "..") != nullptr) {
-        return 0;
-    }
 
-    const std::string root = mods_root();
-    if (root.empty()) return 0;
+    // Only an archive the scan itself reported, so a mod cannot name a
+    // path of its own and read anything on disk.
+    bool known = false;
+    for (PakModule const& module : pak_modules()) {
+        if (module.Pak == pak) {
+            known = true;
+            break;
+        }
+    }
+    if (!known) return 0;
 
     std::string contents;
     bool found = false;
     pak_read(
-        (root + "/" + pak).c_str(),
+        pak,
         [&](char const* name) { return std::strcmp(name, entry) == 0; },
         [&](char const*, char const* data, std::size_t size) {
             contents.assign(data, size);

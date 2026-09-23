@@ -13,6 +13,11 @@ namespace bg3le {
 //
 // Returns false if the archive could not be read at all; a file that fails
 // to decompress is skipped, not fatal.
+// Every file name in `path`, without reading any of their contents. The
+// list is decoded once per archive and kept, so this is cheap to repeat.
+bool pak_list(char const* path,
+              std::function<void(char const* name)> const& sink);
+
 bool pak_read(char const* path,
               std::function<bool(char const* name)> const& accept,
               std::function<void(char const* name, char const* data,

@@ -1135,6 +1135,7 @@ extern "C" int bg3le_ext_game_version(lua_State* L);
 extern "C" int bg3le_ext_command_line(lua_State* L);
 extern "C" int bg3le_ext_load_file(lua_State* L);
 extern "C" int bg3le_ext_pak_modules(lua_State* L);
+extern "C" int bg3le_ext_mod_settings_order(lua_State* L);
 extern "C" int bg3le_ext_pak_read(lua_State* L);
 extern "C" int bg3le_ext_save_file(lua_State* L);
 extern "C" int bg3le_ext_memory_usage(lua_State* L);
@@ -3023,6 +3024,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "ShowError");
     lua_pushcfunction(g_lua, bg3le_ext_pak_modules);
     lua_setfield(g_lua, -2, "PakModules");
+    lua_pushcfunction(g_lua, bg3le_ext_mod_settings_order);
+    lua_setfield(g_lua, -2, "ModSettingsOrder");
     lua_pushcfunction(g_lua, bg3le_ext_pak_read);
     lua_setfield(g_lua, -2, "PakRead");
     lua_pop(g_lua, 1);
@@ -3750,7 +3753,9 @@ end
 -- key dirty through the proxy.
 function Ext.Vars.GetModVariables(moduleUuid)
   local defs = mod_variable_defs[moduleUuid]
-  if defs == nil then return nil end
+  -- An empty table, not nil, for a mod that has registered none: callers
+  -- iterate the result without checking, and upstream lets them.
+  if defs == nil then return {} end
 
   local store = mod_variables[moduleUuid]
   return setmetatable({}, {
@@ -3858,6 +3863,94 @@ function Ext.Net.BroadcastMessage() no_network("BroadcastMessage") end
 function Ext.Net.PostMessageToClient() no_network("PostMessageToClient") end
 function Ext.Net.PostMessageToUser() no_network("PostMessageToUser") end
 
+-- ---- net channels ----
+--
+-- Upstream's NetChannel object, the modern replacement for
+-- RegisterNetListener: Ext.Net.CreateChannel(module, channel) returns a
+-- handle with SetHandler/SetRequestHandler and the send half.
+--
+-- Everything is delivered in this state. bg3le is the host and runs one
+-- Lua context, so a message "to the server" and a message "to a client"
+-- both arrive here; the alternative is a mod that quietly does nothing.
+-- Delivery is deferred to the next tick, as a real one would be, so a
+-- send cannot re-enter the sender.
+local net_channels = {}
+
+local NetChannel = {}
+NetChannel.__index = NetChannel
+
+-- The host is user 1, the only peer there is.
+local kHostUser = 1
+
+local function channel_deliver(self, payload, user)
+  Ext.OnNextTick(function()
+    if self.Handler == nil then return end
+    local ok, err = pcall(self.Handler, payload, user or kHostUser)
+    if not ok then
+      Ext.Log.PrintError(string.format(
+        "bg3le: handler for net channel %s failed: %s", self.Channel,
+        tostring(err)))
+    end
+  end)
+end
+
+local function channel_request(self, payload, user, callback)
+  Ext.OnNextTick(function()
+    local response = nil
+    if self.RequestHandler ~= nil then
+      local ok, result = pcall(self.RequestHandler, payload,
+                               user or kHostUser)
+      if ok then
+        response = result
+      else
+        Ext.Log.PrintError(string.format(
+          "bg3le: request handler for net channel %s failed: %s",
+          self.Channel, tostring(result)))
+      end
+    end
+    if callback ~= nil then callback(response) end
+  end)
+end
+
+function NetChannel:SetHandler(handler) self.Handler = handler end
+function NetChannel:SetRequestHandler(handler) self.RequestHandler = handler end
+
+function NetChannel:Broadcast(payload) channel_deliver(self, payload, nil) end
+function NetChannel:SendToServer(payload) channel_deliver(self, payload, nil) end
+
+function NetChannel:SendToClient(payload, user)
+  channel_deliver(self, payload, user)
+end
+
+function NetChannel:SendToUser(payload, user)
+  channel_deliver(self, payload, user)
+end
+
+function NetChannel:RequestToServer(payload, callback)
+  channel_request(self, payload, nil, callback)
+end
+
+function NetChannel:RequestToClient(payload, user, callback)
+  channel_request(self, payload, user, callback)
+end
+
+function Ext.Net.CreateChannel(module, channel)
+  if type(module) ~= "string" or type(channel) ~= "string" then
+    error("Ext.Net.CreateChannel(module, channel)", 2)
+  end
+
+  -- One object per (module, channel), so both halves of a mod that create
+  -- the same channel share a handler rather than shadowing one another.
+  local key = module .. "/" .. channel
+  local existing = net_channels[key]
+  if existing ~= nil then return existing end
+
+  local made = setmetatable({ Module = module, Channel = channel },
+                            NetChannel)
+  net_channels[key] = made
+  return made
+end
+
 -- Registered listeners are kept and dispatched locally, so a mod that
 -- talks to itself over a channel still works.
 function Ext.RegisterNetListener(channel, handler)
@@ -3885,11 +3978,146 @@ function Ext.OnNextTick(fn)
   return Ext.Timer.WaitFor(0, fn)
 end
 
-local mod_events = {}
+-- ---- mod events ----
+--
+-- A mod declares an event with Ext.RegisterModEvent(modTable, name) and
+-- everyone reaches it through Ext.ModEvents[modTable][name], which has
+-- Subscribe, Unsubscribe and Throw. The key is whatever the declaring mod
+-- passed -- upstream's own mods use the mod table name, not the UUID.
+-- ---- Ext.Events ----
+--
+-- The extender's own events, with upstream's names and the same
+-- Subscribe/Unsubscribe shape as a mod event. The ones bg3le can tell the
+-- truth about are thrown from the places that know: SessionLoading and
+-- SessionLoaded around mod loading, StatsLoaded when the stats manager is
+-- found, Tick on the server tick. The rest exist and stay silent rather
+-- than being absent, because a mod subscribing to one should not fail to
+-- load over an event that will simply never fire here.
+local kEventNames = {
+  "AfterExecuteFunctor", "BeforeDealDamage", "ControllerAxisInput",
+  "ControllerButtonInput", "DealDamage", "DealtDamage", "DoConsoleCommand",
+  "ExecuteFunctor", "FindPath", "GameStateChanged", "KeyInput",
+  "ModuleLoadStarted", "ModuleResume", "MouseButtonInput",
+  "MouseWheelInput", "NetMessage", "NetModMessage", "ResetCompleted",
+  "SessionLoaded", "SessionLoading", "Shutdown", "StatsLoaded",
+  "StatsStructureLoaded", "Tick", "ViewportResized",
+}
 
-function Ext.RegisterModEvent(modUuid, event)
-  mod_events[modUuid] = mod_events[modUuid] or {}
-  mod_events[modUuid][event] = mod_events[modUuid][event] or {}
+-- Indexing an event that was never registered yields one anyway. That is
+-- what upstream does -- Mod Configuration Menu subscribes to channels it
+-- never declares, including the one its own logger hangs off -- and the
+-- alternative is a nil index on the mod's first line.
+local ModEvent = {}
+ModEvent.__index = ModEvent
+
+local function new_mod_event(name)
+  return setmetatable({ Name = name, Handlers = {}, Once = {},
+                        NextHandle = 0 }, ModEvent)
+end
+
+local function events_of(modTable)
+  local events = rawget(Ext.ModEvents, modTable)
+  if events ~= nil then return events end
+
+  events = setmetatable({}, {
+    __index = function(self, event)
+      local made = new_mod_event(modTable .. "." .. event)
+      rawset(self, event, made)
+      return made
+    end,
+  })
+  rawset(Ext.ModEvents, modTable, events)
+  return events
+end
+
+Ext.ModEvents = setmetatable({}, {
+  __index = function(_, modTable) return events_of(modTable) end,
+})
+
+Ext.Events = setmetatable({}, {
+  -- An event upstream has that bg3le does not throw is still an event: a
+  -- mod may subscribe to it, and it simply never fires.
+  __index = function(self, name)
+    local made = new_mod_event("Ext.Events." .. name)
+    rawset(self, name, made)
+    return made
+  end,
+})
+
+for _, name in ipairs(kEventNames) do
+  local _ = Ext.Events[name]
+end
+
+-- Throws one of them. Params are whatever the caller has; upstream passes
+-- an event object whose fields the handler reads.
+function Ext._Internal.FireEvent(name, params)
+  local event = rawget(Ext.Events, name)
+  if event == nil then return end
+  event:Throw(params or {})
+end
+
+-- Anything callable, not just a function: a mod may pass a table with a
+-- __call, and upstream takes it.
+local function callable(value)
+  if type(value) == "function" then return true end
+  local meta = getmetatable(value)
+  return meta ~= nil and meta.__call ~= nil
+end
+
+-- Anything but nil is accepted, and anything that is not callable is
+-- ignored when the event fires. That is not laxness for its own sake:
+-- Mod Configuration Menu registers its server handlers by iterating a
+-- registry object, which hands Subscribe the registry's own `commands`
+-- table under the name "commands". Upstream takes it -- the mod works
+-- there -- so refusing it here would fail the load over a subscription
+-- that never fires either way.
+function ModEvent:Subscribe(handler, options)
+  if handler == nil then
+    error("ModEvent:Subscribe(handler[, options])", 2)
+  end
+  self.NextHandle = self.NextHandle + 1
+  self.Handlers[self.NextHandle] = handler
+  -- Upstream honours Once; the rest of its options are ordering hints
+  -- that only matter with several subscribers in one frame.
+  if type(options) == "table" and options.Once then
+    self.Once[self.NextHandle] = true
+  end
+  return self.NextHandle
+end
+
+function ModEvent:Unsubscribe(handle)
+  self.Handlers[handle] = nil
+  self.Once[handle] = nil
+end
+
+function ModEvent:Throw(payload)
+  -- A copy, so a handler that subscribes or unsubscribes while the event
+  -- is being delivered does not change the set mid-iteration.
+  local handles = {}
+  for handle in pairs(self.Handlers) do handles[#handles + 1] = handle end
+  table.sort(handles)
+
+  for _, handle in ipairs(handles) do
+    local handler = self.Handlers[handle]
+    if handler ~= nil and callable(handler) then
+      local ok, err = pcall(handler, payload)
+      if not ok then
+        Ext.Log.PrintError(string.format(
+          "bg3le: handler for mod event %s failed: %s", self.Name,
+          tostring(err)))
+      end
+      if self.Once[handle] then self:Unsubscribe(handle) end
+    end
+  end
+end
+
+function Ext.RegisterModEvent(modTable, event)
+  if type(modTable) ~= "string" or type(event) ~= "string" then
+    error("Ext.RegisterModEvent(modTable, event)", 2)
+  end
+
+  -- Indexing is enough: the table creates the event if it is new.
+  return events_of(modTable)[event]
 end
 
 local console_commands = {}
@@ -4049,7 +4277,7 @@ function Ext.IsClient() return false end
 -- Plain tables rather than stubs: every one of these is filled in at the
 -- end of the prelude, and a stub's __index would shadow what is put there.
 for _, name in ipairs({"Entity", "Stats", "Level", "StaticData", "Mod",
-                       "Loca", "Events", "Resource", "Template"}) do
+                       "Loca", "Resource", "Template"}) do
   if Ext[name] == nil then Ext[name] = {} end
 end
 Ext.Definition = Ext.StaticData
@@ -4197,7 +4425,16 @@ function Ext.Timer.GameTime()
   return (Ext.Timer.MonotonicTime() - first_tick) / 1000.0
 end
 
+-- Upstream's Tick carries the frame's delta; bg3le's tick is the timer
+-- pump, so that is what it reports.
+local last_tick = nil
+
 function Ext._Internal.RunTimers()
+  local now = Ext.Utils.MonotonicTime() / 1000.0
+  local delta = last_tick ~= nil and (now - last_tick) or 0.0
+  last_tick = now
+  Ext._Internal.FireEvent("Tick", { Time = { DeltaTime = delta, Time = now } })
+
   local now = Ext.Timer.MonotonicTime()
   if first_tick == nil then first_tick = now end
 
@@ -5080,11 +5317,47 @@ local function mod_table_name(config)
   return string.match(config, '"ModTable"%s*:%s*"([^"]+)"')
 end
 
+-- Mods also use plain require(), with a path relative to their own Lua
+-- directory: require("Shared/Foo/Bar") is Lua/Shared/Foo/Bar.lua inside
+-- the mod. A searcher gives them that, over the same reader the mod was
+-- loaded with, so it works for a packed mod as well as a loose one.
+local mod_readers = {}
+local loading_mod = nil
+
+local function mod_searcher(name)
+  local path = string.gsub(name, "%.", "/") .. ".lua"
+
+  -- The mod being loaded first, then any other loaded mod: a mod that
+  -- requires another mod's file is rare but legal, and upstream resolves
+  -- it the same way.
+  local order = {}
+  if loading_mod ~= nil then order[#order + 1] = loading_mod end
+  for _, reader in ipairs(mod_readers) do
+    if reader ~= loading_mod then order[#order + 1] = reader end
+  end
+
+  for _, reader in ipairs(order) do
+    local text = reader.Read("Lua/" .. path)
+    if text ~= nil then
+      local chunk, err = load(text, "@" .. path, "bt", reader.Env)
+      if chunk == nil then error(err, 0) end
+      return chunk, path
+    end
+  end
+  return "\n\tno mod file '" .. path .. "'"
+end
+
+table.insert(package.searchers, mod_searcher)
+
 -- `read` takes a path under the mod's ScriptExtender directory and returns
 -- its contents, so a loose mod and a packed one differ only in that.
 local function load_mod_from(name, uuid, read)
   local config = read("Config.json")
-  if not config then return end
+  if not config then
+    Ext.Log.PrintWarning(string.format(
+      "bg3le: %s has no readable ScriptExtender/Config.json; skipped", name))
+    return
+  end
 
   local table_name = mod_table_name(config)
   if not table_name then
@@ -5095,7 +5368,14 @@ local function load_mod_from(name, uuid, read)
   if loaded[table_name] then return end
 
   local source = read("Lua/BootstrapServer.lua")
-  if not source then return end
+  if not source then
+    -- A client-only mod. bg3le runs the server context, so there is
+    -- nothing to run here, but saying so beats silence.
+    Ext.Log.Print(string.format(
+      "bg3le: %s has no BootstrapServer.lua; nothing to run server-side",
+      name))
+    return
+  end
 
   -- A mod's globals live in its own table, as upstream's do: writing
   -- `function Foo() end` in a mod makes Mods.<ModTable>.Foo, and other mods
@@ -5109,6 +5389,11 @@ local function load_mod_from(name, uuid, read)
   -- straight to Ext.Vars and Ext.Mod, so without it they fail on line one.
   local previous = ModuleUUID
   ModuleUUID = uuid
+
+  local reader = { Name = name, Read = read, Env = env }
+  table.insert(mod_readers, reader)
+  local outer = loading_mod
+  loading_mod = reader
 
   -- Ext.Require resolves against the mod currently being loaded, as it does
   -- in bg3se.
@@ -5126,11 +5411,13 @@ local function load_mod_from(name, uuid, read)
                           "bt", env)
   if not chunk then
     ModuleUUID = previous
+    loading_mod = outer
     Ext.Log.PrintError(string.format("bg3le: %s failed to compile: %s", name, err))
     return
   end
   local ok, run_err = pcall(chunk)
   ModuleUUID = previous
+  loading_mod = outer
   if not ok then
     Ext.Log.PrintError(string.format("bg3le: %s failed to load: %s", name, run_err))
     return
@@ -5144,16 +5431,49 @@ end
 -- are skipped if absent, since that is what a disabled mod is. An empty
 -- load order means the mod list has not been found yet, and then position
 -- is unknown rather than absent -- dropping every mod would be worse.
-local function load_positions()
-  local order = Ext.Mod.GetLoadOrder()
+local function positions_of(order)
   if not order or #order == 0 then return nil end
-
   local positions = {}
   for index, uuid in ipairs(order) do positions[uuid] = index end
   return positions
 end
 
+-- Which mods to load, and in what order.
+--
+-- The engine's load order decides, as upstream's does, and anything the
+-- player enabled in modsettings.lsx that the engine did not load follows
+-- it. That second half is a deliberate divergence: the engine drops a mod
+-- from its list for reasons of its own -- a savegame's module list
+-- overrides the file, for one -- and a script mod the player installed
+-- and enabled should still run rather than vanish without a word.
+local function load_positions(modules)
+  local positions = positions_of(Ext.Mod.GetLoadOrder()) or {}
+
+  local after = 0
+  for _, at in pairs(positions) do
+    if at > after then after = at end
+  end
+
+  local extra = 0
+  for _, uuid in ipairs(Ext._Internal.ModSettingsOrder() or {}) do
+    if positions[uuid] == nil then
+      after = after + 1
+      positions[uuid] = after
+      extra = extra + 1
+    end
+  end
+
+  if extra > 0 then
+    Ext.Log.PrintWarning(string.format(
+      "bg3le: %d mods are enabled in modsettings.lsx but not in the "
+      .. "engine's load order; their scripts are loaded after it", extra))
+  end
+  return positions
+end
+
 function Ext._Internal.LoadMods()
+  Ext._Internal.FireEvent("SessionLoading")
+
   for _, root in ipairs(mod_roots()) do
     local names = Ext._Internal.ListDir(root .. "/Mods")
     if names then
@@ -5169,12 +5489,13 @@ function Ext._Internal.LoadMods()
     end
   end
 
-  local positions = load_positions()
+  local modules = Ext._Internal.PakModules()
+  local positions = load_positions(modules)
   local packed = {}
-  for _, module in ipairs(Ext._Internal.PakModules()) do
-    local at = positions and positions[module.Uuid]
-    if at or not positions then
-      module.At = at or math.maxinteger
+  for _, module in ipairs(modules) do
+    local at = positions[module.Uuid]
+    if at ~= nil then
+      module.At = at
       table.insert(packed, module)
     end
   end
@@ -5183,11 +5504,22 @@ function Ext._Internal.LoadMods()
     return a.Name < b.Name
   end)
 
+  Ext.Log.Print(string.format(
+    "bg3le: %d of %d packed script modules are in the load order",
+    #packed, #modules))
+
   for _, module in ipairs(packed) do
     local prefix = "Mods/" .. module.Name .. "/ScriptExtender/"
     load_mod_from(module.Name, module.Uuid, function(path)
       return Ext._Internal.PakRead(module.Pak, prefix .. path)
     end)
+  end
+
+  -- After every mod's bootstrap, as upstream does: a mod subscribes in
+  -- its bootstrap and expects to be called once everything is up.
+  Ext._Internal.FireEvent("SessionLoaded")
+  if Ext.Stats.Get ~= nil and Ext._Internal.StatsCount() > 0 then
+    Ext._Internal.FireEvent("StatsLoaded")
   end
 end
 -- Everything below runs last, once every module it touches exists.

@@ -25,6 +25,7 @@
 
 #include <GameDefinitions/Module.h>
 
+#include <atomic>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -122,6 +123,9 @@ struct Manager {
     Modules LoadOrder;
     Modules Available;
     void const* BaseModule{nullptr};
+    // ModManager::LoadOrderedModules' array header. The arrays above are a
+    // snapshot; the header is where the engine keeps the live one.
+    unsigned long long Header{0};
 };
 
 Manager& state() {
@@ -268,8 +272,11 @@ Modules available_after(unsigned long long header, std::size_t stride) {
     return Modules{mods, size, stride};
 }
 
-// The key the path from a static to this array header is recorded under.
-constexpr char const* kStaticKey = "mods.loadorder";
+// The keys the paths from a static to each manager's array header are
+// recorded under. There are two managers, client and server, and which of
+// them holds the session's mods depends on when you look, so both are
+// recorded and the fuller one wins.
+constexpr char const* kStaticKeys[] = {"mods.loadorder", "mods.loadorder.2"};
 
 // Builds the manager from an address claimed to be ModManager's
 // LoadOrderedModules array header. Shared between the scan and the
@@ -294,30 +301,88 @@ bool adopt(unsigned long long header) {
     m.BaseModule = base_module_before(header);
     m.Available = available_after(header, stride);
     if (m.BaseModule == nullptr || m.Available.Buffer == nullptr) return false;
+    m.Header = header;
 
     state() = m;
     return true;
 }
 
+// Re-reads the arrays from the header the search found.
+//
+// The load order is not fixed for the run: the engine builds it when a
+// level or savegame loads, and reallocates the array as it goes. Holding
+// the buffer from startup meant Ext.Mod reported the menu's thirteen base
+// modules for the whole session, and every mod the save brought in was
+// invisible -- to Ext.Mod, and to anything keyed off it, which includes
+// which mod scripts bg3le loads.
+void refresh() {
+    Manager& m = state();
+    if (m.Header == 0) return;
+
+    std::uint64_t buffer = 0;
+    std::uint32_t capacity = 0;
+    std::uint32_t size = 0;
+    auto const* at = (char const*)(std::uintptr_t)m.Header;
+    if (!read_as(at, &buffer) || !read_as(at + 8, &capacity)
+        || !read_as(at + 12, &size)) {
+        return;
+    }
+    if (size == 0 || size > 4096 || size > capacity) return;
+
+    auto const* mods = (void const*)(std::uintptr_t)buffer;
+    if (mods == m.LoadOrder.Buffer && size == m.LoadOrder.Count) return;
+
+    // The stride does not change within a build, so only the ends are
+    // checked -- a full validation here would run on every Ext.Mod call.
+    if (!array_holds(mods, 1, m.LoadOrder.Stride)) return;
+    if (!array_holds((char const*)mods + (size - 1) * m.LoadOrder.Stride, 1,
+                     m.LoadOrder.Stride)) {
+        return;
+    }
+
+    m.LoadOrder = Modules{mods, size, m.LoadOrder.Stride};
+    m.Available = available_after(m.Header, m.LoadOrder.Stride);
+    m.BaseModule = base_module_before(m.Header);
+    logf("mods: load order now holds %zu modules", m.LoadOrder.Count);
+}
+
 // The manager from the pointer chain a previous run recorded, so nothing
 // is scanned. Each candidate is validated exactly as a scanned one is.
 bool search_from_statics() {
-    const std::size_t count = bg3le_static_count(kStaticKey);
-    for (std::size_t i = 0; i < count; ++i) {
-        void* header = bg3le_static_get(kStaticKey, i);
-        if (header == nullptr) continue;
-        if (!adopt((unsigned long long)(std::uintptr_t)header)) continue;
-        logf("mods: %zu modules at %p without scanning, from recorded "
-             "static %zu of %zu", state().LoadOrder.Count,
-             state().LoadOrder.Buffer, i, count);
-        bg3le_static_confirm(kStaticKey, i);
-        return true;
+    unsigned long long best = 0;
+    std::size_t bestCount = 0;
+    std::size_t recorded = 0;
+
+    for (char const* key : kStaticKeys) {
+        const std::size_t count = bg3le_static_count(key);
+        recorded += count;
+        for (std::size_t i = 0; i < count; ++i) {
+            void* header = bg3le_static_get(key, i);
+            if (header == nullptr) continue;
+            const auto at = (unsigned long long)(std::uintptr_t)header;
+            if (!adopt(at)) continue;
+            bg3le_static_confirm(key, i);
+            if (state().LoadOrder.Count > bestCount) {
+                bestCount = state().LoadOrder.Count;
+                best = at;
+            }
+            break;
+        }
     }
-    if (count != 0) {
-        logf("mods: none of the %zu recorded statics reaches the load "
-             "order; scanning", count);
+
+    if (best == 0) {
+        if (recorded != 0) {
+            logf("mods: none of the %zu recorded statics reaches a load "
+                 "order; scanning", recorded);
+        }
+        return false;
     }
-    return false;
+
+    // adopt() left the state at whichever manager was tried last.
+    if (!adopt(best)) return false;
+    logf("mods: %zu modules at %p without scanning, from a recorded static",
+         state().LoadOrder.Count, state().LoadOrder.Buffer);
+    return true;
 }
 
 bool search() {
@@ -390,12 +455,26 @@ bool search() {
     // both are Array<Module> in the same object, GetLoadOrder means the
     // loaded ones, and picking whichever the scan reached first would
     // silently return the wrong list.
+    // Every header that validates, not the first.
+    //
+    // There are two mod managers, client and server, and which of them is
+    // populated depends on when the search runs: at the main menu only one
+    // exists, and the server's list is built when a level loads. Taking
+    // the first meant that after a save came up Ext.Mod still reported the
+    // menu's base modules, and every mod the game had loaded was missing.
     Header const* chosen = nullptr;
+    std::size_t best = 0;
     for (Header const& h : headers) {
         if (!adopt(h.At)) continue;
-        chosen = &h;
-        break;
+        const std::size_t count = state().LoadOrder.Count;
+        logf("mods: header %#llx validates with %zu modules", h.At, count);
+        if (count > best) {
+            best = count;
+            chosen = &h;
+        }
     }
+    // adopt() left the state at whichever header was tried last.
+    if (chosen != nullptr && !adopt(chosen->At)) chosen = nullptr;
 
     // Nothing validated as a whole manager, so nothing is adopted. An
     // earlier version fell back to the first header on the grounds that
@@ -418,8 +497,16 @@ bool search() {
     // covers ModManager, since a static points at the object rather than
     // at the array partway into it.
     constexpr std::uint64_t kManagerWindow = 1u << 16;
-    bg3le_static_record_path(kStaticKey, (void const*)(std::uintptr_t)chosen->At,
-                             kManagerWindow);
+    std::size_t recorded = 0;
+    for (Header const& h : headers) {
+        if (recorded >= std::size(kStaticKeys)) break;
+        if (!adopt(h.At)) continue;
+        bg3le_static_record_path(kStaticKeys[recorded],
+                                 (void const*)(std::uintptr_t)h.At,
+                                 kManagerWindow);
+        ++recorded;
+    }
+    adopt(chosen->At);
     logf("mods: %zu modules at %p, stride %zu (header at %#llx, %zu candidate "
          "headers); base module %s, %zu available", chosen->Array.Count,
          chosen->Array.Buffer, chosen->Array.Stride, chosen->At,
@@ -437,6 +524,60 @@ bool search() {
                 (char const*)chosen->Array.Buffer + i * chosen->Array.Stride);
             logf("mods:   %2zu %s", i, text != nullptr ? text : "(unresolved)");
         }
+        // ModManager::Settings.Mods -- the load order as parsed from
+        // modsettings.lsx, before the engine decided what to load. The
+        // offset is not assumed: the array is found by looking for one
+        // whose entries read as module descriptors. Comparing its length
+        // with the loaded count tells a rejected mod from one the engine
+        // never read.
+        for (std::size_t at = kArrayHeader; at <= 512; at += 8) {
+            std::uint64_t buffer = 0;
+            std::uint32_t capacity = 0;
+            std::uint32_t size = 0;
+            auto const* head = (char const*)(std::uintptr_t)(chosen->At + at);
+            if (!read_as(head, &buffer) || !read_as(head + 8, &capacity)
+                || !read_as(head + 12, &size)) {
+                continue;
+            }
+            if (buffer == 0 || size == 0 || size > 4096 || size > capacity) {
+                continue;
+            }
+
+            auto const uuid_of = [&](std::size_t i) -> char const* {
+                std::uint32_t index = 0;
+                auto const* desc =
+                    (char const*)(std::uintptr_t)buffer + i * kDescStride;
+                if (!read_as(desc + kDescUuidString, &index)) return nullptr;
+                return bg3le_fixed_string(index, nullptr);
+            };
+
+            std::size_t named = 0;
+            for (std::size_t i = 0; i < size; ++i) {
+                char const* uuid = uuid_of(i);
+                if (uuid == nullptr || std::strlen(uuid) != 36) break;
+                ++named;
+            }
+            if (named != size) continue;
+
+            logf("mods: descriptor array at +%zu holds %u entries (cap %u)",
+                 at, size, capacity);
+            for (std::size_t i = 0; i < size && i < 4; ++i) {
+                logf("mods:   +%zu[%zu] %s", at, i, uuid_of(i));
+            }
+        }
+
+        // And the mods the engine found but did not load, which is what
+        // tells a load order the engine rejected from one it never read.
+        for (std::size_t i = 0; i < found.Available.Count; ++i) {
+            auto const* module = (char const*)found.Available.Buffer
+                                 + i * found.Available.Stride;
+            char const* text = uuid_string_at(module);
+            ModInfo info{};
+            const bool ok = bg3le_mod_info(module, &info);
+            logf("mods: available %2zu %s %s", i,
+                 text != nullptr ? text : "(unresolved)",
+                 ok && info.Name != nullptr ? info.Name : "");
+        }
         dump_module(chosen->Array.Buffer, chosen->Array.Stride);
     }
     return true;
@@ -445,9 +586,30 @@ bool search() {
 // Retried rather than latched: an early failure only means the engine has not
 // built the load order yet. The warm thread calls this on a timer, so a cap
 // keeps a genuinely absent module list from rescanning memory forever.
+// Set when the game has loaded a level: the manager the menu had is not
+// necessarily the one that now holds the mods.
+std::atomic<bool> g_rescan{false};
+
 bool ready() {
     static int attempts = 0;
-    if (state().LoadOrder.Buffer != nullptr) return true;
+
+    // A rescan re-resolves from the recorded pointers and keeps whichever
+    // manager holds more modules. It deliberately does not fall back to a
+    // scan: this runs on the story thread during level load, and a scan
+    // there is fifteen seconds the player waits through.
+    if (g_rescan.exchange(false)) {
+        Manager const previous = state();
+        if (!search_from_statics()
+            || state().LoadOrder.Count < previous.LoadOrder.Count) {
+            state() = previous;
+        }
+        refresh();
+        if (state().LoadOrder.Buffer != nullptr) return true;
+    }
+    if (state().LoadOrder.Buffer != nullptr) {
+        refresh();
+        return true;
+    }
 
     // Resolving a recorded pointer is not a scan, so any thread may do it.
     if (search_from_statics()) return true;
@@ -504,6 +666,12 @@ void read_version(void const* module, std::size_t offset,
 }
 
 }  // namespace
+
+// Called when a level or savegame has loaded. The next query re-finds the
+// manager rather than trusting the one the main menu had.
+extern "C" void bg3le_mods_rescan() {
+    g_rescan.store(true);
+}
 
 extern "C" std::size_t bg3le_mods_count() {
     return ready() ? state().LoadOrder.Count : 0;

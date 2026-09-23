@@ -26,19 +26,17 @@
 // It reapplies rather than patching once, and a watcher thread catches the
 // string within a fraction of a second of it appearing.
 //
-// None of which is enough. The interface resolves this string into its own
-// copy -- rendered text is UTF-16 there -- and after that the source is
-// just data nobody reads. There is exactly one copy of the UTF-8 string in
-// the address space, it is patched correctly, and the menu shows the
-// original.
+// Timing is the whole trick. The interface resolves this string into its
+// own copy when it builds the menu, and after that the source is data
+// nobody reads -- which is why patching it eight seconds into the run did
+// nothing, and why an earlier round of this concluded the engine's own
+// update path was the only way. It is not: patch the repository copy
+// before the menu is built and the menu renders ours.
 //
-// bg3se does not edit the source. It calls
-// TranslatedStringRepository::UpdateTranslatedString, which goes through
-// the engine and takes whatever the interface caches with it. Getting
-// there needs that method's address, and no engine function in this build
-// carries a symbol -- so it needs code pattern-matching against the
-// image, the same capability the manager lookups want. Until that exists
-// this stays behind BG3LE_MENU_TEXT=1.
+// So the watcher runs from load and polls until the string appears, and
+// the replacement is allocated from the game's heap -- pointing an
+// engine-owned string at ::new memory crashed the game on close, because
+// the repository freed a pointer it had never allocated.
 
 #include <stdafx.h>
 

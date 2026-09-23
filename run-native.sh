@@ -99,9 +99,17 @@ fi
 # every wrapper inherited it -- which broke gamescope outright, because
 # src/vulkan_memory.cpp hid the device-local host-visible memory types that
 # gamescope's own renderer needs ("findMemoryType failed", no backend).
-game=(env "LD_PRELOAD=$preload"
-      "BG3LE_LOG=${BG3LE_LOG:-/tmp/bg3le.log}"
-      ./bin/bg3 "${args[@]}")
+# NOPRELOAD=1 runs the game without the extender at all. The control for
+# any question of the form "is bg3le causing this?" -- the shim is the only
+# instrument inside the process, so the comparison has to be made from
+# outside it, with tools/memgrep.
+if [ "${NOPRELOAD:-0}" = "1" ]; then
+    game=(./bin/bg3 "${args[@]}")
+else
+    game=(env "LD_PRELOAD=$preload"
+          "BG3LE_LOG=${BG3LE_LOG:-/tmp/bg3le.log}"
+          ./bin/bg3 "${args[@]}")
+fi
 
 # HEADLESS=1 runs the game inside gamescope's headless backend: a real GPU
 # and a real Vulkan swapchain, but no window on the desktop. For scripted

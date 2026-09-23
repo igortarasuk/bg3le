@@ -41,7 +41,6 @@ extern "C" bool bg3le_meta_enum_label(void const* handle, char const* path,
                                       std::size_t index, char const** label,
                                       std::uint64_t* value, bool* isBitmask);
 extern "C" std::size_t bg3le_stats_list_index_offset();
-extern "C" void bg3le_stats_functor_dump(void const* functors);
 extern "C" char const* bg3le_stats_attr_condition(int raw);
 
 namespace {
@@ -237,10 +236,6 @@ extern "C" bool bg3le_stats_functor_group_at(void const* object,
         *textKeyOut = text != nullptr ? text : "";
     }
     if (functorsOut != nullptr) *functorsOut = functors;
-    if (std::getenv("BG3LE_DUMP_FUNCTORS") != nullptr) {
-        static int dumped = 0;
-        if (dumped++ < 2) bg3le_stats_functor_dump(functors);
-    }
     return true;
 }
 

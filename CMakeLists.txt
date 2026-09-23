@@ -279,6 +279,10 @@ add_executable(symdump tools/symdump.cpp src/elf_symbols.cpp src/log.cpp)
 
 # Builds a modsettings.lsx from a directory of .paks, reusing the archive
 # reader rather than reimplementing LSPK in a script.
+# Greps another process memory, for questions that have to be answered
+# with the shim absent.
+add_executable(memgrep tools/memgrep.c)
+
 add_executable(modsettings tools/modsettings.cpp src/pak.cpp
                src/inflate.cpp src/log.cpp external/lz4/lz4.c)
 target_include_directories(modsettings PRIVATE external/lz4 src)
