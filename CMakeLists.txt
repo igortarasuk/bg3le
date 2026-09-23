@@ -140,7 +140,8 @@ list(APPEND VENDOR_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/loca.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/templates.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/prototypes.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/version_text.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/version_text.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/statics.cpp)
 
 # Kept in step with tools/vendor-exclude.txt.
 set(VENDOR_EXCLUDE

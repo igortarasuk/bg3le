@@ -58,6 +58,11 @@ extern "C" bool bg3le_scannable_region(char const* line,
 
 namespace bg3le {
 
+extern "C" void* bg3le_static_get(char const* key, std::size_t which);
+extern "C" std::size_t bg3le_static_count(char const* key);
+extern "C" void bg3le_static_confirm(char const* key, std::size_t which);
+extern "C" bool bg3le_static_record(char const* key,
+                                    void const* object);
 extern "C" char const* bg3le_fixed_string(std::uint32_t index,
                                           std::uint32_t* length);
 
@@ -785,14 +790,81 @@ bool find_object_offsets(Found const& f, std::size_t* propsOut,
     return false;
 }
 
+// Everything Ext.Stats needs, from the address of the treasure rarity run.
+//
+// Split out so it can be driven either by the scan below or by the
+// pointer a previous run recorded -- see src/vendor/statics.cpp. The
+// validation is the same either way, so a stale cache fails here rather
+// than being believed.
+bool build_from_run(unsigned long long run) {
+    ArrayRef objects{};
+    std::size_t nameOffset = 0;
+    if (!find_objects(run, &objects, &nameOffset)) return false;
+
+    Found& f = state();
+    f.Objects = objects;
+    f.NameOffset = nameOffset;
+    logf("stats: %u stats via the rarity run at %#llx", objects.Size, run);
+
+    // Attributes need three more things, each identified by content. Any
+    // of them missing leaves enumeration working and attributes reporting
+    // themselves unavailable.
+    const bool lists = find_named_array(
+        run, "Weapon", 4, 4096, 128, &f.Lists, &f.ListNameOffset,
+        "modifier lists");
+    unsigned long long poolAddr = 0;
+    if (find_string_pool(run, &f.Strings, &poolAddr)) {
+        find_value_pools(poolAddr, &f);
+    }
+    const bool values = find_named_array(
+        run, "ConstantInt", 4, 65536, 32, &f.ValueLists, &f.ValueNameOffset,
+        "modifier value lists");
+    bool offsets = false;
+    if (lists) {
+        offsets = find_modifier_name_offset(f.Lists, &f.ModifierNameOffset,
+                                            &f.AttrsOffset)
+                  && find_object_offsets(f, &f.PropsOffset,
+                                         &f.ListIndexOffset);
+    }
+    f.Attributes = lists && values && offsets;
+    logf("stats: attributes %s", f.Attributes ? "available" : "unavailable");
+    return true;
+}
+
 bool search_for_stats() {
+    // The pointer a previous run recorded, if this build has been seen
+    // before: no scan, and available the moment the engine has filled the
+    // static in. The rarity permutation is checked first, so a cache that
+    // no longer means anything is discarded rather than trusted.
+    std::uint32_t want[kRarityCount] = {};
+    const std::size_t candidates = bg3le_static_count("stats.rarities");
+    if (candidates > 0 && rarity_indices(want)) {
+        for (std::size_t i = 0; i < candidates; ++i) {
+            void* cached = bg3le_static_get("stats.rarities", i);
+            if (cached == nullptr) continue;
+
+            std::uint32_t at[kRarityCount] = {};
+            if (!safe_read(cached, at, sizeof(at))) continue;
+            if (!is_rarity_permutation(at, want)) continue;
+            if (!build_from_run((unsigned long long)(std::uintptr_t)cached)) {
+                continue;
+            }
+
+            logf("stats: found without scanning, from recorded static %zu "
+                 "of %zu", i + 1, candidates);
+            bg3le_static_confirm("stats.rarities", i);
+            return true;
+        }
+        logf("stats: none of the %zu recorded statics holds the rarity run; "
+             "scanning", candidates);
+    }
+
     if (bg3le_fixed_string(1, nullptr) == nullptr) {
         logf("stats: the string table is not available, so the rarity "
              "fingerprint cannot be read; Ext.Stats stays unavailable");
         return false;
     }
 
-    std::uint32_t want[kRarityCount] = {};
     if (!rarity_indices(want)) return false;
 
     std::FILE* maps = std::fopen("/proc/self/maps", "r");
@@ -838,42 +910,14 @@ bool search_for_stats() {
                 if (!is_rarity_permutation(v, want)) continue;
                 ++hits;
 
-                ArrayRef objects{};
-                std::size_t nameOffset = 0;
-                if (!find_objects(base + off, &objects, &nameOffset)) continue;
-
+                if (!build_from_run(base + off)) continue;
                 std::fclose(maps);
-                Found& f = state();
-                f.Objects = objects;
-                f.NameOffset = nameOffset;
-                logf("stats: %u stats found via the rarity run at %#llx "
-                     "(scanned %zu bytes over %zu regions)", objects.Size,
-                     base + off, scanned, regions);
-
-                // Attributes need three more things, each identified by
-                // content. Any of them missing leaves enumeration working
-                // and attributes reporting themselves unavailable.
-                const unsigned long long run = base + off;
-                const bool lists = find_named_array(
-                    run, "Weapon", 4, 4096, 128, &f.Lists, &f.ListNameOffset,
-                    "modifier lists");
-                unsigned long long poolAddr = 0;
-                if (find_string_pool(run, &f.Strings, &poolAddr)) {
-                    find_value_pools(poolAddr, &f);
-                }
-                const bool values = find_named_array(
-                    run, "ConstantInt", 4, 65536, 32, &f.ValueLists,
-                    &f.ValueNameOffset, "modifier value lists");
-                bool offsets = false;
-                if (lists) {
-                    offsets = find_modifier_name_offset(f.Lists, &f.ModifierNameOffset,
-                                                        &f.AttrsOffset)
-                              && find_object_offsets(f, &f.PropsOffset,
-                                                     &f.ListIndexOffset);
-                }
-                f.Attributes = lists && values && offsets;
-                logf("stats: attributes %s",
-                     f.Attributes ? "available" : "unavailable");
+                logf("stats: found by scanning %zu bytes over %zu regions",
+                     scanned, regions);
+                // Recorded so the next run reads the engine's own pointer
+                // instead of scanning for it.
+                bg3le_static_record("stats.rarities",
+                                    (void const*)(base + off));
                 return true;
             }
         }
