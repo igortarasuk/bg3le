@@ -113,9 +113,13 @@ extern "C" bool bg3le_meta_format_guid(void const* bytes, char* out,
 bool rarity_indices(std::uint32_t* out) {
     for (std::size_t i = 0; i < kRarityCount; ++i) {
         if (!bg3le_fixed_string_index_of(kRarities[i], &out[i])) {
-            logf("stats: the string table has no entry for \"%s\", so the "
-                 "rarity fingerprint cannot be built; Ext.Stats stays "
-                 "unavailable", kRarities[i]);
+            // Not fatal, and it used to read as though it were: the
+            // table is populated as the game loads, and the search runs
+            // again later. It succeeds then -- 27,821 stats -- so saying
+            // "stays unavailable" was wrong twice over.
+            logf("stats: the string table has no entry for \"%s\" yet, so "
+                 "the rarity fingerprint cannot be built; will look again "
+                 "once the engine has populated it", kRarities[i]);
             return false;
         }
     }
