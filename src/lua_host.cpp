@@ -30,7 +30,27 @@
 namespace bg3le {
 namespace {
 
+// Two Lua states, because the game is two contexts in one process and a
+// mod's BootstrapServer.lua and BootstrapClient.lua are meant not to see
+// each other: upstream runs an esv and an ecl ExtensionState, each with
+// its own Lua, its own Mods table and its own Ext.
+//
+// g_lua is whichever one the current call is running in. Everything below
+// works on "the current state", so the context is switched at the few
+// entry points -- a tick, a mod load, an evaluation from the console --
+// rather than threaded through six hundred call sites.
 lua_State* g_lua = nullptr;
+lua_State* g_server_lua = nullptr;
+lua_State* g_client_lua = nullptr;
+
+bool in_client_state() { return g_lua != nullptr && g_lua == g_client_lua; }
+
+// Ext._Internal.IsClientState() -- what Ext.IsClient()/IsServer() report,
+// since one prelude builds both states.
+int l_is_client_state(lua_State* L) {
+    lua_pushboolean(L, in_client_state() ? 1 : 0);
+    return 1;
+}
 const SymbolTable* g_symbols = nullptr;
 
 // Bound functions must outlive the closures that reference them, and the
@@ -3084,13 +3104,35 @@ void register_log(lua_State* L, const char* name, int severity) {
 
 }  // namespace
 
-void lua_init() {
-    if (g_lua != nullptr) return;
+void build_state(bool client);
 
-    g_lua = luaL_newstate();
-    if (g_lua == nullptr) {
-        logf("lua: luaL_newstate failed");
+void lua_init() {
+    if (g_server_lua != nullptr) return;
+
+    build_state(false);
+    build_state(true);
+
+    // The server context is the one the game's own threads are in unless
+    // something says otherwise.
+    g_lua = g_server_lua;
+    logf("lua: server and client contexts built");
+}
+
+void build_state(bool client) {
+    lua_State* L = luaL_newstate();
+    if (L == nullptr) {
+        logf("lua: luaL_newstate failed for the %s context",
+             client ? "client" : "server");
         return;
+    }
+
+    // Recorded before the build, so anything the prelude asks about the
+    // context during it gets the right answer.
+    g_lua = L;
+    if (client) {
+        g_client_lua = L;
+    } else {
+        g_server_lua = L;
     }
     lua_setup_cppobjects(g_lua, &cpp_alloc, &cpp_free, &cpp_get_light_metatable,
                          &cpp_get_metatable, &cpp_finalize, &cpp_canonicalize);
@@ -3156,6 +3198,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "WorldProbe");
     lua_pushcfunction(g_lua, osi_story_lookup);
     lua_setfield(g_lua, -2, "StoryFunction");
+    lua_pushcfunction(g_lua, l_is_client_state);
+    lua_setfield(g_lua, -2, "IsClientState");
     lua_pushcfunction(g_lua, l_watch_osiris);
     lua_setfield(g_lua, -2, "WatchOsiris");
     lua_pushcfunction(g_lua, l_get_field);
@@ -4603,8 +4647,10 @@ function Ext.Utils.LoadTestLibrary()
         .. "which bg3le does not ship", 2)
 end
 
-function Ext.IsServer() return true end
-function Ext.IsClient() return false end
+-- One prelude builds both states, so these answer for the state they are
+-- asked in rather than being written down.
+function Ext.IsServer() return not Ext._Internal.IsClientState() end
+function Ext.IsClient() return Ext._Internal.IsClientState() end
 
 -- Only what is still unimplemented, and only if nothing has defined it
 -- already: this used to assign unconditionally, which quietly replaced
@@ -4625,16 +4671,31 @@ Mods = {}
 -- function table on demand), so until then explain the situation rather
 -- than letting every Osiris name look like a typo.
 Osi = setmetatable({}, {__index = function(_, key)
+  if Ext.IsClient() then
+    -- Osiris runs server-side, and upstream's client state has no Osi
+    -- either. Saying which context this is beats blaming the save.
+    error(string.format(
+      "bg3le: Osi.%s is not available in the client context; Osiris is "
+      .. "server-side", key), 0)
+  end
   error(string.format(
     "bg3le: Osiris is not bound yet (no story loaded), so Osi.%s is "
     .. "unavailable -- load a save first", key), 0)
 end})
 
-setmetatable(_G, {__index = function(_, key)
-  error(string.format(
-    "bg3le: '%s' is not defined. Osiris functions become available as "
-    .. "globals once a save is loaded.", key), 0)
-end})
+-- Server-side only. This exists so an Osiris name used before a save is
+-- loaded says so instead of reading as a typo, and it is replaced by the
+-- real resolver once Osiris binds. Nothing binds Osiris in the client
+-- context, so installing it there makes it permanent -- and then the
+-- ordinary `if SomeGlobal then` raises. Mod Configuration Menu's client
+-- script does exactly that.
+if Ext.IsServer() then
+  setmetatable(_G, {__index = function(_, key)
+    error(string.format(
+      "bg3le: '%s' is not defined. Osiris functions become available as "
+      .. "globals once a save is loaded.", key), 0)
+  end})
+end
 
 _D = Ext.Dump
 _DS = Ext.DumpShallow
@@ -5805,21 +5866,22 @@ local function load_mod_from(name, uuid, read, report)
   end
   if loaded[table_name] then return end
 
-  local source = read("Lua/BootstrapServer.lua")
+  -- Each context runs its own bootstrap, as upstream does: the server
+  -- state loads BootstrapServer.lua and the client state
+  -- BootstrapClient.lua, and a mod that ships only one runs only there.
+  local boot = Ext.IsClient() and "BootstrapClient.lua" or "BootstrapServer.lua"
+  local source = read("Lua/" .. boot)
   if not source then
-    -- A client-only mod. bg3le runs the server context, so there is
-    -- nothing to run here, but saying so beats silence.
     Ext.Log.Print(string.format(
-      "bg3le: %s has no BootstrapServer.lua; nothing to run server-side",
-      name))
+      "bg3le: %s has no %s; nothing to run %s-side", name, boot,
+      Ext.IsClient() and "client" or "server"))
     return
   end
 
   -- Upstream names the script it is about to run, which is what tells you
   -- the order mods actually loaded in.
   Ext.Log.Print(string.format(
-    "Loading bootstrap script: Mods/%s/ScriptExtender/Lua/BootstrapServer.lua",
-    name))
+    "Loading bootstrap script: Mods/%s/ScriptExtender/Lua/%s", name, boot))
   local started = Ext.Utils.MonotonicTime()
 
   -- A mod's globals live in its own table, as upstream's do: writing
@@ -5862,7 +5924,7 @@ local function load_mod_from(name, uuid, read, report)
     return chunk()
   end
 
-  local chunk, err = load(source, "@" .. name .. "/BootstrapServer.lua",
+  local chunk, err = load(source, "@" .. name .. "/" .. boot,
                           "bt", env)
   if not chunk then
     ModuleUUID = previous
@@ -5882,7 +5944,7 @@ local function load_mod_from(name, uuid, read, report)
   local took = Ext.Utils.MonotonicTime() - started
   if took >= 10 then
     Ext.Log.Print(string.format(
-      "Loading BootstrapServer.lua for mod %s took %d ms", name, took))
+      "Loading %s for mod %s took %d ms", boot, name, took))
   end
   Ext.Log.Print(string.format("bg3le: loaded mod %s (Mods.%s)", name, table_name))
 end
@@ -6034,10 +6096,10 @@ function Ext._Internal.LoadMods()
       clientOnly[#clientOnly + 1] = module.Name
     end
   end
-  if #clientOnly > 0 then
-    Ext.Log.PrintWarning(string.format(
-      "bg3le: %d mods ship a BootstrapClient.lua that is not run: bg3le has "
-      .. "no client Lua context (%s)", #clientOnly,
+  if #clientOnly > 0 and Ext.IsServer() then
+    Ext.Log.Print(string.format(
+      "bg3le: %d mods also ship a BootstrapClient.lua, which the client "
+      .. "context runs after this one (%s)", #clientOnly,
       table.concat(clientOnly, ", ")))
   end
 
@@ -6722,9 +6784,50 @@ void call_internal(const char* name) {
 
 void lua_set_symbols(const SymbolTable* symbols) { g_symbols = symbols; }
 
-void lua_tick() { call_internal("RunTimers"); }
+// Runs something in one context and puts the previous one back.
+//
+// Nested use is fine and happens: a client script can be loaded while the
+// server context is the current one.
+class InContext {
+public:
+    explicit InContext(lua_State* want) : was_(g_lua) {
+        if (want != nullptr) g_lua = want;
+    }
+    ~InContext() { g_lua = was_; }
 
-void lua_load_mods() { call_internal("LoadMods"); }
+    InContext(InContext const&) = delete;
+    InContext& operator=(InContext const&) = delete;
+
+private:
+    lua_State* was_;
+};
+
+void lua_tick() {
+    {
+        InContext server(g_server_lua);
+        call_internal("RunTimers");
+    }
+    if (g_client_lua != nullptr) {
+        InContext client(g_client_lua);
+        call_internal("RunTimers");
+    }
+}
+
+// Both contexts load mods, each running the bootstrap that belongs to it.
+// The server goes first, as upstream's does: a client script that asks the
+// server for something wants a listener already registered.
+void lua_load_mods() {
+    {
+        InContext server(g_server_lua);
+        call_internal("LoadMods");
+    }
+    if (g_client_lua != nullptr) {
+        InContext client(g_client_lua);
+        call_internal("LoadMods");
+    }
+}
+
+bool lua_has_client() { return g_client_lua != nullptr; }
 
 void lua_bind_osi(const std::vector<osi::Function>& functions) {
     if (g_lua == nullptr) return;
@@ -6825,6 +6928,19 @@ setmetatable(_G, {
     statusf("Bound %d Osiris functions as Osi.* and globals (%d of them "
             "declared with more than one arity, %d events skipped)",
             bound, overloaded, events);
+}
+
+void lua_eval_in(bool client, const char* code, std::string* result,
+                 std::string* error) {
+    lua_State* want = client ? g_client_lua : g_server_lua;
+    if (want == nullptr) {
+        *error = client ? "there is no client Lua context"
+                        : "there is no server Lua context";
+        return;
+    }
+
+    InContext context(want);
+    lua_eval(code, result, error);
 }
 
 void lua_eval(const char* code, std::string* result, std::string* error) {

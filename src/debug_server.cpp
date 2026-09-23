@@ -52,6 +52,7 @@ struct Job {
     std::string code;
     std::string result;
     std::string error;
+    bool client = false;  // which Lua context to evaluate in
     bool done = false;
 };
 
@@ -183,10 +184,17 @@ void handle_client(int fd) {
 
         if (evaluate_body.empty()) continue;
 
+        // DbgEvaluate: context=1, expression=2, frame=3, flags=4. The
+        // context was parsed and ignored while there was only one Lua
+        // state; bg3lua's :client / :server have been sending it all
+        // along.
         std::string expression;
+        std::uint64_t context = 0;
         pb::Reader er(evaluate_body.data(), evaluate_body.size());
         while (er.next(&field, &wire)) {
-            if (field == 2 && wire == 2) {
+            if (field == 1 && wire == 0) {
+                er.read_varint(&context);
+            } else if (field == 2 && wire == 2) {
                 er.read_bytes(&expression);
             } else if (!er.skip(wire)) {
                 break;
@@ -196,6 +204,7 @@ void handle_client(int fd) {
         // Hand the chunk to the story thread; never touch Lua from here.
         auto job = std::make_shared<Job>();
         job->code = expression;
+        job->client = context == 1;
         {
             std::lock_guard<std::mutex> lock(g_queue_mutex);
             g_queue.push_back(job);
@@ -287,7 +296,7 @@ void debug_server_pump() {
 
         std::string result;
         std::string error;
-        lua_eval(job->code.c_str(), &result, &error);
+        lua_eval_in(job->client, job->code.c_str(), &result, &error);
 
         {
             std::lock_guard<std::mutex> lock(g_queue_mutex);

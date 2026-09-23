@@ -77,6 +77,15 @@ component's declared size with the size the engine recorded, and
   same — and only once a mod subscribes, so until then every node keeps the
   engine's own pointers. Engine-side activity reaches it too: a listener on a
   database sees the fact a procedure's own rule inserts
+- **A client Lua context as well as the server's.** The game is two contexts
+  in one process and upstream runs a Lua state for each, so bg3le does too:
+  each has its own `Ext`, its own `Mods` table, and runs the bootstrap that
+  belongs to it. Mod Configuration Menu loads on both sides and prints its
+  `[S]` and `[C]` banners; `Ext.IsClient()`/`Ext.IsServer()` answer for the
+  state they are asked in. The console switches with `:client` / `:server` —
+  the LuaDebug protocol has carried a context on every request all along.
+  Osiris is server-side, as upstream has it, and says so in the client
+  context rather than blaming the save
 - **The engine's own managers found once and remembered.** Everything located
   by content — `RPGStats`, the mod load order, the spell and status
   prototype managers — has the path from a static pointer to it recorded
@@ -159,10 +168,6 @@ component's declared size with the size the engine recorded, and
   physics and pathfinding, `Entity.Create`/`Destroy`, the atlas and resource
   managers, `GlobalSwitches`, and anything that sends over the network.
   `reference/ext-api-surface.txt` lists them with their shapes
-- **No client Lua context.** bg3le runs the server's, so a mod's
-  `BootstrapClient.lua` never runs — for a UI mod that is most of the mod.
-  The mods that ship one are named at load time rather than half-loaded in
-  silence
 - **One session per process.** The story-load work runs once, so loading a
   second save without restarting leaves Osiris bound to the first story's
   mappings and every mod's script from the first session. Upstream resets

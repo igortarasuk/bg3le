@@ -984,11 +984,12 @@ void dump_osiris_api(void* self) {
                 "databases)", story.size());
         bindable.insert(bindable.end(), story.begin(), story.end());
     } else if (osi::story_function_count() > 0) {
-        // Found in the database but not callable: a procedure is run by
-        // inserting a tuple into its node, which bg3le cannot do yet. Worth
-        // saying, because a mod calling Osi.PROC_* gets nil.
-        statusf("Osiris: %zu story-defined functions are not callable yet "
-                "(procedures and databases need node insertion)",
+        // These carry no dispatch handle, so they are not bound here: they
+        // are run by inserting a tuple into their node, and each resolves
+        // the first time its name is used. Said because the count is worth
+        // knowing, not because anything is missing.
+        statusf("Osiris: %zu story-defined functions (procedures, events and "
+                "databases), run by node insertion and resolved on first use",
                 osi::story_function_count());
     }
 

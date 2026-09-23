@@ -31,6 +31,15 @@ void lua_load_mods();
 
 // Evaluates a chunk, returning its stringified results or the error text.
 // Must be called from the story thread.
+// Evaluates in one context or the other. The console chooses: the
+// LuaDebug protocol carries a context on every request, and bg3lua's
+// :client / :server switch it.
+void lua_eval_in(bool client, const char* code, std::string* result,
+                 std::string* error);
+
+// Whether a client context exists at all.
+bool lua_has_client();
+
 void lua_eval(const char* code, std::string* result, std::string* error);
 
 }  // namespace bg3le
