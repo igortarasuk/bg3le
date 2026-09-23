@@ -17,12 +17,16 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <algorithm>
+#include <dirent.h>
+#include <map>
 #include <vector>
 
 #include "lauxlib.h"
 #include "lua.h"
 
 #include "log.h"
+#include "pak.h"
 
 namespace bg3le {
 
@@ -306,6 +310,166 @@ extern "C" int bg3le_ext_show_error(lua_State* L) {
     logf("Ext.Utils.ShowError: %s", message);
     std::fprintf(stderr, "bg3le: %s\n", message);
     return 0;
+}
+
+
+// ---- mod archives ---------------------------------------------------------
+//
+// Mods ship their Lua inside a .pak, so the loader has to read one. The
+// alternative -- loose files only -- means none of an installed mod set
+// runs, which is most of what a script extender is for.
+
+namespace {
+
+struct PakModule {
+    std::string Pak;   // file name within the profile's Mods directory
+    std::string Name;  // the folder under Mods/ inside the archive
+    std::string Uuid;
+};
+
+std::string mods_root() {
+    const std::string root = profile_root();
+    if (root.empty()) return {};
+    return root + "/Mods";
+}
+
+// The module name in "Mods/<name>/ScriptExtender/Config.json", or empty.
+std::string module_of_config(char const* entry) {
+    static char const* const kPrefix = "Mods/";
+    static char const* const kSuffix = "/ScriptExtender/Config.json";
+    const std::size_t prefix = std::strlen(kPrefix);
+    const std::size_t suffix = std::strlen(kSuffix);
+    const std::size_t len = std::strlen(entry);
+    if (len <= prefix + suffix) return {};
+    if (std::strncmp(entry, kPrefix, prefix) != 0) return {};
+    if (std::strcmp(entry + len - suffix, kSuffix) != 0) return {};
+
+    const std::string name(entry + prefix, len - prefix - suffix);
+    // One level only: "Mods/A/B/ScriptExtender/Config.json" is not a module.
+    if (name.find('/') != std::string::npos) return {};
+    return name;
+}
+
+std::string uuid_in_meta(std::string const& meta) {
+    const std::size_t info = meta.find("id=\"ModuleInfo\"");
+    if (info == std::string::npos) return {};
+    const std::size_t uuid = meta.find("id=\"UUID\"", info);
+    if (uuid == std::string::npos) return {};
+    const std::size_t value = meta.find("value=\"", uuid);
+    if (value == std::string::npos) return {};
+    const std::size_t from = value + 7;
+    const std::size_t to = meta.find('"', from);
+    if (to == std::string::npos) return {};
+    return meta.substr(from, to - from);
+}
+
+// Every archive in the profile's Mods directory that carries a script
+// extender module, scanned once.
+std::vector<PakModule> const& pak_modules() {
+    static std::vector<PakModule> modules;
+    static bool scanned = false;
+    if (scanned) return modules;
+    scanned = true;
+
+    const std::string root = mods_root();
+    if (root.empty()) return modules;
+
+    DIR* dir = opendir(root.c_str());
+    if (dir == nullptr) return modules;
+
+    std::vector<std::string> paks;
+    while (dirent* entry = readdir(dir)) {
+        const std::string name = entry->d_name;
+        if (name.size() < 5
+            || name.compare(name.size() - 4, 4, ".pak") != 0) {
+            continue;
+        }
+        paks.push_back(name);
+    }
+    closedir(dir);
+    std::sort(paks.begin(), paks.end());
+
+    for (std::string const& pak : paks) {
+        const std::string path = root + "/" + pak;
+        std::vector<std::string> names;
+        std::map<std::string, std::string> metas;
+        pak_read(
+            path.c_str(),
+            [](char const* entry) {
+                const std::size_t len = std::strlen(entry);
+                const bool meta = len >= 8
+                                  && std::strcmp(entry + len - 8, "meta.lsx")
+                                         == 0;
+                return meta || !module_of_config(entry).empty();
+            },
+            [&](char const* entry, char const* data, std::size_t size) {
+                const std::string module = module_of_config(entry);
+                if (!module.empty()) {
+                    names.push_back(module);
+                    return;
+                }
+                metas.emplace(entry, std::string(data, size));
+            });
+
+        for (std::string const& name : names) {
+            PakModule module{pak, name, {}};
+            auto it = metas.find("Mods/" + name + "/meta.lsx");
+            if (it != metas.end()) module.Uuid = uuid_in_meta(it->second);
+            modules.push_back(std::move(module));
+        }
+    }
+
+    logf("mods: %zu script extender modules in %zu archives under %s",
+         modules.size(), paks.size(), root.c_str());
+    return modules;
+}
+
+}  // namespace
+
+// Ext._Internal.PakModules() -> { {Pak=, Name=, Uuid=}, ... }
+extern "C" int bg3le_ext_pak_modules(lua_State* L) {
+    auto const& modules = pak_modules();
+    lua_createtable(L, (int)modules.size(), 0);
+    int index = 1;
+    for (PakModule const& module : modules) {
+        lua_createtable(L, 0, 3);
+        lua_pushstring(L, module.Pak.c_str());
+        lua_setfield(L, -2, "Pak");
+        lua_pushstring(L, module.Name.c_str());
+        lua_setfield(L, -2, "Name");
+        lua_pushstring(L, module.Uuid.c_str());
+        lua_setfield(L, -2, "Uuid");
+        lua_rawseti(L, -2, index++);
+    }
+    return 1;
+}
+
+// Ext._Internal.PakRead(pak, entry) -> string or nil. The archive is named
+// by file name, not path, so a mod cannot read outside the Mods directory.
+extern "C" int bg3le_ext_pak_read(lua_State* L) {
+    char const* pak = luaL_checkstring(L, 1);
+    char const* entry = luaL_checkstring(L, 2);
+    if (std::strchr(pak, '/') != nullptr
+        || std::strstr(pak, "..") != nullptr) {
+        return 0;
+    }
+
+    const std::string root = mods_root();
+    if (root.empty()) return 0;
+
+    std::string contents;
+    bool found = false;
+    pak_read(
+        (root + "/" + pak).c_str(),
+        [&](char const* name) { return std::strcmp(name, entry) == 0; },
+        [&](char const*, char const* data, std::size_t size) {
+            contents.assign(data, size);
+            found = true;
+        });
+    if (!found) return 0;
+
+    lua_pushlstring(L, contents.data(), contents.size());
+    return 1;
 }
 
 }  // namespace bg3le

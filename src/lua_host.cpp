@@ -1134,6 +1134,8 @@ extern "C" int bg3le_ext_generate_guid(lua_State* L);
 extern "C" int bg3le_ext_game_version(lua_State* L);
 extern "C" int bg3le_ext_command_line(lua_State* L);
 extern "C" int bg3le_ext_load_file(lua_State* L);
+extern "C" int bg3le_ext_pak_modules(lua_State* L);
+extern "C" int bg3le_ext_pak_read(lua_State* L);
 extern "C" int bg3le_ext_save_file(lua_State* L);
 extern "C" int bg3le_ext_memory_usage(lua_State* L);
 extern "C" int bg3le_ext_show_error(lua_State* L);
@@ -3019,6 +3021,10 @@ void lua_init() {
     lua_setfield(g_lua, -2, "GetMemoryUsage");
     lua_pushcfunction(g_lua, bg3le_ext_show_error);
     lua_setfield(g_lua, -2, "ShowError");
+    lua_pushcfunction(g_lua, bg3le_ext_pak_modules);
+    lua_setfield(g_lua, -2, "PakModules");
+    lua_pushcfunction(g_lua, bg3le_ext_pak_read);
+    lua_setfield(g_lua, -2, "PakRead");
     lua_pop(g_lua, 1);
 
     // ---- Ext.Math ----
@@ -5040,8 +5046,13 @@ function Ext.Entity.UuidToHandle(uuid) return Ext._Internal.UuidToHandle(uuid) e
 
 -- ---- mod loading ----
 --
--- Loose-file mods only: a root on the search path is a directory containing
--- Mods/<Name>/ScriptExtender/. Reading .pak archives is not implemented.
+-- Two kinds of mod: a loose directory containing Mods/<Name>/ScriptExtender/,
+-- and a .pak in the profile's Mods directory with the same tree inside it.
+-- Installed mods are almost always packed, so both have to work.
+--
+-- Packed mods load in the game's load order and only if they are in it,
+-- which is what enabling a mod means. Loose ones load regardless: they are
+-- a development convenience and never appear in modsettings.lsx.
 local loaded = {}
 
 local function read_file(path)
@@ -5069,9 +5080,10 @@ local function mod_table_name(config)
   return string.match(config, '"ModTable"%s*:%s*"([^"]+)"')
 end
 
-local function load_mod(root, name)
-  local dir = root .. "/Mods/" .. name .. "/ScriptExtender"
-  local config = read_file(dir .. "/Config.json")
+-- `read` takes a path under the mod's ScriptExtender directory and returns
+-- its contents, so a loose mod and a packed one differ only in that.
+local function load_mod_from(name, uuid, read)
+  local config = read("Config.json")
   if not config then return end
 
   local table_name = mod_table_name(config)
@@ -5082,31 +5094,43 @@ local function load_mod(root, name)
   end
   if loaded[table_name] then return end
 
-  local bootstrap = dir .. "/Lua/BootstrapServer.lua"
-  local source = read_file(bootstrap)
+  local source = read("Lua/BootstrapServer.lua")
   if not source then return end
 
+  -- A mod's globals live in its own table, as upstream's do: writing
+  -- `function Foo() end` in a mod makes Mods.<ModTable>.Foo, and other mods
+  -- reach it that way. Reads fall through to the real globals.
   Mods[table_name] = Mods[table_name] or {}
+  local env = Mods[table_name]
+  if getmetatable(env) == nil then setmetatable(env, { __index = _G }) end
+
+  -- ModuleUUID is the mod being loaded, set for the duration and cleared
+  -- after, the way bg3se's LuaLoadGameBootstrap does it. Mods pass it
+  -- straight to Ext.Vars and Ext.Mod, so without it they fail on line one.
+  local previous = ModuleUUID
+  ModuleUUID = uuid
 
   -- Ext.Require resolves against the mod currently being loaded, as it does
   -- in bg3se.
-  local lua_dir = dir .. "/Lua"
   function Ext.Require(path)
-    local text = read_file(lua_dir .. "/" .. path)
+    local text = read("Lua/" .. path)
     if not text then
       error("bg3le: Ext.Require could not read " .. path, 0)
     end
-    local chunk, err = load(text, "@" .. path)
+    local chunk, err = load(text, "@" .. path, "bt", env)
     if not chunk then error(err, 0) end
     return chunk()
   end
 
-  local chunk, err = load(source, "@" .. name .. "/BootstrapServer.lua")
+  local chunk, err = load(source, "@" .. name .. "/BootstrapServer.lua",
+                          "bt", env)
   if not chunk then
+    ModuleUUID = previous
     Ext.Log.PrintError(string.format("bg3le: %s failed to compile: %s", name, err))
     return
   end
   local ok, run_err = pcall(chunk)
+  ModuleUUID = previous
   if not ok then
     Ext.Log.PrintError(string.format("bg3le: %s failed to load: %s", name, run_err))
     return
@@ -5116,13 +5140,54 @@ local function load_mod(root, name)
   Ext.Log.Print(string.format("bg3le: loaded mod %s (Mods.%s)", name, table_name))
 end
 
+-- The game's load order, as UUID -> position. Packed mods load in it and
+-- are skipped if absent, since that is what a disabled mod is. An empty
+-- load order means the mod list has not been found yet, and then position
+-- is unknown rather than absent -- dropping every mod would be worse.
+local function load_positions()
+  local order = Ext.Mod.GetLoadOrder()
+  if not order or #order == 0 then return nil end
+
+  local positions = {}
+  for index, uuid in ipairs(order) do positions[uuid] = index end
+  return positions
+end
+
 function Ext._Internal.LoadMods()
   for _, root in ipairs(mod_roots()) do
     local names = Ext._Internal.ListDir(root .. "/Mods")
     if names then
       table.sort(names)
-      for _, name in ipairs(names) do load_mod(root, name) end
+      for _, name in ipairs(names) do
+        local dir = root .. "/Mods/" .. name .. "/ScriptExtender"
+        local meta = read_file(root .. "/Mods/" .. name .. "/meta.lsx") or ""
+        local uuid = string.match(meta,
+          'id="UUID"%s+type="[%w]+"%s+value="([^"]+)"')
+        load_mod_from(name, uuid,
+          function(path) return read_file(dir .. "/" .. path) end)
+      end
     end
+  end
+
+  local positions = load_positions()
+  local packed = {}
+  for _, module in ipairs(Ext._Internal.PakModules()) do
+    local at = positions and positions[module.Uuid]
+    if at or not positions then
+      module.At = at or math.maxinteger
+      table.insert(packed, module)
+    end
+  end
+  table.sort(packed, function(a, b)
+    if a.At ~= b.At then return a.At < b.At end
+    return a.Name < b.Name
+  end)
+
+  for _, module in ipairs(packed) do
+    local prefix = "Mods/" .. module.Name .. "/ScriptExtender/"
+    load_mod_from(module.Name, module.Uuid, function(path)
+      return Ext._Internal.PakRead(module.Pak, prefix .. path)
+    end)
   end
 end
 -- Everything below runs last, once every module it touches exists.

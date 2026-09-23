@@ -6,11 +6,15 @@
 // the Linux build carries a symbol to hook. The files themselves do say,
 // though, in their paths, so the archives are read directly.
 //
-// Only version 18 single-part archives are handled, which is every archive
-// that holds stats; the multi-part ones are textures.
+// Single-part archives of version 15, 16 and 18 are handled -- 18 is what
+// the game ships and what recent mod tools write, 15 and 16 are what older
+// mods were packed with, and one of those is the user's own. Multi-part
+// archives are textures and are skipped.
 //
 // Header, then a file list at the offset it names: uint32 count, uint32
-// compressed size, then an LZ4 block holding count fixed-size entries.
+// compressed size, then an LZ4 block holding count fixed-size entries. The
+// entry shrank in 18, from three 64-bit sizes to a 48-bit offset and two
+// 32-bit sizes, so both shapes are read into one struct.
 
 #include "pak.h"
 
@@ -19,6 +23,7 @@
 #include <cstring>
 #include <vector>
 
+#include "inflate.h"
 #include "log.h"
 
 extern "C" {
@@ -29,7 +34,6 @@ namespace bg3le {
 
 namespace {
 
-constexpr std::uint32_t kVersion = 18;
 constexpr std::size_t kHeaderSize = 40;
 
 // Guards against a corrupt header turning into a huge allocation.
@@ -38,7 +42,7 @@ constexpr std::uint32_t kMaxListBytes = 1u << 28;
 constexpr std::uint32_t kMaxFileBytes = 1u << 28;
 
 #pragma pack(push, 1)
-struct Entry {
+struct Entry18 {
     char Name[256];
     std::uint32_t OffsetLow;
     std::uint16_t OffsetHigh;
@@ -47,18 +51,42 @@ struct Entry {
     std::uint32_t SizeOnDisk;
     std::uint32_t UncompressedSize;
 };
+
+struct Entry15 {
+    char Name[256];
+    std::uint64_t Offset;
+    std::uint64_t SizeOnDisk;
+    std::uint64_t UncompressedSize;
+    std::uint32_t Part;
+    std::uint32_t Flags;
+    std::uint32_t Crc;
+    std::uint32_t Unused;
+};
 #pragma pack(pop)
 
-static_assert(sizeof(Entry) == 272, "LSPK v18 file entries are 272 bytes");
+static_assert(sizeof(Entry18) == 272, "LSPK v18 file entries are 272 bytes");
+static_assert(sizeof(Entry15) == 296, "LSPK v15 file entries are 296 bytes");
+
+// Both entry shapes, read into the form the rest of this file wants.
+struct Entry {
+    char Name[257];
+    std::uint64_t Offset;
+    std::uint64_t SizeOnDisk;
+    std::uint64_t UncompressedSize;
+    std::uint8_t Flags;
+};
 
 // The low nibble of Flags is the compression method; the rest is its level,
 // which does not matter for decoding.
 constexpr std::uint8_t kMethodMask = 0x0f;
 constexpr std::uint8_t kMethodNone = 0;
+constexpr std::uint8_t kMethodZlib = 1;
 constexpr std::uint8_t kMethodLZ4 = 2;
 
-std::uint64_t entry_offset(Entry const& e) {
-    return (std::uint64_t)e.OffsetLow | ((std::uint64_t)e.OffsetHigh << 32);
+// A name that fills the field has no terminator of its own.
+void copy_name(Entry* out, char const* name) {
+    std::memcpy(out->Name, name, 256);
+    out->Name[256] = '\0';
 }
 
 bool read_at(std::FILE* f, long offset, void* out, std::size_t size) {
@@ -71,8 +99,8 @@ bool read_entry(std::FILE* f, Entry const& e, std::vector<char>* out) {
     if (e.SizeOnDisk == 0 || e.SizeOnDisk > kMaxFileBytes) return false;
     if (e.UncompressedSize > kMaxFileBytes) return false;
 
-    std::vector<char> raw(e.SizeOnDisk);
-    if (!read_at(f, (long)entry_offset(e), raw.data(), raw.size())) {
+    std::vector<char> raw((std::size_t)e.SizeOnDisk);
+    if (!read_at(f, (long)e.Offset, raw.data(), raw.size())) {
         return false;
     }
 
@@ -83,16 +111,19 @@ bool read_entry(std::FILE* f, Entry const& e, std::vector<char>* out) {
         return true;
 
     case kMethodLZ4: {
-        out->resize(e.UncompressedSize);
+        out->resize((std::size_t)e.UncompressedSize);
         const int got = LZ4_decompress_safe(raw.data(), out->data(),
                                             (int)raw.size(),
                                             (int)out->size());
         return got == (int)e.UncompressedSize;
     }
 
+    case kMethodZlib:
+        out->resize((std::size_t)e.UncompressedSize);
+        return inflate(raw.data(), raw.size(), out->data(), out->size());
+
     default:
-        // zlib and zstd exist in the format but not in any archive that
-        // ships stats; skipped rather than half-handled.
+        // zstd exists in the format but nothing has been seen using it.
         return false;
     }
 }
@@ -115,11 +146,24 @@ bool pak_read(char const* path,
 
     std::uint32_t version = 0;
     std::uint64_t listOffset = 0;
-    std::uint16_t parts = 0;
     std::memcpy(&version, header + 4, sizeof(version));
     std::memcpy(&listOffset, header + 8, sizeof(listOffset));
-    std::memcpy(&parts, header + 38, sizeof(parts));
-    if (version != kVersion || parts != 1) {
+
+    std::size_t entrySize = 0;
+    if (version == 18) {
+        entrySize = sizeof(Entry18);
+        // Only 18 records the part count in the header; 15 and 16 keep it
+        // per entry, where a multi-part archive shows up as a part other
+        // than zero and is skipped there.
+        std::uint16_t parts = 0;
+        std::memcpy(&parts, header + 38, sizeof(parts));
+        if (parts != 1) {
+            std::fclose(f);
+            return false;
+        }
+    } else if (version == 15 || version == 16) {
+        entrySize = sizeof(Entry15);
+    } else {
         std::fclose(f);
         return false;
     }
@@ -144,29 +188,52 @@ bool pak_read(char const* path,
         return false;
     }
 
-    std::vector<Entry> entries(count);
-    const int want = (int)(count * sizeof(Entry));
-    if (LZ4_decompress_safe(packed.data(), (char*)entries.data(),
-                            (int)packed.size(), want) != want) {
+    std::vector<char> list(count * entrySize);
+    const int want = (int)list.size();
+    if (LZ4_decompress_safe(packed.data(), list.data(), (int)packed.size(),
+                            want) != want) {
         std::fclose(f);
         return false;
     }
     packed.clear();
     packed.shrink_to_fit();
 
+    std::vector<Entry> entries;
+    entries.reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        char const* at = list.data() + (std::size_t)i * entrySize;
+        Entry e{};
+        if (version == 18) {
+            Entry18 raw{};
+            std::memcpy(&raw, at, sizeof(raw));
+            if (raw.Part != 0) continue;
+            copy_name(&e, raw.Name);
+            e.Offset = (std::uint64_t)raw.OffsetLow
+                       | ((std::uint64_t)raw.OffsetHigh << 32);
+            e.SizeOnDisk = raw.SizeOnDisk;
+            e.UncompressedSize = raw.UncompressedSize;
+            e.Flags = raw.Flags;
+        } else {
+            Entry15 raw{};
+            std::memcpy(&raw, at, sizeof(raw));
+            if (raw.Part != 0) continue;
+            copy_name(&e, raw.Name);
+            e.Offset = raw.Offset;
+            e.SizeOnDisk = raw.SizeOnDisk;
+            e.UncompressedSize = raw.UncompressedSize;
+            e.Flags = (std::uint8_t)raw.Flags;
+        }
+        entries.push_back(e);
+    }
+
     std::vector<char> contents;
     for (Entry const& e : entries) {
-        // A name that fills the field has no terminator of its own.
-        char name[sizeof(e.Name) + 1];
-        std::memcpy(name, e.Name, sizeof(e.Name));
-        name[sizeof(e.Name)] = '\0';
-
-        if (!accept(name)) continue;
+        if (!accept(e.Name)) continue;
         if (!read_entry(f, e, &contents)) {
-            logf("pak: %s: could not read %s", path, name);
+            logf("pak: %s: could not read %s", path, e.Name);
             continue;
         }
-        sink(name, contents.data(), contents.size());
+        sink(e.Name, contents.data(), contents.size());
     }
 
     std::fclose(f);

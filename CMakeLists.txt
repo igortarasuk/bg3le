@@ -253,6 +253,7 @@ add_library(bg3le SHARED
     src/win_compat.cpp
     src/affinity.cpp
     src/vulkan_memory.cpp
+    src/inflate.cpp
     src/pak.cpp
     src/math.cpp
     src/ext_libs.cpp
@@ -275,3 +276,9 @@ target_link_options(bg3le PRIVATE -Wl,--warn-unresolved-symbols)
 target_compile_options(bg3le PRIVATE -Wall -Wextra -fvisibility=default)
 
 add_executable(symdump tools/symdump.cpp src/elf_symbols.cpp src/log.cpp)
+
+# Builds a modsettings.lsx from a directory of .paks, reusing the archive
+# reader rather than reimplementing LSPK in a script.
+add_executable(modsettings tools/modsettings.cpp src/pak.cpp
+               src/inflate.cpp src/log.cpp external/lz4/lz4.c)
+target_include_directories(modsettings PRIVATE external/lz4 src)
