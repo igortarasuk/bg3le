@@ -17,8 +17,19 @@ enum ValueType : unsigned short {
     kGuidString = 5,
 };
 
-// The low 3 bits of a function id give its kind.
-enum Kind { kCall = 1, kQuery = 2, kEvent = 3 };
+// The low 3 bits of a function id give its kind. 1-3 are the engine's own
+// functions; the rest belong to the story -- a Proc_* a mod calls is kind
+// 5, a user query kind 8.
+enum Kind {
+    kCall = 1,
+    kQuery = 2,
+    kEvent = 3,
+    kDatabase = 4,
+    kProc = 5,
+    kSysQuery = 6,
+    kSysCall = 7,
+    kUserQuery = 8,
+};
 
 struct Function {
     std::string name;
@@ -31,11 +42,22 @@ struct Function {
     int out_params = -1;
 
     Kind kind() const { return static_cast<Kind>(id & 7); }
+
+    // Which of the two dispatch handlers runs it.
+    bool is_query() const {
+        const Kind k = kind();
+        return k == kQuery || k == kSysQuery || k == kUserQuery;
+    }
 };
 
 // Reads out-parameter counts from Osiris' own function database, keyed by
 // name. Returns the number recovered, or 0 if the walk failed.
 std::size_t load_out_param_counts(std::vector<Function>* functions);
+
+// The functions the story itself defines -- procedures, user queries and
+// databases -- which the engine's own mapping does not list. `known` is
+// what that mapping gave, so the same function is not returned twice.
+std::vector<Function> story_functions(std::vector<Function> const& known);
 
 // A value crossing the boundary in either direction.
 struct Value {

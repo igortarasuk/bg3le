@@ -5389,6 +5389,10 @@ local function load_mod_from(name, uuid, read)
   -- straight to Ext.Vars and Ext.Mod, so without it they fail on line one.
   local previous = ModuleUUID
   ModuleUUID = uuid
+  -- And in the mod's own table, where it outlives the load: upstream's
+  -- mods read Mods[other].ModuleUUID to identify each other, and Mod
+  -- Configuration Menu warns about every mod that has none.
+  env.ModuleUUID = uuid
 
   local reader = { Name = name, Read = read, Env = env }
   table.insert(mod_readers, reader)

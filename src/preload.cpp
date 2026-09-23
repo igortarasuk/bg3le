@@ -813,6 +813,17 @@ void dump_osiris_api(void* self) {
     statusf("Signature walk: resolved out-params for %zu of %zu functions",
             typed, bindable.size());
 
+    // The story's own procedures, user queries and databases. The engine's
+    // mapping lists only what the engine implements; everything a goal
+    // script declares -- Proc_CharacterFullRestore and the rest of what
+    // mods actually call -- lives in Osiris' function database instead.
+    std::vector<osi::Function> const story = osi::story_functions(bindable);
+    if (!story.empty()) {
+        statusf("Osiris: %zu story-defined functions (procedures, queries, "
+                "databases)", story.size());
+        bindable.insert(bindable.end(), story.begin(), story.end());
+    }
+
     lua_bind_osi(bindable);
 
     // Before the mods, not after: whatever they ask for on load has to be
