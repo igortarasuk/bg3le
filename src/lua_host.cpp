@@ -1096,6 +1096,9 @@ extern "C" std::size_t bg3le_templates_count();
 extern "C" char const* bg3le_templates_id_at(std::size_t index);
 extern "C" void* bg3le_templates_find(char const* id);
 extern "C" char const* bg3le_templates_type(char const* id);
+extern "C" void* bg3le_prototype_find(int kind, char const* name);
+extern "C" std::size_t bg3le_prototype_count(int kind);
+extern "C" char const* bg3le_prototype_name_at(int kind, std::size_t index);
 extern "C" char const* bg3le_stats_attr_condition(int raw);
 extern "C" char const* bg3le_stats_ai_flags(void const* object);
 extern "C" char const* bg3le_stats_enum_label(char const* enumeration,
@@ -1738,6 +1741,29 @@ int l_stats_list_attrs(lua_State* L) {
         lua_setfield(L, -2, "Name");
         lua_pushstring(L, type != nullptr ? type : "");
         lua_setfield(L, -2, "Type");
+        lua_rawseti(L, -2, (int)i + 1);
+    }
+    return 1;
+}
+
+// Ext._Internal.PrototypeFind(kind, name) -> address; 0 spell, 1 status.
+int l_prototype_find(lua_State* L) {
+    void* at = bg3le_prototype_find((int)luaL_checkinteger(L, 1),
+                                    luaL_checkstring(L, 2));
+    if (at == nullptr) return 0;
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)at);
+    return 1;
+}
+
+// Ext._Internal.PrototypeNames(kind) -> { name, ... }
+int l_prototype_names(lua_State* L) {
+    const int kind = (int)luaL_checkinteger(L, 1);
+    const std::size_t count = bg3le_prototype_count(kind);
+    lua_createtable(L, (int)count, 0);
+    for (std::size_t i = 0; i < count; ++i) {
+        char const* name = bg3le_prototype_name_at(kind, i);
+        if (name == nullptr) break;
+        lua_pushstring(L, name);
         lua_rawseti(L, -2, (int)i + 1);
     }
     return 1;
@@ -2883,6 +2909,10 @@ void lua_init() {
     lua_setfield(g_lua, -2, "StatsEnumIndex");
     lua_pushcfunction(g_lua, l_stats_list_attrs);
     lua_setfield(g_lua, -2, "StatsListAttrs");
+    lua_pushcfunction(g_lua, l_prototype_find);
+    lua_setfield(g_lua, -2, "PrototypeFind");
+    lua_pushcfunction(g_lua, l_prototype_names);
+    lua_setfield(g_lua, -2, "PrototypeNames");
     lua_pushcfunction(g_lua, l_template_find);
     lua_setfield(g_lua, -2, "TemplateFind");
     lua_pushcfunction(g_lua, l_template_ids);
@@ -5204,11 +5234,45 @@ Ext.Stats.PrepareFunctorParams = needs(
   "Ext.Stats.PrepareFunctorParams needs the engine's functor execution "
   .. "context")
 
-for _, kind in ipairs({"Spell", "Status", "Passive", "Boost", "Interrupt"}) do
-  Ext.Stats["GetCached" .. kind] = needs(
-    "Ext.Stats.GetCached" .. kind .. " needs the engine's " .. kind
-    .. " prototype manager, which bg3le has not located")
+-- A prototype is the engine's parsed form of a stat: the stats object says
+-- what the .txt said, the prototype is what the engine runs. The spell and
+-- status managers are found by validating each candidate against its own
+-- contents; see src/vendor/prototypes.cpp.
+local PROTOTYPE_KIND = {Spell = 0, Status = 1}
+
+local function cached_prototype(kind, class)
+  return function(name)
+    if type(name) ~= "string" then return nil end
+    -- An empty table means the search has not published yet. Saying so
+    -- beats nil, which a caller cannot tell from "no such spell".
+    if #Ext._Internal.PrototypeNames(PROTOTYPE_KIND[kind]) == 0 then
+      error("bg3le: the " .. kind:lower() .. " prototype manager has not "
+            .. "been found yet", 2)
+    end
+    local address = Ext._Internal.PrototypeFind(PROTOTYPE_KIND[kind], name)
+    if address == nil then return nil end
+    return Ext._Internal.ReadObject(address, class, "", {})
+  end
 end
+
+Ext.Stats.GetCachedSpell = cached_prototype("Spell", "SpellPrototype")
+Ext.Stats.GetCachedStatus = cached_prototype("Status", "StatusPrototype")
+
+-- Passives and interrupts store their prototypes inline in the map rather
+-- than behind a pointer, and boosts are keyed by GUID; none of the three
+-- can be validated the way the other two are -- there is no pointer to
+-- follow and check the name of -- so they are not guessed at.
+Ext.Stats.GetCachedPassive = needs(
+  "Ext.Stats.GetCachedPassive needs the passive prototype manager, whose "
+  .. "map stores prototypes inline rather than behind a pointer, so the "
+  .. "self-check the spell and status maps allow does not apply")
+Ext.Stats.GetCachedInterrupt = needs(
+  "Ext.Stats.GetCachedInterrupt needs the interrupt prototype manager, "
+  .. "whose map stores prototypes inline rather than behind a pointer")
+Ext.Stats.GetCachedBoost = needs(
+  "Ext.Stats.GetCachedBoost needs the boost prototype manager, whose map "
+  .. "is keyed by GUID rather than by a name that could be checked "
+  .. "against the prototype")
 
 -- ---- the rest of Ext.Entity ----
 

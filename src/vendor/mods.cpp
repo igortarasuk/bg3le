@@ -180,6 +180,7 @@ void scan_memory(Visit visit) {
             if (want > kChunk + kOverlap) want = kChunk + kOverlap;
             const std::size_t got =
                 safe_read_some((void const*)base, block.data(), want);
+            scan_yield();
             if (got < kOverlap) continue;
             visit(base, block.data(), got);
         }
@@ -388,6 +389,9 @@ bool search() {
 // built the load order yet. The warm thread calls this on a timer, so a cap
 // keeps a genuinely absent module list from rescanning memory forever.
 bool ready() {
+    // Only the warming thread scans; see mem.h.
+    if (state().LoadOrder.Buffer == nullptr && !scan_allowed()) return false;
+
     static int attempts = 0;
     if (state().LoadOrder.Buffer != nullptr) return true;
     if (attempts >= 40) return false;

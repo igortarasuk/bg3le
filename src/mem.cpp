@@ -1,3 +1,6 @@
+#include <chrono>
+#include <thread>
+
 #include "mem.h"
 
 #include <sys/uio.h>
@@ -53,3 +56,20 @@ bool safe_cstr(const void* addr, char* buf, std::size_t buf_size) {
 }
 
 }  // namespace bg3le
+
+void scan_yield() {
+    // One millisecond every sixteen chunks -- sixteen megabytes. Over a
+    // four gigabyte scan that is a quarter of a second added, and it is
+    // the difference between the game ticking and not.
+    static thread_local unsigned chunks = 0;
+    if (++chunks % 16 != 0) return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+
+namespace {
+thread_local bool g_scan_allowed = false;
+}
+
+void scan_enable_on_this_thread() { g_scan_allowed = true; }
+
+bool scan_allowed() { return g_scan_allowed; }

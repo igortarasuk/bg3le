@@ -246,6 +246,7 @@ bool build() {
             if (want > kChunk + kObject) want = kChunk + kObject;
             const std::size_t got =
                 safe_read_some((void const*)base, block.data(), want);
+            scan_yield();
             if (got < kObject) continue;
 
             for (std::size_t off = 0; off + kObject <= got; off += 8) {
@@ -324,6 +325,9 @@ bool build() {
 }
 
 bool ready() {
+    // Only the warming thread scans; see mem.h.
+    if (!state().Built && !scan_allowed()) return false;
+
     if (state().Built) return true;
 
     static int attempts = 0;

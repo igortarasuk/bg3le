@@ -23,3 +23,23 @@ bool safe_cstr(const void* addr, char* buf, std::size_t buf_size);
 std::size_t safe_read_some(const void* addr, void* out, std::size_t n);
 
 }  // namespace bg3le
+
+// Called once per chunk by anything scanning the whole address space.
+//
+// These scans run on a background thread but they are not free to the rest
+// of the process: every read is a process_vm_readv, which takes the mmap
+// lock, and millions of them back to back leave the game blocked on its
+// own allocations -- its threads sitting idle rather than busy, unable to
+// tick at all. Pausing briefly every so often lets that drain.
+void scan_yield();
+
+// Whole-address-space scans are allowed on the warming thread and nowhere
+// else.
+//
+// Without this a search that has not finished yet gets run by whichever
+// thread asks first -- and that is the story thread, which then spends a
+// minute in process_vm_readv while the game stops ticking. A search that
+// is not ready reports itself unavailable instead, and the warming thread
+// fills it in.
+void scan_enable_on_this_thread();
+bool scan_allowed();

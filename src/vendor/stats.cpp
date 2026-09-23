@@ -821,6 +821,7 @@ bool search_for_stats() {
             const std::size_t got =
                 safe_read_some((void const*)base, block.data(), span);
             if (got < kRunBytes) continue;
+            scan_yield();
             scanned += got;
 
             const std::size_t last = got - kRunBytes;

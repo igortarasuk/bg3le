@@ -30,6 +30,7 @@
 #include "mods.h"
 
 #include "../log.h"
+#include "../mem.h"
 #include "../pak.h"
 
 namespace bg3le {
@@ -203,6 +204,9 @@ bool build() {
 }
 
 bool ready() {
+    // Only the warming thread scans; see mem.h.
+    if (!state().Built && !scan_allowed()) return false;
+
     if (state().Built) return true;
     static int attempts = 0;
     if (attempts >= 40) return false;

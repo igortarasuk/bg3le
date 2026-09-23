@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "../log.h"
+#include "../mem.h"
 #include "../pak.h"
 
 namespace bg3le {
@@ -230,6 +231,9 @@ bool build() {
 }
 
 bool ready() {
+    // Only the warming thread scans; see mem.h.
+    if (!state().Built && !scan_allowed()) return false;
+
     if (state().Built) return true;
 
     // The archives do not change while the game runs, so one attempt

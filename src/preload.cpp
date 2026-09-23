@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -71,6 +72,7 @@ extern "C" std::size_t bg3le_mods_count();
 extern "C" bool bg3le_stat_origins_ready();
 extern "C" bool bg3le_loca_ready();
 extern "C" bool bg3le_templates_ready();
+extern "C" bool bg3le_prototypes_ready();
 
 // Finds the stats manager on a thread of our own.
 //
@@ -82,30 +84,99 @@ extern "C" bool bg3le_templates_ready();
 //
 // Detached on purpose: nothing waits on the result, and a failure only means
 // Ext.Stats reports itself unavailable.
+// Finds the structures Ext.* reads, on a thread of our own.
+//
+// Each of these is a scan of the process's own memory, and there are now
+// six of them. Run eagerly on a fixed five-second cadence they were
+// scanning gigabytes forty times over during startup, which left the game
+// idle and unable to tick -- the debugger could not get a story thread at
+// all. So: ordered by dependency, backed off between attempts, and given
+// up on early.
+//
+// Detached on purpose: nothing waits on the result, and a failure only
+// means the module in question reports itself unavailable.
 void warm_stats_search() {
+    // BG3LE_NO_WARM=1 skips every search, so a problem can be told apart
+    // from the searches that look for the structures behind them.
+    if (std::getenv("BG3LE_NO_WARM") != nullptr) {
+        logf("warm: skipped (BG3LE_NO_WARM)");
+        return;
+    }
+
     std::thread([] {
-        bool stats = false;
-        bool mods = false;
-        bool origins = false;
-        bool loca = false;
-        bool templates = false;
+        scan_enable_on_this_thread();
+
+        struct Search {
+            char const* Name;
+            bool (*Ready)();
+            bool Done;
+            bool NeedsStats;
+        };
+
+        Search searches[] = {
+            {"stats", [] { return bg3le_stats_manager() != nullptr; },
+             false, false},
+            {"mods", [] { return bg3le_mods_count() > 0; }, false, false},
+            // Which mod defines a stat needs the load order first.
+            {"origins", &bg3le_stat_origins_ready, false, false},
+            // Reads the archives rather than memory, so it is cheap and
+            // settles on the first attempt.
+            {"loca", &bg3le_loca_ready, false, false},
+            {"templates", &bg3le_templates_ready, false, false},
+            // Classifying the prototype maps asks the stats what their
+            // names are, so there is no point before stats is up.
+            {"prototypes", &bg3le_prototypes_ready, false, true},
+        };
+
+        bool statsReady = false;
+        bool modsReady = false;
+
+        // Five seconds, then ten, twenty and forty: a search that has not
+        // succeeded by then is waiting on data the game has not built, and
+        // rescanning every five seconds only takes cycles from the game.
+        // Enough rounds for every search to get several turns: one
+        // search runs per round, and one that needs another to finish
+        // first has to wait for it. Six rounds meant the prototype search
+        // never got a turn at all, and the first Lua call for it then ran
+        // the scan on the story thread.
+        int delay = 5;
         for (int attempt = 0; attempt < 40; ++attempt) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            if (!stats) stats = bg3le_stats_manager() != nullptr;
-            // The module list is found the same way and costs the same two
-            // memory scans, so it warms here rather than stalling the story
-            // thread on whichever Ext.Mod call happens to come first.
-            if (!mods) mods = bg3le_mods_count() > 0;
-            // Which mod defines each stat comes from the archives, which
-            // means file IO and LZ4 -- off the story thread like the rest.
-            // It needs the load order, so it follows the module search.
-            if (mods && !origins) origins = bg3le_stat_origins_ready();
-            // The translated strings are a memory scan like the others.
-            if (!loca) loca = bg3le_loca_ready();
-            if (!templates) templates = bg3le_templates_ready();
-            if (stats && mods && origins && loca && templates) return;
+            std::this_thread::sleep_for(std::chrono::seconds(delay));
+            if (delay < 10) delay *= 2;
+
+            bool all = true;
+            for (Search& search : searches) {
+                if (search.Done) continue;
+                if (search.NeedsStats && !statsReady) {
+                    all = false;
+                    continue;
+                }
+                // One search per round, so a round cannot be six scans
+                // back to back.
+                search.Done = search.Ready();
+                if (!search.Done) all = false;
+                if (std::strcmp(search.Name, "stats") == 0) {
+                    statsReady = search.Done;
+                }
+                if (std::strcmp(search.Name, "mods") == 0) {
+                    modsReady = search.Done;
+                }
+                break;
+            }
+
+            for (Search const& search : searches) {
+                if (!search.Done) all = false;
+            }
+            if (all) return;
         }
-        logf("stats: gave up warming the search after 40 attempts");
+
+        for (Search const& search : searches) {
+            if (!search.Done) {
+                logf("warm: gave up looking for %s; the Ext.* functions "
+                     "that need it will report themselves unavailable",
+                     search.Name);
+            }
+        }
     }).detach();
 }
 
