@@ -407,7 +407,7 @@ void install_tick_hook() {
     if (hook_slot(kUpdateMessagesSlot, kUpdateMessagesFunc,
                   reinterpret_cast<void*>(&update_messages_hook), &original)) {
         g_orig_update_messages = reinterpret_cast<UpdateMessagesProc>(original);
-        statusf("Hooked server tick via slot 0x%lx",
+        statusf("Hooked server tick at the vtable slot in image+%#lx",
                 (unsigned long)kUpdateMessagesSlot);
     } else {
         statusf("WARNING: server tick hook refused; the prompt will stall "
@@ -423,8 +423,8 @@ void ensure_symbols() {
         }
         statusf("bg3le attached to %s", g_symbols.path().c_str());
         statusf("Extender runtime log written to '%s'", log_path());
-        statusf("Resolved %zu symbols (load bias 0x%lx)", g_symbols.count(),
-                g_symbols.bias());
+        statusf("Read %zu symbols from the executable's table "
+                "(load bias 0x%lx)", g_symbols.count(), g_symbols.bias());
 
         // The engine names every ECS type index, so the whole registry comes
         // straight out of the symbol table.
@@ -830,10 +830,13 @@ void dump_osiris_api(void* self) {
         "_ZNK7COsiris21GetStoryVersionStringEPc");
     if (version != nullptr) version(self, storyVersion);
 
-    const std::size_t typed =
-        osi::load_out_param_counts(&bindable, storyVersion);
-    statusf("Signature walk: resolved out-params for %zu of %zu functions",
-            typed, bindable.size());
+    bool signaturesCached = false;
+    const std::size_t typed = osi::load_out_param_counts(
+        &bindable, storyVersion, &signaturesCached);
+    statusf("Osiris signatures: out-params for %zu of %zu functions, %s",
+            typed, bindable.size(),
+            signaturesCached ? "from the store for this story"
+                             : "by walking the function database");
     phase("the signature walk");
 
     // The story's own procedures, user queries and databases. The engine's
@@ -846,6 +849,13 @@ void dump_osiris_api(void* self) {
         statusf("Osiris: %zu story-defined functions (procedures, queries, "
                 "databases)", story.size());
         bindable.insert(bindable.end(), story.begin(), story.end());
+    } else if (osi::story_function_count() > 0) {
+        // Found in the database but not callable: a procedure is run by
+        // inserting a tuple into its node, which bg3le cannot do yet. Worth
+        // saying, because a mod calling Osi.PROC_* gets nil.
+        statusf("Osiris: %zu story-defined functions are not callable yet "
+                "(procedures and databases need node insertion)",
+                osi::story_function_count());
     }
 
     lua_bind_osi(bindable);
@@ -962,9 +972,14 @@ extern "C" long _ZNK7COsiris13NoStoryLoadedEv(void* self) {
 extern "C" long _ZN7COsiris4LoadER12COsiSmartBuf(void* self, void* buf) {
     static auto real = next<long (*)(void*, void*)>("_ZN7COsiris4LoadER12COsiSmartBuf");
     debug_server_note_story_thread();
+    // The engine calls this more than once per session -- the base story and
+    // then the save's own -- so the line says which, rather than looking
+    // like the same event logged twice.
+    static int loads = 0;
+    const int which = ++loads;
     double t0 = now_s();
     long rc = real != nullptr ? real(self, buf) : 0;
-    statusf("OnAfterOsirisLoad: story loaded in %.2fs", now_s() - t0);
+    statusf("COsiris::Load #%d: story loaded in %.2fs", which, now_s() - t0);
 
     g_story_ready_at = now_s();
     start_stall_profile();
@@ -991,9 +1006,9 @@ extern "C" long _ZN7COsiris7CompileEPKwS1_(void* self, const wchar_t* a, const w
 extern "C" long _ZN7COsiris5MergeEPKw(void* self, const wchar_t* a) {
     static auto real = next<long (*)(void*, const wchar_t*)>("_ZN7COsiris5MergeEPKw");
     double t0 = now_s();
-    statusf("MergeWrapper() - started merge");
+    statusf("COsiris::Merge: started");
     long rc = real != nullptr ? real(self, a) : 0;
-    statusf("MergeWrapper() - finished merge in %.2fs", now_s() - t0);
+    statusf("COsiris::Merge: finished in %.2fs", now_s() - t0);
     return rc;
 }
 

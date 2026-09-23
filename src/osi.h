@@ -58,13 +58,19 @@ struct Function {
 // it: the database is a property of the story, and walking it costs a
 // hundred and thirty thousand reads on the story thread during level
 // load. Pass nullptr to walk unconditionally.
+// `cached` reports whether the answer came from the store rather than a
+// walk, so the caller can say which.
 std::size_t load_out_param_counts(std::vector<Function>* functions,
-                                  char const* story);
+                                  char const* story, bool* cached);
 
 // The functions the story itself defines -- procedures, user queries and
 // databases -- which the engine's own mapping does not list. `known` is
 // what that mapping gave, so the same function is not returned twice.
 std::vector<Function> story_functions(std::vector<Function> const& known);
+
+// How many the database held that story_functions could not return, which
+// on this build is all of them: they carry no dispatch handle.
+std::size_t story_function_count();
 
 // A value crossing the boundary in either direction.
 struct Value {

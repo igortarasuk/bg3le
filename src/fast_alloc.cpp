@@ -167,8 +167,11 @@ void fast_alloc_install() {
         statusf("fast alloc: NOT active (patched %zu alloc / %zu free sites)", a, f);
         return;
     }
-    statusf("fast alloc: active, replacing PhysX TempAllocator at %zu/%zu sites",
-            a, f);
+    // Two counts, not a ratio: the old wording read "77/80 sites" as though
+    // three had been missed, when they are the allocate and free call sites
+    // and both were patched in full.
+    statusf("fast alloc: active, replacing PhysX TempAllocator at %zu "
+            "allocate and %zu free call sites", a, f);
 }
 
 void fast_alloc_report(const char* when) {

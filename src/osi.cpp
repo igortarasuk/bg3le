@@ -301,6 +301,9 @@ struct DbEntry {
 
 std::size_t g_visited = 0;
 
+// How many entries the database held that carried no dispatch handle.
+std::size_t g_story_functions = 0;
+
 void visit_tree(std::uintptr_t node,
                 std::unordered_map<std::string, DbEntry>* out,
                 int depth, std::unordered_set<std::uintptr_t>* seen) {
@@ -506,7 +509,8 @@ void save_cached_signatures(char const* story) {
 }
 
 std::size_t load_out_param_counts(std::vector<Function>* functions,
-                                  char const* story) {
+                                  char const* story, bool* cached) {
+    if (cached != nullptr) *cached = false;
     std::uintptr_t base = 0;
     ::dl_iterate_phdr(find_osiris, &base);
     if (base == 0) {
@@ -518,8 +522,11 @@ std::size_t load_out_param_counts(std::vector<Function>* functions,
     // reads rather than a walk.
     find_node_db(base);
 
-    std::size_t cached = 0;
-    if (load_cached_signatures(story, functions, &cached)) return cached;
+    std::size_t fromStore = 0;
+    if (load_cached_signatures(story, functions, &fromStore)) {
+        if (cached != nullptr) *cached = true;
+        return fromStore;
+    }
 
     std::uintptr_t holder = 0;
     if (!peek(base + kFunctionDbHolder, &holder) || holder < 0x1000) {
@@ -770,12 +777,15 @@ std::vector<Function> story_functions(std::vector<Function> const& known) {
     // inserting a tuple into their node. Reaching those needs the node
     // list, which bg3le does not have yet; until then they are counted
     // rather than bound, so nothing claims to call what it cannot.
+    g_story_functions = noId;
     logf("osiris: database holds %zu entries: %zu the engine already maps, "
          "%zu callable through the dispatch, %zu story-defined (no "
          "dispatch handle)",
          database().size(), already, out.size(), noId);
     return out;
 }
+
+std::size_t story_function_count() { return g_story_functions; }
 
 void set_handlers(void* call, void* query) {
     g_call = reinterpret_cast<Thunk6>(call);

@@ -5567,7 +5567,7 @@ function Ext._Internal.LoadMods()
   end)
 
   Ext.Log.Print(string.format(
-    "bg3le: %d of %d packed script modules are in the load order",
+    "bg3le: %d of %d packed script modules will load",
     #packed, #modules))
 
   for _, module in ipairs(packed) do
