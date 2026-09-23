@@ -248,7 +248,8 @@ void listener() {
         ::close(srv);
         return;
     }
-    statusf("Debug server listening on 127.0.0.1:%d", port);
+    statusf("Lua debugger listening on 127.0.0.1:%d; DBG protocol version %u",
+            port, kProtocolVersion);
 
     // Only now can a client succeed in connecting.
     maybe_open_console();

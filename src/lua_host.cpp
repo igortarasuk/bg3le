@@ -3844,6 +3844,7 @@ end
 Ext.Net = {}
 
 local net_listeners = {}
+local warned_net_listener = {}
 
 function Ext.Net.IsHost() return true end
 
@@ -3954,6 +3955,15 @@ end
 -- Registered listeners are kept and dispatched locally, so a mod that
 -- talks to itself over a channel still works.
 function Ext.RegisterNetListener(channel, handler)
+  -- Upstream says the same thing, once per channel: the NetChannel object
+  -- replaced this.
+  if not warned_net_listener[channel] then
+    warned_net_listener[channel] = true
+    Ext.Log.Print(string.format(
+      "Ext.RegisterNetListener(%s) is deprecated; consider using "
+      .. "Ext.Net.CreateChannel() instead", tostring(channel)))
+  end
+
   net_listeners[channel] = net_listeners[channel] or {}
   table.insert(net_listeners[channel], handler)
 end
@@ -4100,12 +4110,30 @@ function ModEvent:Throw(payload)
   for _, handle in ipairs(handles) do
     local handler = self.Handlers[handle]
     if handler ~= nil and callable(handler) then
+      local started = Ext.Utils.MonotonicTime()
       local ok, err = pcall(handler, payload)
       if not ok then
         Ext.Log.PrintError(string.format(
           "bg3le: handler for mod event %s failed: %s", self.Name,
           tostring(err)))
       end
+
+      -- A handler that holds the thread up is worth naming, with the file
+      -- and line it was defined at, as upstream does.
+      local took = Ext.Utils.MonotonicTime() - started
+      if took >= 10 then
+        local where = "?"
+        if type(handler) == "function" then
+          local info = debug.getinfo(handler, "Sl")
+          if info ~= nil then
+            where = string.format("%s:%d", info.short_src or "?",
+                                  info.linedefined or 0)
+          end
+        end
+        Ext.Log.Print(string.format("Dispatching event %s (%s) took %d ms",
+                                    self.Name, where, took))
+      end
+
       if self.Once[handle] then self:Unsubscribe(handle) end
     end
   end
@@ -5358,10 +5386,55 @@ local function mod_roots()
   return roots
 end
 
--- Config.json only ever needs ModTable here, so match it directly rather
--- than pulling in a JSON parser.
+-- Config.json is matched directly rather than parsed: the three fields
+-- that matter are unambiguous in it.
 local function mod_table_name(config)
   return string.match(config, '"ModTable"%s*:%s*"([^"]+)"')
+end
+
+local function mod_required_version(config)
+  return tonumber(string.match(config, '"RequiredVersion"%s*:%s*(%d+)'))
+end
+
+local function mod_feature_flags(config)
+  local flags = string.match(config, '"FeatureFlags"%s*:%s*%[(.-)%]')
+  if flags == nil then return {} end
+
+  local out = {}
+  for flag in string.gmatch(flags, '"([^"]+)"') do out[#out + 1] = flag end
+  return out
+end
+
+-- What each mod asks the extender for, and the union of it, the way
+-- upstream reports both before it loads anything.
+local function report_configs(configs)
+  local version = 0
+  local flags = {}
+  local seen = {}
+
+  for _, entry in ipairs(configs) do
+    Ext.Log.Print(string.format("    '%s': SE v%s; flags: %s", entry.Name,
+                                entry.Version or "?",
+                                table.concat(entry.Flags, ", ")))
+    if (entry.Version or 0) > version then version = entry.Version end
+    for _, flag in ipairs(entry.Flags) do
+      if not seen[flag] then
+        seen[flag] = true
+        flags[#flags + 1] = flag
+      end
+    end
+  end
+
+  if #configs > 0 then
+    Ext.Log.Print(string.format("Merged config: SE v%d; flags: %s", version,
+                                table.concat(flags, ", ")))
+    local ours = Ext.Utils.Version()
+    if version > ours then
+      Ext.Log.PrintWarning(string.format(
+        "bg3le: a mod asks for Script Extender v%d; this is v%d", version,
+        ours))
+    end
+  end
 end
 
 -- Mods also use plain require(), with a path relative to their own Lua
@@ -5398,12 +5471,20 @@ table.insert(package.searchers, mod_searcher)
 
 -- `read` takes a path under the mod's ScriptExtender directory and returns
 -- its contents, so a loose mod and a packed one differ only in that.
-local function load_mod_from(name, uuid, read)
+local function load_mod_from(name, uuid, read, report)
   local config = read("Config.json")
   if not config then
     Ext.Log.PrintWarning(string.format(
       "bg3le: %s has no readable ScriptExtender/Config.json; skipped", name))
     return
+  end
+
+  if report ~= nil then
+    report[#report + 1] = {
+      Name = name,
+      Version = mod_required_version(config),
+      Flags = mod_feature_flags(config),
+    }
   end
 
   local table_name = mod_table_name(config)
@@ -5423,6 +5504,13 @@ local function load_mod_from(name, uuid, read)
       name))
     return
   end
+
+  -- Upstream names the script it is about to run, which is what tells you
+  -- the order mods actually loaded in.
+  Ext.Log.Print(string.format(
+    "Loading bootstrap script: Mods/%s/ScriptExtender/Lua/BootstrapServer.lua",
+    name))
+  local started = Ext.Utils.MonotonicTime()
 
   -- A mod's globals live in its own table, as upstream's do: writing
   -- `function Foo() end` in a mod makes Mods.<ModTable>.Foo, and other mods
@@ -5481,6 +5569,11 @@ local function load_mod_from(name, uuid, read)
   end
 
   loaded[table_name] = true
+  local took = Ext.Utils.MonotonicTime() - started
+  if took >= 10 then
+    Ext.Log.Print(string.format(
+      "Loading BootstrapServer.lua for mod %s took %d ms", name, took))
+  end
   Ext.Log.Print(string.format("bg3le: loaded mod %s (Mods.%s)", name, table_name))
 end
 
@@ -5546,13 +5639,14 @@ function Ext._Internal.LoadMods()
         local uuid = string.match(meta,
           'id="UUID"%s+type="[%w]+"%s+value="([^"]+)"')
         load_mod_from(name, uuid,
-          function(path) return read_file(dir .. "/" .. path) end)
+          function(path) return read_file(dir .. "/" .. path) end, nil)
       end
     end
   end
 
   local modules = Ext._Internal.PakModules()
   local positions = load_positions(modules)
+  local configs = {}
   local packed = {}
   for _, module in ipairs(modules) do
     local at = positions[module.Uuid]
@@ -5570,11 +5664,48 @@ function Ext._Internal.LoadMods()
     "bg3le: %d of %d packed script modules will load",
     #packed, #modules))
 
+  -- Upstream lists what every mod asks of the extender before it runs any
+  -- of them, then the merged view. Collected on a first pass so the list
+  -- comes out whole rather than interleaved with the loading.
+  local readers = {}
   for _, module in ipairs(packed) do
     local prefix = "Mods/" .. module.Name .. "/ScriptExtender/"
-    load_mod_from(module.Name, module.Uuid, function(path)
+    readers[module.Name] = function(path)
       return Ext._Internal.PakRead(module.Pak, prefix .. path)
-    end)
+    end
+    local config = readers[module.Name]("Config.json")
+    if config ~= nil then
+      configs[#configs + 1] = {
+        -- The display name, as upstream lists it; the folder is what the
+        -- bootstrap lines name.
+        Name = module.ModName ~= "" and module.ModName or module.Name,
+        Version = mod_required_version(config),
+        Flags = mod_feature_flags(config),
+      }
+    end
+  end
+  report_configs(configs)
+
+  -- What the client half would have run. bg3le has one Lua context, the
+  -- server's, so a mod's client scripts do not run at all -- and for a UI
+  -- mod that is most of it. Better said than silently missing.
+  local clientOnly = {}
+  for _, module in ipairs(packed) do
+    local prefix = "Mods/" .. module.Name .. "/ScriptExtender/"
+    if Ext._Internal.PakRead(module.Pak, prefix .. "Lua/BootstrapClient.lua")
+        ~= nil then
+      clientOnly[#clientOnly + 1] = module.Name
+    end
+  end
+  if #clientOnly > 0 then
+    Ext.Log.PrintWarning(string.format(
+      "bg3le: %d mods ship a BootstrapClient.lua that is not run: bg3le has "
+      .. "no client Lua context (%s)", #clientOnly,
+      table.concat(clientOnly, ", ")))
+  end
+
+  for _, module in ipairs(packed) do
+    load_mod_from(module.Name, module.Uuid, readers[module.Name], nil)
   end
 
   -- After every mod's bootstrap, as upstream does: a mod subscribes in

@@ -380,6 +380,8 @@ struct NodeList {
     std::uint32_t Count = 0;
 };
 
+NodeList g_nodes;
+
 NodeList find_node_db(std::uintptr_t base) {
     for (std::intptr_t delta = -0x80; delta <= 0x80; delta += 8) {
         std::uintptr_t db = 0;
@@ -411,7 +413,8 @@ NodeList find_node_db(std::uintptr_t base) {
 
         logf("osiris: node list at libOsiris+%#lx holds %u nodes",
              (unsigned long)(kFunctionDbHolder + delta), size);
-        return NodeList{begin, size};
+        g_nodes = NodeList{begin, size};
+        return g_nodes;
     }
     logf("osiris: no node list found near the function database");
     return NodeList{};
@@ -786,6 +789,8 @@ std::vector<Function> story_functions(std::vector<Function> const& known) {
 }
 
 std::size_t story_function_count() { return g_story_functions; }
+
+std::size_t node_count() { return g_nodes.Count; }
 
 void set_handlers(void* call, void* query) {
     g_call = reinterpret_cast<Thunk6>(call);

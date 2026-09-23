@@ -158,20 +158,22 @@ extern "C" int bg3le_ext_generate_guid(lua_State* L) {
 // component packs the rest: 73 * 100000 + 98 * 1000 + 727 = 7398727, which
 // is v4.73.98.727 -- exactly what the Windows extender reported for this
 // same build in reference/utils-shape.txt.
-extern "C" int bg3le_ext_game_version(lua_State* L) {
+// The game's version, scanned out of its own binary once. Exposed as a
+// plain function as well so the startup banner can report it the way
+// upstream's does, without going through Lua.
+std::string const& game_version_text() {
     static std::string cached;
-    if (!cached.empty()) {
-        lua_pushstring(L, cached.c_str());
-        return 1;
-    }
+    static bool scanned = false;
+    if (scanned) return cached;
+    scanned = true;
 
     char exe[4096];
     const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    if (n <= 0) return 0;
+    if (n <= 0) return cached;
     exe[n] = '\0';
 
     std::FILE* f = std::fopen(exe, "rb");
-    if (f == nullptr) return 0;
+    if (f == nullptr) return cached;
 
     // A bounded scan for the version literal rather than a full read of a
     // 300 MB binary.
@@ -200,13 +202,23 @@ extern "C" int bg3le_ext_game_version(lua_State* L) {
         }
     }
     std::fclose(f);
-    if (!found) return 0;
+    if (!found) return cached;
 
     char text[64];
     std::snprintf(text, sizeof(text), "v%u.%u.%u.%u", major, packed / 100000,
                   (packed / 1000) % 100, packed % 1000);
     cached = text;
-    lua_pushstring(L, cached.c_str());
+    return cached;
+}
+
+extern "C" char const* bg3le_game_version() {
+    return game_version_text().c_str();
+}
+
+extern "C" int bg3le_ext_game_version(lua_State* L) {
+    std::string const& version = game_version_text();
+    if (version.empty()) return 0;
+    lua_pushstring(L, version.c_str());
     return 1;
 }
 

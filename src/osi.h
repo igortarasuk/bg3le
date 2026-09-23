@@ -72,6 +72,9 @@ std::vector<Function> story_functions(std::vector<Function> const& known);
 // on this build is all of them: they carry no dispatch handle.
 std::size_t story_function_count();
 
+// How many nodes Osiris' node list holds, or 0 if it was not found.
+std::size_t node_count();
+
 // A value crossing the boundary in either direction.
 struct Value {
     unsigned short type = kNone;

@@ -70,6 +70,12 @@ void install_game_allocator() {
 extern "C" void* bg3le_stats_manager();
 extern "C" std::size_t bg3le_mods_count();
 extern "C" void bg3le_mods_rescan();
+extern "C" char const* bg3le_game_version();
+
+// The Script Extender API version bg3le implements, and the game build its
+// data layouts were established against -- see reference/version.txt.
+constexpr int kExtenderApiVersion = 32;
+constexpr char const* kValidatedGameVersion = "v4.73.98.727";
 extern "C" void bg3le_pak_modules_prewarm();
 extern "C" bool bg3le_stat_origins_ready();
 extern "C" bool bg3le_loca_ready();
@@ -415,11 +421,34 @@ void install_tick_hook() {
     }
 }
 
+double now_s();
+
 void ensure_symbols() {
     std::call_once(g_symbols_once, [] {
+        // Upstream reports what its own startup cost ("Library startup took
+        // 1252 ms"); ours is the symbol table and the ECS registry built
+        // from it, so those are timed the same way.
+        const double started = now_s();
         if (!g_symbols.load()) {
             logf("symbol table unavailable");
             return;
+        }
+        const double symbols = now_s();
+        // Upstream opens with its build, the game's version and a verdict
+        // on it. Same three facts, since the first question about any
+        // extender is whether it matches the game it is loaded into.
+        statusf("bg3le, bg3se v%d API, built on %s %s", kExtenderApiVersion,
+                __DATE__, __TIME__);
+        char const* version = bg3le_game_version();
+        if (version != nullptr && version[0] != '\0') {
+            const bool known =
+                std::strcmp(version, kValidatedGameVersion) == 0;
+            if (known) {
+                statusf("Game version %s OK", version);
+            } else {
+                statusf("Game version %s -- bg3le's layouts were established "
+                        "against %s", version, kValidatedGameVersion);
+            }
         }
         statusf("bg3le attached to %s", g_symbols.path().c_str());
         statusf("Extender runtime log written to '%s'", log_path());
@@ -432,6 +461,9 @@ void ensure_symbols() {
         const std::size_t types = ecs::load(g_symbols);
         statusf("ECS registry: %zu type indices (%zu components)", types,
                 ecs::count(ecs::Context::Component));
+        statusf("bg3le startup took %d ms (%d of it the symbol table)",
+                (int)((now_s() - started) * 1000.0),
+                (int)((symbols - started) * 1000.0));
         void* p = g_symbols.find(
             "_ZN2ls11TypeContextIN3esv4tags8_private23TagComponentTypeContextEE7m_StateE");
         logf("  sentinel esv TagComponentTypeContext::m_State -> %p", p);
@@ -979,7 +1011,15 @@ extern "C" long _ZN7COsiris4LoadER12COsiSmartBuf(void* self, void* buf) {
     const int which = ++loads;
     double t0 = now_s();
     long rc = real != nullptr ? real(self, buf) : 0;
-    statusf("COsiris::Load #%d: story loaded in %.2fs", which, now_s() - t0);
+    // bg3se reports the node count here too; it is the size of the story
+    // the game just loaded, and a useful thing to see change.
+    if (osi::node_count() > 0) {
+        statusf("COsiris::Load #%d: story loaded in %.2fs, %zu nodes", which,
+                now_s() - t0, osi::node_count());
+    } else {
+        statusf("COsiris::Load #%d: story loaded in %.2fs", which,
+                now_s() - t0);
+    }
 
     g_story_ready_at = now_s();
     start_stall_profile();
@@ -1022,9 +1062,28 @@ extern "C" long _ZN7COsiris12PrepareMergeEPKw(void* self, const wchar_t* a) {
 
 // ---- entry point ----
 
+// The game writes a ModCrashSanityCheck directory in the profile while it
+// runs and removes it on a clean exit; finding it at startup is how it
+// decides the last run crashed, and it disables mods when it does. bg3se
+// removes it for the same reason (CleanupSanityCheck in
+// ScriptExtenderClient.cpp), and bg3le kills the game often enough in
+// testing to leave it behind every time.
+void cleanup_sanity_check() {
+    char const* home = std::getenv("HOME");
+    if (home == nullptr) return;
+
+    const std::string path = std::string(home)
+                             + "/.local/share/Larian Studios/Baldur's Gate 3"
+                             + "/ModCrashSanityCheck";
+    if (::rmdir(path.c_str()) == 0) {
+        logf("Removed ModCrashSanityCheck");
+    }
+}
+
 __attribute__((constructor)) static void bg3le_init() {
     log_init();
     logf("bg3le loaded");
+    cleanup_sanity_check();
 
     // Symbol loading is deferred to the first Osiris callback: allocating
     // here runs before the game's allocator exists.
