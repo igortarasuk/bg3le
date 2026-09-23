@@ -139,6 +139,21 @@ void dump_all_thread_stacks(const char* reason) {
     logf("stackdump (%s): end", reason);
 }
 
+void dump_own_stack(const char* reason) {
+    const std::uintptr_t bias = main_bias();
+    void* frames[kMaxFrames];
+    int count = ::backtrace(frames, kMaxFrames);
+    std::string line;
+    char buf[32];
+    for (int i = 0; i < count; ++i) {
+        const auto addr = reinterpret_cast<std::uintptr_t>(frames[i]);
+        std::snprintf(buf, sizeof(buf), " %#lx",
+                      (unsigned long)(addr >= bias ? addr - bias : addr));
+        line += buf;
+    }
+    logf("ownstack (%s): bias 0x%lx%s", reason, (unsigned long)bias, line.c_str());
+}
+
 void schedule_stack_dump(double delay_seconds, const char* reason) {
     const std::string why(reason);
     std::thread([delay_seconds, why] {

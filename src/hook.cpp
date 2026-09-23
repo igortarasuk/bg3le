@@ -162,4 +162,63 @@ bool hook_slot(std::uintptr_t slot_offset, std::uintptr_t expected_offset,
     return true;
 }
 
+// True when [offset, offset+len) lies inside the main object's .text.
+// Protects LD_PRELOAD hosts that are not bg3 (steam-launch-wrapper).
+bool in_text(std::uintptr_t offset, std::size_t len) {
+    Elf64_Addr addr = 0;
+    std::size_t size = 0;
+    if (!find_text(&addr, &size)) return false;
+    return offset >= addr && offset + len <= addr + size;
+}
+
+bool patch_bytes(std::uintptr_t offset, const unsigned char* expected,
+                  const unsigned char* patch, std::size_t len) {
+    return patch_bytes(offset, expected, len, patch, len);
+}
+
+bool patch_bytes(std::uintptr_t offset, const unsigned char* expected,
+                  std::size_t expected_len, const unsigned char* patch,
+                  std::size_t len) {
+    if (!in_text(offset, expected_len)) {
+        logf("hook: %#lx is outside the main object's .text -- not bg3?",
+             (unsigned long)offset);
+        return false;
+    }
+    if (len > expected_len) {
+        logf("hook: patch at %#lx longer than verified span -- refusing",
+             (unsigned long)offset);
+        return false;
+    }
+    const std::uintptr_t bias = load_bias();
+    auto* addr = reinterpret_cast<unsigned char*>(bias + offset);
+
+    if (std::memcmp(addr, expected, expected_len) != 0) {
+        logf("hook: bytes at %#lx don't match expected -- refusing to patch",
+             (unsigned long)offset);
+        return false;
+    }
+
+    const long page = ::sysconf(_SC_PAGESIZE);
+    const auto start_addr = reinterpret_cast<std::uintptr_t>(addr);
+    auto* page_start = reinterpret_cast<void*>(start_addr & ~(std::uintptr_t)(page - 1));
+    const std::size_t span = (start_addr + len) - reinterpret_cast<std::uintptr_t>(page_start);
+    if (::mprotect(page_start, span, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        logf("hook: mprotect failed for patch at %#lx", (unsigned long)offset);
+        return false;
+    }
+
+    std::memcpy(addr, patch, len);
+    ::mprotect(page_start, span, PROT_READ | PROT_EXEC);
+
+    logf("hook: patched %zu byte(s) at %#lx", len, (unsigned long)offset);
+    return true;
+}
+
+bool bytes_match(std::uintptr_t offset, const unsigned char* expected, std::size_t len) {
+    if (!in_text(offset, len)) return false;
+    const std::uintptr_t bias = load_bias();
+    auto* addr = reinterpret_cast<unsigned char*>(bias + offset);
+    return std::memcmp(addr, expected, len) == 0;
+}
+
 }  // namespace bg3le

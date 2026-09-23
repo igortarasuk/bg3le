@@ -35,4 +35,24 @@ bool hook_slot(std::uintptr_t slot_offset, std::uintptr_t expected_offset,
 std::size_t hook_call_sites(std::uintptr_t func_offset, void* replacement,
                             void** original);
 
+// Overwrites `len` bytes at `offset` (a link-time .text address; the load
+// bias is applied internally) with `patch`, after first verifying they
+// currently hold `expected` -- the same safety net as hook_slot: if the
+// binary has shifted since these bytes were read, the patch is refused
+// rather than corrupting unrelated code.
+bool patch_bytes(std::uintptr_t offset, const unsigned char* expected,
+                  const unsigned char* patch, std::size_t len);
+
+// Same, but verifies expected_len bytes and writes patch_len bytes.
+// patch_len must not exceed expected_len.
+bool patch_bytes(std::uintptr_t offset, const unsigned char* expected,
+                  std::size_t expected_len, const unsigned char* patch,
+                  std::size_t patch_len);
+
+// Compares len bytes at offset against expected, without writing.
+// Cheap enough to poll each tick as an already-applied check.
+bool bytes_match(std::uintptr_t offset, const unsigned char* expected, std::size_t len);
+// True when the range lies inside the main object's .text.
+bool in_text(std::uintptr_t offset, std::size_t len);
+
 }  // namespace bg3le

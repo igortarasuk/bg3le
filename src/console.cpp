@@ -64,24 +64,7 @@ std::string client_path() {
 
 bool console_enabled(const std::string& exe_dir) {
     if (const char* env = std::getenv("BG3LE_CONSOLE")) return env[0] == '1';
-
-    // Parity with the Windows extender's setting, read from the same
-    // filename next to the game binary.
-    const std::string settings = exe_dir + "/ScriptExtenderSettings.json";
-    std::FILE* f = std::fopen(settings.c_str(), "rb");
-    if (f == nullptr) return false;
-    std::string text;
-    char buf[4096];
-    std::size_t n;
-    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
-    std::fclose(f);
-
-    const std::size_t key = text.find("\"CreateConsole\"");
-    if (key == std::string::npos) return false;
-    const std::size_t colon = text.find(':', key);
-    if (colon == std::string::npos) return false;
-    const std::size_t value = text.find_first_not_of(" \t\r\n", colon + 1);
-    return value != std::string::npos && text.compare(value, 4, "true") == 0;
+    return settings_flag(exe_dir, "CreateConsole", false);
 }
 
 // Inside the Steam runtime container the host's terminals are neither on
@@ -159,6 +142,29 @@ std::vector<std::string> build_argv(const std::string& term,
 }
 
 }  // namespace
+
+// Parity with the Windows extender: same file next to the binary.
+bool settings_flag(const std::string& exe_dir, const char* key, bool fallback) {
+    const std::string settings = exe_dir + "/ScriptExtenderSettings.json";
+    std::FILE* f = std::fopen(settings.c_str(), "rb");
+    if (f == nullptr) return fallback;
+    std::string text;
+    char buf[4096];
+    std::size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
+    std::fclose(f);
+
+    const std::string quoted = std::string("\"") + key + "\"";
+    const std::size_t at = text.find(quoted);
+    if (at == std::string::npos) return fallback;
+    const std::size_t colon = text.find(':', at);
+    if (colon == std::string::npos) return fallback;
+    const std::size_t value = text.find_first_not_of(" \t\r\n", colon + 1);
+    if (value == std::string::npos) return fallback;
+    if (text.compare(value, 4, "true") == 0) return true;
+    if (text.compare(value, 5, "false") == 0) return false;
+    return fallback;
+}
 
 void maybe_open_console() {
     bool expected = false;

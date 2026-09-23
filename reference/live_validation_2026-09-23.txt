@@ -1,0 +1,6 @@
+# Live validation 2026-09-23, log /tmp/bg3le.log.128195 (mods active, predicate patch on)
+[  6393.703] EnableAchievements: patched IsModded predicate at 0x37675f0
+[  6395.210] steam hook: ISteamUserStats vtable 0x7f26cfd35dd0, SetAchievement slot -> 0x7f26d9963ad0 (was 0x7f26ce47aaa0)
+[  6536.092] ISteamUserStats::SetAchievement(0x5592657fc760, "BG3_Quest33")
+[  6536.107] ownstack (SetAchievement call): bias 0x5592316a3000 0x2994a82d8862 0x2994a82c0b08 0x6aa119c 0x50786ef 0x34b267f 0x335e365 0x2af99bc 0x2b05d2b 0x2d202e9 0x2d1b9cf 0x2d1b928 0x2d1b5e2 0x770577a 0x2994a63f50a2 0x2994a647d80c
+[  6536.107] ISteamUserStats::SetAchievement -> true

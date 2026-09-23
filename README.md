@@ -42,6 +42,13 @@ component's declared size with the size the engine recorded, and
 - A Lua debugger server compatible with the
   [bg3lua](https://github.com/lenonk/bg3lua) client (`client/` submodule),
   plus `CreateConsole` parity that opens a terminal on startup
+- `EnableAchievements` parity: achievements stay on with mods. bg3se patches
+  `ls::ModuleSettings::IsModded`; here the equivalent is the engine's
+  per-module "is official" predicate, patched to return true at startup. Off
+  with `"EnableAchievements": false` in `ScriptExtenderSettings.json` or
+  `BG3LE_NO_ACH_PATCH=1`. Analysis and test protocol:
+  [reference/ACHIEVEMENTS-NEXT.md](reference/ACHIEVEMENTS-NEXT.md),
+  [tools/gdb_scripts/RUNBOOK.md](tools/gdb_scripts/RUNBOOK.md)
 - **A 65-98s level load reduced to ~1s.** The native build spends almost all
   of it in `physx::Sn::ConvX` converting PhysX data whose `TempAllocator`
   serialises on one global mutex; `src/fast_alloc.cpp` replaces it with a
