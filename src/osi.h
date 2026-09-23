@@ -102,7 +102,9 @@ enum class Status {
 // declaration of it is a database. Resolved on demand from the Lua side:
 // the Function objects behind these are heap pointers that cannot be
 // cached between runs, and recovering them walks Osiris' database.
-bool story_function(char const* name, bool* is_database);
+// `real` receives the name as the story spells it, which can differ in
+// case from what was asked for.
+bool story_function(char const* name, bool* is_database, std::string* real);
 
 // Retracts facts from a story database. A `kNone` argument is a wildcard
 // for that column, as a nil is upstream.

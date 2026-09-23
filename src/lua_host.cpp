@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cmath>
+#include <deque>
 #include <cstring>
 #include <ctime>
 #include <dirent.h>
@@ -35,6 +36,17 @@ const SymbolTable* g_symbols = nullptr;
 // Bound functions must outlive the closures that reference them, and the
 // storage must not move once pointers are handed to Lua.
 std::vector<osi::Function> g_functions;
+
+// Osiris overloads by arity: ApplyStatus is declared with three, four and
+// five parameters, and they are three different functions. One Lua name
+// covers all of them, so a name maps to the group and the call picks the
+// member whose input count matches -- which is what bg3se's name resolver
+// does. Binding one function per name kept whichever came last and
+// refused every other arity.
+//
+// A deque, because the closures hold pointers to the groups and Lua is
+// handed them as they are built.
+std::deque<std::vector<const osi::Function*>> g_overloads;
 
 bool to_value(lua_State* L, int idx, osi::Value* out) {
     switch (lua_type(L, idx)) {
@@ -248,12 +260,21 @@ int l_watch_osiris(lua_State* L) {
 // its Osi.* through a metatable for the same reason; a name that is never
 // used costs nothing.
 int osi_story_lookup(lua_State* L) {
-    char const* name = luaL_checkstring(L, 1);
+    char const* asked = luaL_checkstring(L, 1);
 
     bool isDatabase = false;
-    if (!osi::story_function(name, &isDatabase)) {
+    std::string spelling;
+    if (!osi::story_function(asked, &isDatabase, &spelling)) {
         lua_pushnil(L);
         return 1;
+    }
+
+    // The story's own spelling is what the database is keyed by, so that
+    // is what the closure carries. The warning is upstream's.
+    char const* name = spelling.empty() ? asked : spelling.c_str();
+    if (spelling != asked) {
+        logf("lua: COMPATIBILITY WARNING: Osiris symbol '%s' referenced "
+             "using incorrect case; the correct name is '%s'", asked, name);
     }
 
     if (!isDatabase) {
@@ -284,24 +305,79 @@ int osi_story_lookup(lua_State* L) {
 
 // Osi.Name(inputs...) -- whatever the caller omits is treated as an output,
 // matching how the engine's own argument lists are shaped.
+// How many arguments a caller supplies for this declaration.
+int expected_inputs(const osi::Function& fn) {
+    if (fn.out_params < 0) return -1;  // not known; the caller's count decides
+    return (int)fn.params.size() - fn.out_params;
+}
+
 int osi_dispatch(lua_State* L) {
-    const auto* fn = static_cast<const osi::Function*>(
+    const auto* group = static_cast<std::vector<const osi::Function*>*>(
         lua_touserdata(L, lua_upvalueindex(1)));
     const int argc = lua_gettop(L);
 
     // With out-param counts recovered from Osiris, the input count is known
-    // exactly and a wrong count is an error, as in bg3se. Without them, fall
-    // back to letting the caller's argument count decide the split.
-    if (fn->out_params >= 0) {
-        const int expected = (int)fn->params.size() - fn->out_params;
-        if (argc != expected) {
-            return luaL_error(L,
-                "Incorrect number of IN arguments for '%s'; expected %d, got %d",
-                fn->name.c_str(), expected, argc);
+    // exactly, so the declaration is chosen by it. A name with one
+    // declaration behaves as before; one with several -- ApplyStatus has
+    // three -- now answers to each of them.
+    const osi::Function* fn = nullptr;
+    for (const osi::Function* candidate : *group) {
+        if (expected_inputs(*candidate) == argc) {
+            fn = candidate;
+            break;
         }
-    } else if (static_cast<std::size_t>(argc) > fn->params.size()) {
-        return luaL_error(L, "Osi.%s takes at most %d argument(s), got %d",
-                          fn->name.c_str(), (int)fn->params.size(), argc);
+    }
+    if (fn == nullptr) {
+        // Without out-param counts the caller's own count decides the
+        // split, as it did before they were recovered.
+        for (const osi::Function* candidate : *group) {
+            if (expected_inputs(*candidate) < 0
+                && (std::size_t)argc <= candidate->params.size()) {
+                fn = candidate;
+                break;
+            }
+        }
+    }
+    char const* wanted = group->empty() ? "?" : (*group)[0]->name.c_str();
+    if (fn == nullptr) {
+        // The engine's mapping holds one declaration per name, but the
+        // story declares its own arities of the same name: ApplyStatus is
+        // in the mapping with five parameters and in Osiris' database with
+        // three, four and five, the extra two being the story's own. A
+        // count the mapping does not have is theirs, so it goes the way
+        // every story function goes -- a tuple into its node.
+        const std::string key =
+            std::string(wanted) + "/" + std::to_string(argc);
+        std::vector<osi::Value> args;
+        args.reserve(argc > 0 ? argc : 0);
+        bool convertible = true;
+        for (int i = 1; i <= argc; ++i) {
+            osi::Value v;
+            if (!to_value(L, i, &v)) {
+                convertible = false;
+                break;
+            }
+            args.push_back(std::move(v));
+        }
+
+        std::string why;
+        if (convertible
+            && osi::insert(key.c_str(), args, &why) == osi::Status::kHandled) {
+            return 0;
+        }
+
+        std::string counts;
+        for (const osi::Function* candidate : *group) {
+            const int wants = expected_inputs(*candidate);
+            if (wants < 0) continue;
+            if (!counts.empty()) counts += " or ";
+            counts += std::to_string(wants);
+        }
+        return luaL_error(L,
+            "Incorrect number of IN arguments for '%s'; expected %s, got %d, "
+            "and the story declares no %d-argument form (%s)",
+            wanted, counts.empty() ? "none" : counts.c_str(), argc, argc,
+            why.empty() ? "not convertible" : why.c_str());
     }
 
     std::vector<osi::Value> inputs;
@@ -5833,6 +5909,15 @@ end
 local function load_positions(modules)
   local positions = positions_of(Ext.Mod.GetLoadOrder()) or {}
 
+  -- Which uuids belong to a mod that actually carries scripts, so the
+  -- message below can name them. Built from what was passed rather than
+  -- read from a global: referencing one that was never assigned raised
+  -- out of LoadMods, which loaded no packed mod at all.
+  local scripted = {}
+  for _, module in ipairs(modules or {}) do
+    if module.Uuid ~= nil then scripted[module.Uuid] = module.Name end
+  end
+
   local after = 0
   for _, at in pairs(positions) do
     if at > after then after = at end
@@ -6646,17 +6731,34 @@ void lua_bind_osi(const std::vector<osi::Function>& functions) {
 
     g_functions = functions;  // one copy, then never resized again
 
-    lua_createtable(g_lua, 0, static_cast<int>(g_functions.size()));
-    int bound = 0;
+    // Grouped by name first: several declarations of one name are one Lua
+    // function that picks between them by argument count.
+    g_overloads.clear();
+    std::unordered_map<std::string, std::size_t> groupOf;
     int events = 0;
-    for (osi::Function& fn : g_functions) {
+    for (const osi::Function& fn : g_functions) {
         if (fn.kind() == osi::kEvent) {
             ++events;  // raised by the game, not callable
             continue;
         }
-        lua_pushlightuserdata(g_lua, &fn);
+        auto found = groupOf.find(fn.name);
+        if (found == groupOf.end()) {
+            groupOf.emplace(fn.name, g_overloads.size());
+            g_overloads.push_back({&fn});
+        } else {
+            g_overloads[found->second].push_back(&fn);
+        }
+    }
+
+    lua_createtable(g_lua, 0, static_cast<int>(g_overloads.size()));
+    int bound = 0;
+    int overloaded = 0;
+    for (auto const& entry : groupOf) {
+        std::vector<const osi::Function*>& group = g_overloads[entry.second];
+        if (group.size() > 1) ++overloaded;
+        lua_pushlightuserdata(g_lua, &group);
         lua_pushcclosure(g_lua, osi_dispatch, 1);
-        lua_setfield(g_lua, -2, fn.name.c_str());
+        lua_setfield(g_lua, -2, entry.first.c_str());
         ++bound;
     }
     lua_setglobal(g_lua, "Osi");
@@ -6666,10 +6768,9 @@ void lua_bind_osi(const std::vector<osi::Function>& functions) {
     // Matching that is the point of sharing the API surface. Verified against
     // the enumerated names that none collide with a Lua global.
     lua_getglobal(g_lua, "Osi");
-    for (osi::Function& fn : g_functions) {
-        if (fn.kind() == osi::kEvent) continue;
-        lua_getfield(g_lua, -1, fn.name.c_str());
-        lua_setglobal(g_lua, fn.name.c_str());
+    for (auto const& entry : groupOf) {
+        lua_getfield(g_lua, -1, entry.first.c_str());
+        lua_setglobal(g_lua, entry.first.c_str());
     }
     lua_pop(g_lua, 1);
 
@@ -6721,8 +6822,9 @@ setmetatable(_G, {
 })
 )LUA");
 
-    statusf("Bound %d Osiris functions as Osi.* and globals (%d events skipped)",
-            bound, events);
+    statusf("Bound %d Osiris functions as Osi.* and globals (%d of them "
+            "declared with more than one arity, %d events skipped)",
+            bound, overloaded, events);
 }
 
 void lua_eval(const char* code, std::string* result, std::string* error) {

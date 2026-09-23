@@ -324,55 +324,101 @@ std::size_t g_visited = 0;
 // How many entries the database held that carried no dispatch handle.
 std::size_t g_story_functions = 0;
 
-void visit_tree(std::uintptr_t node,
+// Every function in one of Osiris' hash buckets.
+//
+// bg3se's TMapNode is { Left, Root, Right, Color, IsRoot, KeyValuePair },
+// the key being a 24-byte string at +0x20 and the OsiFunctionDef* the
+// value at +0x38. That much this build agrees with, and a bucket slot is
+// { count, node, node } -- the count is what made the rest of this
+// measurable: bucket 0 holds 19 entries, and the holder's own total at
+// +0x5fe8 is 20,414.
+//
+// The node a bucket points at is not the root of its tree, so following
+// Left and Right from there reaches a fraction of it: 3,748 entries in
+// total, of which only 323 were among the 1,303 the engine's own mapping
+// names. Two thirds of Osiris was invisible, and nothing said so --
+// every entry that was found was correct.
+//
+// The middle link is the parent, so following all three reaches
+// everything. Done indiscriminately that crawls the heap: eleven million
+// addresses and ninety-two seconds of a level load. What bounds it is
+// the key. A real node carries "Name/Arity" at +0x20, so a node is only
+// expanded if it has one, and a stray pointer into the heap stops there
+// instead of spreading.
+bool node_key(Block<0x40> const& entry, std::string* key) {
+    if (!parse_osi_string(entry.Bytes + 0x20, key) || key->empty()) {
+        return false;
+    }
+
+    // "Name/Arity", and nothing else: the arity is digits, and the name
+    // is the kind of identifier a story compiler emits.
+    const std::size_t slash = key->rfind('/');
+    if (slash == std::string::npos || slash == 0
+        || slash + 1 >= key->size()) {
+        return false;
+    }
+    for (std::size_t i = slash + 1; i < key->size(); ++i) {
+        if (std::isdigit((unsigned char)(*key)[i]) == 0) return false;
+    }
+    for (std::size_t i = 0; i < slash; ++i) {
+        const unsigned char c = (unsigned char)(*key)[i];
+        if (std::isalnum(c) == 0 && c != '_') return false;
+    }
+    return true;
+}
+
+void visit_tree(std::uintptr_t bucket,
                 std::unordered_map<std::string, DbEntry>* out,
-                int depth, std::unordered_set<std::uintptr_t>* seen) {
-    // Guard against cycles as well as depth: if a link turns out to be a
-    // parent pointer rather than a child, this must not spin.
-    // No IsRoot check: bg3se's layout puts that flag at +0x19, but pruning on
-    // it here discarded live subtrees -- a Lua walk without the check reached
-    // nodes this one reported as absent. Null links, the visited set and the
-    // depth bound are sufficient termination.
-    if (node < 0x1000 || depth > 128) return;
-    if (!seen->insert(node).second) return;
-    ++g_visited;
+                int /*depth*/, std::unordered_set<std::uintptr_t>* seen) {
+    if (bucket < 0x1000) return;
 
-    // One read for the whole tree node: the links, the key string and the
-    // pointer to the function.
-    const Block<0x40> entry(node);
-    if (!entry.Ok) return;
+    std::vector<std::uintptr_t> pending{bucket};
+    while (!pending.empty()) {
+        const std::uintptr_t node = pending.back();
+        pending.pop_back();
 
-    const auto left = entry.at<std::uintptr_t>(0x00);
-    const auto right = entry.at<std::uintptr_t>(0x10);
-    const auto def = entry.at<std::uintptr_t>(0x38);
+        if (node < 0x1000) continue;
+        if (!seen->insert(node).second) continue;
+        ++g_visited;
 
-    // Key on the tree's own key ("Name/Arity"), not the bare signature name:
-    // Osiris overloads by arity, so 1303 functions collapse onto far fewer
-    // names and most matches are lost.
-    if (def >= 0x1000) {
-        const Block<0x28> function(def);
-        const auto signature = function.Ok
-                                   ? function.at<std::uintptr_t>(0x18)
-                                   : 0;
-        if (signature >= 0x1000) {
-            const Block<0x28> sig(signature);
-            if (sig.Ok) {
-                const int outs = count_out_params(
-                    sig.at<std::uintptr_t>(0x18),
-                    sig.at<std::uint32_t>(0x20));
-                std::string key;
-                if (outs >= 0 && parse_osi_string(entry.Bytes + 0x20, &key)
-                    && !key.empty()) {
-                    (*out)[key] = DbEntry{
-                        outs, def,
-                        read_param_types(sig.at<std::uintptr_t>(0x10))};
+        // One read for the whole tree node: the links, the key and the
+        // pointer to the function.
+        const Block<0x40> entry(node);
+        if (!entry.Ok) continue;
+
+        // No IsRoot check: bg3se's layout puts that flag at +0x19, and on
+        // this build those padding bytes carry whatever the allocator left
+        // there -- one node reads 'T'. Pruning on it discarded live
+        // subtrees.
+        std::string key;
+        if (!node_key(entry, &key)) continue;
+
+        const auto def = entry.at<std::uintptr_t>(0x38);
+        if (def >= 0x1000) {
+            const Block<0x28> function(def);
+            const auto signature = function.Ok
+                                       ? function.at<std::uintptr_t>(0x18)
+                                       : 0;
+            if (signature >= 0x1000) {
+                const Block<0x28> sig(signature);
+                if (sig.Ok) {
+                    const int outs = count_out_params(
+                        sig.at<std::uintptr_t>(0x18),
+                        sig.at<std::uint32_t>(0x20));
+                    if (outs >= 0) {
+                        (*out)[key] = DbEntry{
+                            outs, def,
+                            read_param_types(sig.at<std::uintptr_t>(0x10))};
+                    }
                 }
             }
         }
-    }
 
-    visit_tree(left, out, depth + 1, seen);
-    visit_tree(right, out, depth + 1, seen);
+        // Only a node that proved itself expands.
+        pending.push_back(entry.at<std::uintptr_t>(0x00));  // Left
+        pending.push_back(entry.at<std::uintptr_t>(0x08));  // Root/parent
+        pending.push_back(entry.at<std::uintptr_t>(0x10));  // Right
+    }
 }
 
 }  // namespace
@@ -1415,10 +1461,13 @@ bool bind_defs() {
 
     std::unordered_map<std::string, DbEntry> live;
     for (std::size_t i = 0; i < kBuckets; ++i) {
-        std::uintptr_t root = 0;
-        if (!peek(holder + 0x10 + i * kSlotStride + 0x08, &root)) continue;
+        const std::uintptr_t slot = holder + 0x10 + i * kSlotStride;
         std::unordered_set<std::uintptr_t> seen;
-        visit_tree(root, &live, 0, &seen);
+        for (std::uintptr_t off = 0x00; off <= 0x08; off += 0x08) {
+            std::uintptr_t map = 0;
+            if (!peek(slot + off, &map)) continue;
+            visit_tree(map, &live, 0, &seen);
+        }
     }
     if (live.empty()) {
         logf("osiris: no function objects found; story calls stay unavailable");
@@ -1758,10 +1807,13 @@ std::size_t load_out_param_counts(std::vector<Function>* functions,
     by_name.clear();
     g_visited = 0;
     for (std::size_t i = 0; i < kBuckets; ++i) {
-        std::uintptr_t root = 0;
-        if (!peek(holder + 0x10 + i * kSlotStride + 0x08, &root)) continue;
+        const std::uintptr_t slot = holder + 0x10 + i * kSlotStride;
         std::unordered_set<std::uintptr_t> seen;
-        visit_tree(root, &by_name, 0, &seen);
+        for (std::uintptr_t off = 0x00; off <= 0x08; off += 0x08) {
+            std::uintptr_t map = 0;
+            if (!peek(slot + off, &map)) continue;
+            visit_tree(map, &by_name, 0, &seen);
+        }
     }
 
     // Functions the story never references have no entry here; those keep the
@@ -1915,9 +1967,22 @@ std::size_t load_out_param_counts(std::vector<Function>* functions,
     logf("osiris: parameter types agree for %zu functions, differ for %zu",
          typed, typedWrong);
 
-    logf("osiris: signature walk visited %zu nodes, found %zu entries, "
-         "matched %zu of %zu functions", g_visited, by_name.size(), applied,
-         functions->size());
+    // The database counts itself, so say whether the walk agrees with it.
+    // This is the check that was missing: every entry the old walk found
+    // was correct, it simply found a fifth of them, and nothing in the
+    // output could have told you.
+    std::uint32_t declared = 0;
+    peek(holder + 0x5fe8, &declared);
+    if (declared > 0) {
+        logf("osiris: signature walk visited %zu nodes and found %zu of the "
+             "%u entries the database says it holds, matching %zu of %zu "
+             "functions the engine maps",
+             g_visited, by_name.size(), declared, applied, functions->size());
+    } else {
+        logf("osiris: signature walk visited %zu nodes, found %zu entries, "
+             "matched %zu of %zu functions", g_visited, by_name.size(),
+             applied, functions->size());
+    }
     return applied;
 }
 
@@ -2592,10 +2657,35 @@ bool watch_story_triggers() { return install_node_hooks(); }
 // cannot be cached across runs, and walking Osiris' database to get them
 // costs half a second that a session which never calls one should not
 // pay. bg3se resolves its Osi.* the same way, through a metatable.
-bool story_function(char const* name, bool* is_database) {
+bool story_function(char const* name, bool* is_database, std::string* real) {
     if (name == nullptr || !bind_defs()) return false;
 
-    const std::string prefix = std::string(name) + "/";
+    std::string prefix = std::string(name) + "/";
+
+    // Case-insensitively if the exact name is not there, as the engine's
+    // own names resolve: mods write Proc_CharacterFullRestore where the
+    // story declares PROC_CharacterFullRestore, and upstream answers with
+    // a compatibility warning rather than a nil.
+    bool exact = false;
+    for (auto const& entry : database()) {
+        if (entry.first.compare(0, prefix.size(), prefix) == 0) {
+            exact = true;
+            break;
+        }
+    }
+    if (!exact) {
+        for (auto const& entry : database()) {
+            const std::size_t slash = entry.first.rfind('/');
+            if (slash == std::string::npos || slash != prefix.size() - 1) {
+                continue;
+            }
+            if (::strncasecmp(entry.first.c_str(), name, slash) != 0) continue;
+            prefix = entry.first.substr(0, slash + 1);
+            break;
+        }
+    }
+    if (real != nullptr) prefix.substr(0, prefix.size() - 1).swap(*real);
+
     bool found = false;
     bool database_only = true;
     for (auto const& entry : database()) {

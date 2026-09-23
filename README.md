@@ -26,7 +26,11 @@ component's declared size with the size the engine recorded, and
   interactive prompt while the game runs. Out-parameter counts and parameter
   types come from Osiris' own function database rather than from the
   caller's argument count, and the answer is cached under the story version
-  — walking it costs 130,000 reads on the story thread otherwise
+  — walking it costs 130,000 reads on the story thread otherwise. A name
+  with several arities answers to each: Osiris declares `ApplyStatus` with
+  three, four and five parameters, the engine's mapping holds only the five,
+  and the other two are the story's own, so a count the mapping does not
+  have goes the way story functions go
 - Lua host with `Ext.Log`, `Ext.Json`, `Ext.Math` (scalar), `Ext.Table`,
   `Ext.Timer`, `Ext.Utils`, and `_D`/`_P`/`_PW`/`_PE`. The interpreter is
   Norbyte's Lua fork, the same one bg3se uses — see
@@ -51,7 +55,7 @@ component's declared size with the size the engine recorded, and
   investigation, dead ends included, is in
   [reference/ACHIEVEMENTS-DIAGNOSIS.md](reference/ACHIEVEMENTS-DIAGNOSIS.md).
   `BG3LE_ACHIEVEMENTS=0` turns it off
-- **The story's own procedures and databases are callable.** All 3,425 of
+- **The story's own procedures and databases are callable.** All 19,078 of
   them — `Osi.PROC_*`, `Osi.DB_*` and the story's events, which carry no
   dispatch handle and so cannot go through the DIV boundary at all. They run
   the way the engine runs them: a tuple is inserted into the Rete node the
