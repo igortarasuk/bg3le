@@ -5284,12 +5284,14 @@ function Ext.Entity.UuidToHandle(uuid) return Ext._Internal.UuidToHandle(uuid) e
 -- ---- mod loading ----
 --
 -- Two kinds of mod: a loose directory containing Mods/<Name>/ScriptExtender/,
--- and a .pak in the profile's Mods directory with the same tree inside it.
--- Installed mods are almost always packed, so both have to work.
+-- and a .pak with the same tree inside it, in the profile's Mods directory
+-- or the install's Data/Mods. Installed mods are almost always packed, so
+-- both have to work.
 --
--- Packed mods load in the game's load order and only if they are in it,
--- which is what enabling a mod means. Loose ones load regardless: they are
--- a development convenience and never appear in modsettings.lsx.
+-- Packed mods load in the engine's load order, and then in the order of
+-- anything else modsettings.lsx enables; see load_positions below for why
+-- that second half exists. Loose ones load regardless: they are a
+-- development convenience and never appear in modsettings.lsx at all.
 local loaded = {}
 
 local function read_file(path)
