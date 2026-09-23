@@ -1401,6 +1401,11 @@ extern "C" char const* bg3le_stats_attr_string(int raw);
 extern "C" char const* bg3le_stats_attr_translated(int raw);
 extern "C" char const* bg3le_loca_get(char const* handle);
 extern "C" bool bg3le_loca_set(char const* handle, char const* text);
+extern "C" bool bg3le_stats_attr_set(void const* object, std::size_t index,
+                                     int raw);
+extern "C" int bg3le_stats_condition_intern(char const* text);
+extern "C" void bg3le_fixed_string_dump();
+extern "C" int bg3le_stats_string_intern(char const* text);
 extern "C" std::size_t bg3le_loca_count();
 extern "C" char const* bg3le_loca_handle_at(std::size_t index);
 extern "C" std::size_t bg3le_templates_count();
@@ -2397,6 +2402,50 @@ int l_stats_at(lua_State* L) {
 }
 
 // Ext._Internal.StatsFind(name) -> address
+// Ext._Internal.Env(name) -> the environment variable, or nil. So a
+// question of the form "is this bg3le's doing?" can be answered from
+// outside the process without a rebuild.
+int l_env(lua_State* L) {
+    char const* value = std::getenv(luaL_checkstring(L, 1));
+    if (value == nullptr) return 0;
+    lua_pushstring(L, value);
+    return 1;
+}
+
+// Ext._Internal.StringTableDump() -- the sub-table shapes and one entry
+// each, to the log. A diagnostic, kept because what it establishes -- how
+// an entry is allocated -- is what a string attribute write depends on.
+int l_string_table_dump(lua_State*) {
+    bg3le_fixed_string_dump();
+    return 0;
+}
+
+// Ext._Internal.StatsAttrSet(addr, index, raw) -> bool
+int l_stats_attr_set(lua_State* L) {
+    auto addr = (std::uintptr_t)luaL_checkinteger(L, 1);
+    const auto index = (std::size_t)luaL_checkinteger(L, 2);
+    const int raw = (int)luaL_checkinteger(L, 3);
+    lua_pushboolean(L,
+                    bg3le_stats_attr_set((void const*)addr, index, raw) ? 1 : 0);
+    return 1;
+}
+
+// Ext._Internal.StatsStringIntern(text) -> pool index, or nil
+int l_stats_string_intern(lua_State* L) {
+    const int index = bg3le_stats_string_intern(luaL_checkstring(L, 1));
+    if (index < 0) return 0;
+    lua_pushinteger(L, index);
+    return 1;
+}
+
+// Ext._Internal.StatsConditionIntern(text) -> pool index, or nil
+int l_stats_condition_intern(lua_State* L) {
+    const int index = bg3le_stats_condition_intern(luaL_checkstring(L, 1));
+    if (index < 0) return 0;
+    lua_pushinteger(L, index);
+    return 1;
+}
+
 int l_stats_find(lua_State* L) {
     const char* name = luaL_checkstring(L, 1);
     void* obj = bg3le_stats_find(name);
@@ -3286,6 +3335,16 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "LocaKeys");
     lua_pushcfunction(g_lua, l_loca_set);
     lua_setfield(g_lua, -2, "LocaSet");
+    lua_pushcfunction(g_lua, l_env);
+    lua_setfield(g_lua, -2, "Env");
+    lua_pushcfunction(g_lua, l_string_table_dump);
+    lua_setfield(g_lua, -2, "StringTableDump");
+    lua_pushcfunction(g_lua, l_stats_attr_set);
+    lua_setfield(g_lua, -2, "StatsAttrSet");
+    lua_pushcfunction(g_lua, l_stats_condition_intern);
+    lua_setfield(g_lua, -2, "StatsConditionIntern");
+    lua_pushcfunction(g_lua, l_stats_string_intern);
+    lua_setfield(g_lua, -2, "StatsStringIntern");
     lua_pushcfunction(g_lua, l_all_entities);
     lua_setfield(g_lua, -2, "AllEntities");
     lua_pushcfunction(g_lua, l_component_type_names);
@@ -5396,7 +5455,7 @@ local function read_attribute(addr, i)
   -- reported "CanNotUse" on a spell whose AIFlags is empty.
   if typeName == "AIFlags" then
     return name, Ext._Internal.StatsAIFlags(addr) or "",
-           STAT_KIND[kind] or "Unknown", typeName, raw
+           STAT_KIND[kind] or "Unknown", typeName, raw, kind
   end
 
   if kind == 0 or kind == 1 then
@@ -5475,7 +5534,7 @@ local function read_attribute(addr, i)
     value = raw
   end
 
-  return name, value, STAT_KIND[kind] or "Unknown", typeName, raw
+  return name, value, STAT_KIND[kind] or "Unknown", typeName, raw, kind
 end
 
 -- A stat object, shaped the way upstream shapes one.
@@ -5491,6 +5550,118 @@ end
 -- RPGStats::SyncWithPrototypeManager and the parse buffers behind it, none
 -- of which bg3le reaches yet, and a silent no-op would be worse than an
 -- error a mod author can read.
+-- Writing an attribute.
+--
+-- An attribute is one int32 in the stat object's indexed properties, and
+-- what that int32 means depends on the attribute's kind: an Int or an
+-- Enumeration is the value, and the rest index one of RPGStats' pools. So
+-- a write is a store, plus getting the value into a pool first when the
+-- kind needs one.
+--
+-- The kinds that carry compiled data -- functors, roll conditions,
+-- requirements -- are not written: the engine holds them parsed, and
+-- storing an index to text it never compiles would look like it worked and
+-- do nothing.
+-- BG3LE_STAT_WRITES=0 turns attribute writing off, so "is bg3le's stat
+-- write causing this?" can be answered from outside the process. It is
+-- how the FixedString path below was shown to be the thing that hangs the
+-- engine.
+local STAT_WRITABLE_KINDS = {
+  [0] = "int", [1] = "int", [4] = "enum", [8] = "condition",
+}
+
+-- BG3LE_STAT_STRING_WRITES=1 puts FixedString attributes back. Everything
+-- it needs works -- a string-table entry is placed, resolves, and lands in
+-- the pool -- but with it on, the engine spends tens of minutes of its own
+-- CPU during the level load and never finishes. See
+-- reference/STAT-WRITES.md.
+if Ext._Internal.Env("BG3LE_STAT_STRING_WRITES") == "1" then
+  STAT_WRITABLE_KINDS[3] = "string"
+end
+if Ext._Internal.Env("BG3LE_STAT_WRITES") == "0" then
+  STAT_WRITABLE_KINDS = {}
+end
+
+local STAT_KIND_UNWRITABLE = {
+  [2] = "a float, which indexes a pool with no room to add to",
+  [3] = "a FixedString. bg3le can give it a string-table entry and a pool "
+        .. "slot, and both read back correctly, but with that enabled the "
+        .. "engine spends the rest of the level load at 250% CPU in its own "
+        .. "code and never finishes. See reference/STAT-WRITES.md; "
+        .. "BG3LE_STAT_STRING_WRITES=1 enables it anyway",
+  [5] = "a flag set, which indexes the int64 pool",
+  [6] = "a GUID, which indexes the GUID pool",
+  [7] = "a functor list, which the engine holds compiled",
+  [9] = "a roll condition table, which the engine holds compiled",
+  [10] = "a requirement list, which the engine holds compiled",
+  [11] = "deprecated upstream and reported as nil",
+  [12] = "a translated string handle",
+}
+
+local function stat_write(self, key, value)
+  local addr = rawget(self, "__addr")
+  local slots = rawget(self, "__slots")
+  local slot = slots and slots[key]
+  if addr == nil or slot == nil then
+    error(string.format(
+      "bg3le: %s is not an attribute of this stat, so there is nothing to "
+      .. "write", tostring(key)), 3)
+  end
+
+  local writable = STAT_WRITABLE_KINDS[slot.kind]
+  if writable == nil then
+    error(string.format("bg3le cannot write %s: it is %s", key,
+                        STAT_KIND_UNWRITABLE[slot.kind]
+                        or "of a kind bg3le does not write"), 3)
+  end
+
+  local raw
+  if writable == "int" then
+    if type(value) ~= "number" then
+      error(string.format("%s is an integer attribute", key), 3)
+    end
+    raw = math.floor(value)
+  elseif writable == "enum" then
+    if type(value) == "number" then
+      raw = math.floor(value)
+    else
+      raw = Ext._Internal.StatsEnumIndex(slot.typeName, tostring(value))
+      if raw == nil then
+        error(string.format("%q is not a value of enumeration %s", tostring(value),
+                            tostring(slot.typeName)), 3)
+      end
+    end
+  elseif writable == "string" then
+    if type(value) ~= "string" then
+      error(string.format("%s is a string attribute", key), 3)
+    end
+    raw = Ext._Internal.StatsStringIntern(value)
+    if raw == nil then
+      error(string.format(
+        "bg3le could not give %q a string-table entry and a pool slot; see "
+        .. "the string table and stats lines in the extender log", value), 3)
+    end
+  else  -- condition
+    if type(value) ~= "string" then
+      error(string.format("%s is a condition expression", key), 3)
+    end
+    raw = Ext._Internal.StatsConditionIntern(value)
+    if raw == nil then
+      error(string.format(
+        "bg3le could not add the condition %q to the engine's condition "
+        .. "pool; see the stats lines in the extender log", value), 3)
+    end
+  end
+
+  if not Ext._Internal.StatsAttrSet(addr, slot.index, raw) then
+    error(string.format("bg3le could not write %s on this stat", key), 3)
+  end
+
+  -- The snapshot the proxy reads from, so a read back agrees with the write.
+  rawget(self, "__fields")[key] = value
+  return true
+end
+
 local STAT_NOT_WRITABLE =
   "bg3le cannot write stats yet; %s needs the engine's stat sync path, " ..
   "which is not implemented"
@@ -5500,10 +5671,30 @@ local function stat_method(name)
 end
 
 local STAT_METHODS = {
-  Sync = stat_method("Sync"),
   SetPersistence = stat_method("SetPersistence"),
-  SetRawAttribute = stat_method("SetRawAttribute"),
   CopyFrom = stat_method("CopyFrom"),
+
+  SetRawAttribute = function(self, name, value)
+    return stat_write(self, name, value)
+  end,
+
+  -- Nothing to push: the write went into the object the engine reads, and
+  -- the prototype rebuild that upstream's Sync triggers has no symbol here.
+  -- Saying so once beats raising, because a mod that writes an attribute
+  -- and then syncs would lose the write it already made.
+  Sync = function(self)
+    if not rawget(self, "__syncSaid") then
+      rawset(self, "__syncSaid", true)
+      Ext.Log.Print(
+        "bg3le: stat:Sync() has nothing to push -- the attribute was written "
+        .. "to the object the engine reads. What upstream's Sync also does, "
+        .. "rebuilding the spell and status prototypes from the stats, needs "
+        .. "RPGStats::SyncWithPrototypeManager, which has no symbol on this "
+        .. "build; an attribute the engine has already compiled into a "
+        .. "prototype will not change until it rebuilds one")
+    end
+    return true
+  end,
 }
 
 -- An attribute the engine has no value for. Upstream reports the key with a
@@ -5521,8 +5712,8 @@ stat_proxy.__index = function(self, key)
   return v
 end
 
-stat_proxy.__newindex = function(_, key, _)
-  error(string.format(STAT_NOT_WRITABLE, "assigning " .. tostring(key)), 2)
+stat_proxy.__newindex = function(self, key, value)
+  stat_write(self, key, value)
 end
 
 -- Enumerates methods alongside fields, which is what makes a dump match:
@@ -5530,6 +5721,8 @@ end
 -- function entries next to the attributes.
 stat_proxy.__pairs = function(self)
   local fields = rawget(self, "__fields")
+  -- __addr, __slots and __fields are rawset on the proxy itself, not in
+  -- fields, so they cannot appear here.
   local keys = {}
   for k in pairs(fields) do keys[#keys + 1] = k end
   for k in pairs(STAT_METHODS) do keys[#keys + 1] = k end
@@ -5550,8 +5743,9 @@ end
 
 stat_proxy.__name = "Stat"
 
-local function make_stat(fields)
-  return setmetatable({__fields = fields}, stat_proxy)
+local function make_stat(fields, addr, slots)
+  return setmetatable({__fields = fields, __addr = addr, __slots = slots},
+                      stat_proxy)
 end
 
 -- Ext.Stats.Get(name) -> stat object, or nil plus a reason
@@ -5564,12 +5758,18 @@ function Ext.Stats.Get(name)
   if addr == nil then return nil, err end
 
   local fields = {Name = name}
+  local slots = {}
   local n = Ext._Internal.StatsAttrCount(addr)
   for i = 0, n - 1 do
-    local attr, value = read_attribute(addr, i)
+    local attr, value, _, typeName, _, kind = read_attribute(addr, i)
     if attr ~= nil then
       if value == nil then value = STAT_NIL end
       fields[attr] = value
+      -- Where this attribute lives, so assigning to it can write it.
+      -- The kind comes back from the read rather than being asked for
+      -- again: a second StatsAttrAt per attribute doubled the cost of
+      -- Ext.Stats.Get, and a mod's stat pass calls it hundreds of times.
+      slots[attr] = {index = i, kind = kind, typeName = typeName}
     end
   end
 
@@ -5578,7 +5778,7 @@ function Ext.Stats.Get(name)
   if n == 0 then
     fields.AttributesUnavailable =
       "no attributes readable; see the stats lines in the extender log"
-    return make_stat(fields)
+    return make_stat(fields, addr, slots)
   end
 
   -- Fields upstream puts alongside the attributes. Names and shapes follow
@@ -5591,7 +5791,7 @@ function Ext.Stats.Get(name)
   fields.Using = Ext._Internal.StatsUsing(addr) or ""
   fields.ComboCategories = {}
   fields.ComboProperties = {}
-  return make_stat(fields)
+  return make_stat(fields, addr, slots)
 end
 
 -- Ext.Stats.GetTypes(name) -> { attribute = type, ... }

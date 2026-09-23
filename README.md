@@ -185,11 +185,21 @@ component's declared size with the size the engine recorded, and
 - **`ModManager.Settings`.** It sits past a hash map whose size on this build
   is not established, so `GetModManager` returns `BaseModule`,
   `LoadOrderedModules` and `AvailableMods` and omits it
-- **Writing stats.** `Ext.Stats.Get` returns upstream's proxy object with its
-  four methods, but `Sync`, `SetPersistence`, `SetRawAttribute` and
-  `CopyFrom` raise: writing needs the engine's stat sync path, which is not
-  reached yet. They raise rather than no-op so a mod author sees what is
-  missing instead of a change that silently does nothing
+- **Writing stats, except strings and the compiled kinds.** Integer,
+  enumeration and condition attributes are written: an attribute is one
+  `int32` in the stat object, and a condition a mod builds at runtime goes
+  into the spare capacity of the engine's own condition pool. 5eSpells
+  rewrites a few hundred interrupt conditions this way and they read back
+  through a fresh `Ext.Stats.Get`. A `FixedString` attribute can be written
+  too — the string-table entry and the pool slot both work — but with it
+  enabled the engine spends the rest of the level load at 250% CPU in its
+  own code, so it is off unless `BG3LE_STAT_STRING_WRITES=1`. Functors,
+  roll conditions and requirements are held compiled by the engine and are
+  not attempted; `SetPersistence` and `CopyFrom` still raise, and `Sync`
+  reports what it cannot do rather than raising, because a mod that writes
+  and then syncs would otherwise lose the write it already made.
+  [reference/STAT-WRITES.md](reference/STAT-WRITES.md) has the layout and
+  the three theories that were tested and eliminated
 - **Functors, conditions and requirements inside stats.** Their shapes are
   recorded in `reference/stats-spell.txt` — nested objects carrying a
   `TypeId` — and bg3se exposes them through the same property maps this

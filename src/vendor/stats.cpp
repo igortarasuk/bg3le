@@ -42,6 +42,7 @@
 #include <GameDefinitions/Components/All.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <ctime>
@@ -281,6 +282,10 @@ struct Found {
     ArrayRef Int64s{};                  // RPGStats::Int64s
     ArrayRef TranslatedStrings{};       // RPGStats::TranslatedStrings
     ArrayRef Conditions{};              // RPGStats::Conditions
+    // Where that array's header lives, which reading never needed: an
+    // attribute write has to see the capacity and hand out a slot from it.
+    void const* ConditionsHeader{nullptr};
+    void const* StringsHeader{nullptr};     // likewise, for FixedStrings
     bool Attributes{false};             // whether all of the above landed
 };
 
@@ -600,8 +605,17 @@ void find_conditions(unsigned long long poolAddr, Found* f) {
         if (!plausible_conditions(candidate)) continue;
 
         f->Conditions = candidate;
-        logf("stats: condition pool at pool+%zu, %u entries", off,
-             candidate.Size);
+        f->ConditionsHeader = (void const*)(poolAddr + off);
+
+        // The capacity is quoted because whether a mod can add a condition
+        // depends on it: an expression it builds at runtime is not in the
+        // pool, and the only place to put one without taking ownership of
+        // the array away from the engine is the slack past the end.
+        std::uint32_t capacity = 0;
+        read_as((char const*)f->ConditionsHeader + 8, &capacity);
+        logf("stats: condition pool at pool+%zu, %u entries, %u capacity "
+             "(%u spare)", off, candidate.Size, capacity,
+             capacity > candidate.Size ? capacity - candidate.Size : 0);
         return;
     }
     logf("stats: no condition pool found; Conditions attributes report "
@@ -824,6 +838,7 @@ bool build_from_run(unsigned long long run) {
         "modifier lists");
     unsigned long long poolAddr = 0;
     if (find_string_pool(run, &f.Strings, &poolAddr)) {
+        f.StringsHeader = (void const*)poolAddr;
         find_value_pools(poolAddr, &f);
     }
     const bool values = find_named_array(
@@ -1145,19 +1160,123 @@ void const* list_for(void const* object) {
     return list;
 }
 
-void const* modifier_at(void const* object, std::size_t index) {
-    void const* list = list_for(object);
-    if (list == nullptr) return nullptr;
+// The modifiers of one modifier list, read in one go and kept.
+//
+// Every attribute of every stat goes through here, and reading the pointer
+// one at a time cost a system call each: a stat with two hundred
+// attributes paid two hundred, and a mod that walks a few hundred stats
+// paid tens of thousands. There are nine lists in the whole game and they
+// do not change while it runs, so each is read once.
+std::vector<void const*> const* modifiers_of(void const* list) {
+    static std::unordered_map<void const*, std::vector<void const*>> byList;
+    auto known = byList.find(list);
+    if (known != byList.end()) return &known->second;
+
     ArrayRef attrs{};
     if (!array_header_at((char const*)list + state().AttrsOffset, &attrs)) {
         return nullptr;
     }
-    if (index >= attrs.Size) return nullptr;
-    void const* mod = nullptr;
-    if (!read_as((char const*)attrs.Buffer + index * sizeof(void*), &mod)) {
+
+    std::vector<void const*> all(attrs.Size);
+    const std::size_t got =
+        safe_read_some(attrs.Buffer, all.data(), all.size() * sizeof(void*))
+        / sizeof(void*);
+    all.resize(got);
+    if (got == 0) return nullptr;
+
+    return &byList.emplace(list, std::move(all)).first->second;
+}
+
+void const* modifier_at(void const* object, std::size_t index) {
+    void const* list = list_for(object);
+    if (list == nullptr) return nullptr;
+
+    std::vector<void const*> const* mods = modifiers_of(list);
+    if (mods == nullptr || index >= mods->size()) return nullptr;
+    return (*mods)[index];
+}
+
+// What a modifier says about the attribute it describes: its name, the
+// enumeration its values are read through, and the kind that follows from
+// that. Fixed for the run, and shared by every stat on the same list, so
+// this is worth remembering rather than re-reading per attribute per stat.
+struct ModifierMeta {
+    char const* Name{nullptr};
+    char const* TypeName{nullptr};
+    int Kind{13};
+    void const* Enumeration{nullptr};
+};
+
+ModifierMeta const* meta_of(void const* modifier);
+void const* enumeration_for(void const* modifier);
+int property_type(void const* enumeration);
+
+// One object's indexed properties, read in one go.
+//
+// A one-entry cache, because that is the access pattern: everything that
+// reads a stat reads all of its attributes in a row. Keyed by the vector's
+// own bounds as well as the object, so a write through bg3le_stats_attr_set
+// -- which goes to the same memory -- cannot be served a stale copy.
+struct PropertyCache {
+    void const* Object{nullptr};
+    void const* Begin{nullptr};
+    std::vector<std::int32_t> Values;
+};
+
+PropertyCache& property_cache() {
+    static PropertyCache cache;
+    return cache;
+}
+
+std::vector<std::int32_t> const* properties_of(void const* object) {
+    PropertyCache& cache = property_cache();
+
+    void const* begin = nullptr;
+    void const* end = nullptr;
+    auto const* props = (char const*)object + state().PropsOffset;
+    if (!read_as(props + 0, &begin)) return nullptr;
+    if (!read_as(props + 8, &end)) return nullptr;
+    if (begin == nullptr || end < begin) return nullptr;
+
+    if (object == cache.Object && begin == cache.Begin) return &cache.Values;
+
+    const std::size_t count =
+        (std::size_t)((char const*)end - (char const*)begin) / 4;
+    std::vector<std::int32_t> all(count);
+    const std::size_t got =
+        safe_read_some(begin, all.data(), count * sizeof(std::int32_t))
+        / sizeof(std::int32_t);
+    all.resize(got);
+
+    cache.Object = object;
+    cache.Begin = begin;
+    cache.Values = std::move(all);
+    return &cache.Values;
+}
+
+ModifierMeta const* meta_of(void const* modifier) {
+    static std::unordered_map<void const*, ModifierMeta> byModifier;
+    auto known = byModifier.find(modifier);
+    if (known != byModifier.end()) return &known->second;
+
+    Found const& f = state();
+    bg3se::FixedString modName{};
+    if (!read_as((char const*)modifier + f.ModifierNameOffset, &modName)) {
         return nullptr;
     }
-    return mod;
+
+    ModifierMeta meta;
+    meta.Name = text_of(modName);
+    meta.Enumeration = enumeration_for(modifier);
+    meta.Kind = property_type(meta.Enumeration);
+    if (meta.Enumeration != nullptr) {
+        bg3se::FixedString enName{};
+        meta.TypeName =
+            read_as((char const*)meta.Enumeration + f.ValueNameOffset, &enName)
+                ? text_of(enName)
+                : nullptr;
+    }
+    return &byModifier.emplace(modifier, meta).first->second;
 }
 
 // The enumeration a modifier's value should be read through. EnumerationIndex
@@ -1413,42 +1532,17 @@ extern "C" bool bg3le_stats_attr_at(void const* object, std::size_t index,
     void const* mod = modifier_at(object, index);
     if (mod == nullptr) return false;
 
+    ModifierMeta const* meta = meta_of(mod);
+    if (meta == nullptr) return false;
+
     // The attribute's position is its index into the object's values.
-    void const* begin = nullptr;
-    void const* end = nullptr;
-    auto const* props = (char const*)object + f.PropsOffset;
-    if (!read_as(props + 0, &begin)) return false;
-    if (!read_as(props + 8, &end)) return false;
-    if (begin == nullptr || end < begin) return false;
-    const std::size_t count =
-        (std::size_t)((char const*)end - (char const*)begin) / 4;
-    if (index >= count) return false;
+    std::vector<std::int32_t> const* values = properties_of(object);
+    if (values == nullptr || index >= values->size()) return false;
 
-    std::int32_t raw = 0;
-    if (!read_as((char const*)begin + index * sizeof(std::int32_t), &raw)) {
-        return false;
-    }
-
-    bg3se::FixedString modName{};
-    if (!read_as((char const*)mod + f.ModifierNameOffset, &modName)) {
-        return false;
-    }
-
-    void const* en = enumeration_for(mod);
-    if (nameOut != nullptr) *nameOut = text_of(modName);
-    if (typeNameOut != nullptr) {
-        if (en != nullptr) {
-            bg3se::FixedString enName{};
-            *typeNameOut =
-                read_as((char const*)en + f.ValueNameOffset, &enName)
-                    ? text_of(enName)
-                    : nullptr;
-        } else {
-            *typeNameOut = nullptr;
-        }
-    }
-    if (kindOut != nullptr) *kindOut = property_type(en);
-    if (rawOut != nullptr) *rawOut = raw;
+    if (nameOut != nullptr) *nameOut = meta->Name;
+    if (typeNameOut != nullptr) *typeNameOut = meta->TypeName;
+    if (kindOut != nullptr) *kindOut = meta->Kind;
+    if (rawOut != nullptr) *rawOut = (*values)[index];
     return true;
 }
 
@@ -1585,6 +1679,243 @@ extern "C" char const* bg3le_stats_attr_translated(int raw) {
 }
 
 // A Conditions attribute's expression text.
+
+// ---------------------------------------------------------------------------
+// Writing an attribute.
+//
+// An attribute is one int32 in the object's indexed properties, so the
+// write itself is a single store into memory this file already reads. What
+// takes care is the value: most kinds are an index into one of RPGStats'
+// pools, and a value a mod builds at runtime is not in one.
+//
+// Adding to a pool cannot mean growing it. The engine owns those arrays
+// and frees them with its own allocator, so replacing the buffer with one
+// of ours would hand it a pointer to free that it did not allocate. What
+// it can mean is the slack past the end: a Larian array carries a
+// capacity as well as a size, and an entry written into the spare capacity
+// is inside the engine's own buffer.
+//
+// The size is then raised to include it, which the first version of this
+// did not do -- on the theory that an entry the engine does not count is
+// an entry it will never destruct. That was wrong in the way that matters:
+// an index past the size is out of range to every reader, this file's
+// included, so the attribute read back empty. Writing a condition
+// therefore *cleared* it, and an interrupt with no condition is an
+// interrupt that always fires.
+//
+// So a write either finds the value already pooled, or takes a slack slot,
+// or refuses and says which.
+std::size_t& conditions_taken() {
+    static std::size_t taken = 0;
+    return taken;
+}
+
+std::size_t& strings_taken() {
+    static std::size_t taken = 0;
+    return taken;
+}
+
+extern "C" bool bg3le_fixed_string_intern(char const* text,
+                                          std::uint32_t* out);
+
+bool write_bytes(void* at, void const* from, std::size_t size) {
+    // The pools are ordinary heap, not the read-only image, so there is no
+    // protection to change -- but a wrong address must not take the game
+    // down, so the target is proved readable first.
+    unsigned char probe[1] = {};
+    if (!safe_read(at, probe, sizeof(probe))) return false;
+    std::memcpy(at, from, size);
+    return true;
+}
+
+// A sixteen-byte Larian string holding this text, built in place.
+//
+// Fifteen characters or fewer live inside the sixteen bytes and need
+// nothing else. Longer ones need a buffer, and that buffer is ours and
+// stays ours: the entry it belongs to sits past the array's size, so the
+// engine never destructs it and never frees what it points at. A few
+// hundred bytes that outlive the session is the price of not handing the
+// engine a pointer from the wrong allocator.
+bool build_ls_string(void* at, char const* text) {
+    const std::size_t length = std::strlen(text);
+    unsigned char raw[16] = {};
+
+    if (length <= 15) {
+        std::memcpy(raw, text, length);
+        raw[15] = (unsigned char)length;
+        return write_bytes(at, raw, sizeof(raw));
+    }
+
+    if (length > (1u << 20)) return false;
+    char* owned = (char*)std::malloc(length + 1);
+    if (owned == nullptr) return false;
+    std::memcpy(owned, text, length + 1);
+
+    const std::uint64_t buffer = (std::uint64_t)(std::uintptr_t)owned;
+    const std::uint32_t size = (std::uint32_t)length;
+    const std::uint32_t capacity = (std::uint32_t)length | 0x80000000u;
+    std::memcpy(raw + 0, &buffer, sizeof(buffer));
+    std::memcpy(raw + 8, &size, sizeof(size));
+    std::memcpy(raw + 12, &capacity, sizeof(capacity));
+
+    if (write_bytes(at, raw, sizeof(raw))) return true;
+    std::free(owned);
+    return false;
+}
+
+// The pool index for a condition expression: the one it already has, or a
+// slack slot, or -1.
+extern "C" int bg3le_stats_condition_intern(char const* text) {
+    Found const& f = state();
+    if (text == nullptr || f.Conditions.Buffer == nullptr
+        || f.ConditionsHeader == nullptr) {
+        return -1;
+    }
+
+    // What has already been written, so the same expression twice costs
+    // nothing. Searching the pool itself instead reads five thousand
+    // Larian strings, most of them through a pointer, and a mod that
+    // writes forty conditions paid for it forty times.
+    static std::unordered_map<std::string, int> ours;
+    auto known = ours.find(text);
+    if (known != ours.end()) return known->second;
+
+    std::uint32_t capacity = 0;
+    if (!read_as((char const*)f.ConditionsHeader + 8, &capacity)) return -1;
+
+    const std::size_t slot = f.Conditions.Size + conditions_taken();
+    if (slot >= capacity) {
+        logf("stats: the condition pool has %u entries and %u capacity, so "
+             "there is no room for \"%s\"; the engine owns the array and "
+             "growing it would hand it a buffer to free that it did not "
+             "allocate", f.Conditions.Size, capacity, text);
+        return -1;
+    }
+
+    if (!build_ls_string((void*)((char*)f.Conditions.Buffer + slot * 16),
+                         text)) {
+        return -1;
+    }
+    // Now inside the array, so everything that reads it can see it.
+    const std::uint32_t size = (std::uint32_t)(slot + 1);
+    write_bytes((void*)((char*)f.ConditionsHeader + 12), &size, sizeof(size));
+    const_cast<ArrayRef&>(f.Conditions).Size = size;
+
+    ++conditions_taken();
+    ours.emplace(text, (int)slot);
+
+    // Truncated, and quiet after the first few: these run to six hundred
+    // characters and a mod writes dozens.
+    static std::size_t said = 0;
+    if (++said <= 3) {
+        logf("stats: condition written to pool slot %zu, in the array's own "
+             "spare capacity (%zu of %u used): \"%.64s%s\"", slot,
+             conditions_taken(), capacity - f.Conditions.Size, text,
+             std::strlen(text) > 64 ? "..." : "");
+    }
+    return (int)slot;
+}
+
+// The pool index for a FixedString attribute's text.
+//
+// Two steps, because the pool holds string-table ids rather than text: get
+// an id for the text, then a slot in the pool that holds it. A slot the
+// pool already has is free; otherwise one comes out of the array's spare
+// capacity, on the same terms as a condition.
+extern "C" int bg3le_stats_string_intern(char const* text) {
+    Found const& f = state();
+    if (text == nullptr || f.Strings.Buffer == nullptr
+        || f.StringsHeader == nullptr) {
+        return -1;
+    }
+
+    std::uint32_t id = 0;
+    if (!bg3le_fixed_string_intern(text, &id)) return -1;
+
+    // Where each id already sits, read once. The pool is four bytes per
+    // entry, so the whole thing is one read of a hundred and twenty
+    // kilobytes -- worth doing, because reusing a slot leaves the spare
+    // capacity for ids that need it.
+    static std::unordered_map<std::uint32_t, int> slots;
+    static bool mapped = false;
+    if (!mapped) {
+        mapped = true;
+        std::vector<std::uint32_t> all(f.Strings.Size);
+        const std::size_t got = safe_read_some(
+            f.Strings.Buffer, all.data(),
+            all.size() * sizeof(std::uint32_t)) / sizeof(std::uint32_t);
+        for (std::size_t i = 1; i < got; ++i) {
+            slots.emplace(all[i], (int)i);
+        }
+        logf("stats: %zu of the string pool's %u slots indexed for writing",
+             slots.size(), f.Strings.Size);
+    }
+
+    auto known = slots.find(id);
+    if (known != slots.end()) return known->second;
+
+    std::uint32_t capacity = 0;
+    if (!read_as((char const*)f.StringsHeader + 8, &capacity)) return -1;
+
+    const std::size_t slot = f.Strings.Size + strings_taken();
+    if (slot >= capacity) {
+        logf("stats: the string pool has %u entries and %u capacity, so "
+             "there is no room for another; the engine owns the array and "
+             "growing it would hand it a buffer to free that it did not "
+             "allocate", f.Strings.Size, capacity);
+        return -1;
+    }
+
+    if (!write_bytes((void*)((char*)f.Strings.Buffer
+                             + slot * sizeof(std::uint32_t)),
+                     &id, sizeof(id))) {
+        return -1;
+    }
+    const std::uint32_t size = (std::uint32_t)(slot + 1);
+    write_bytes((void*)((char*)f.StringsHeader + 12), &size, sizeof(size));
+    const_cast<ArrayRef&>(f.Strings).Size = size;
+
+    ++strings_taken();
+    slots.emplace(id, (int)slot);
+
+    static std::size_t said = 0;
+    if (++said <= 3) {
+        logf("stats: string id %#x written to pool slot %zu, in the array's "
+             "own spare capacity (%zu of %u used)", id, slot, strings_taken(),
+             capacity - f.Strings.Size);
+    }
+    return (int)slot;
+}
+
+// One int32 into the object's indexed properties, which is what an
+// attribute is.
+extern "C" bool bg3le_stats_attr_set(void const* object, std::size_t index,
+                                     int raw) {
+    Found const& f = state();
+    if (!f.Attributes || object == nullptr) return false;
+
+    void const* begin = nullptr;
+    void const* end = nullptr;
+    auto const* props = (char const*)object + f.PropsOffset;
+    if (!read_as(props + 0, &begin)) return false;
+    if (!read_as(props + 8, &end)) return false;
+    if (begin == nullptr || end < begin) return false;
+
+    const std::size_t count =
+        (std::size_t)((char const*)end - (char const*)begin) / 4;
+    if (index >= count) return false;
+
+    const std::int32_t value = raw;
+    if (!write_bytes((void*)((char*)begin + index * sizeof(std::int32_t)),
+                     &value, sizeof(value))) {
+        return false;
+    }
+
+    // The reader keeps one object's values, and this just changed them.
+    if (property_cache().Object == object) property_cache().Object = nullptr;
+    return true;
+}
+
 extern "C" char const* bg3le_stats_attr_condition(int raw) {
     Found const& f = state();
     if (raw <= 0 || f.Conditions.Buffer == nullptr) return nullptr;
