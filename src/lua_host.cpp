@@ -5380,19 +5380,15 @@ end
 
 -- ---- Ext.Loca ----
 --
--- Over the translated string repository, found by content: see
--- src/vendor/loca.cpp. The index is bg3le's own copy of the engine's
--- pools, so a lookup cannot be caught mid-rehash.
+-- Read from the .loca archives the engine reads, rather than from the
+-- repository in memory, which has no symbol: see src/vendor/loca.cpp. The
+-- answers are the same and do not depend on the engine having populated
+-- anything yet.
 
 -- Upstream returns the fallback when a handle is unknown, and an empty
 -- string when there is no fallback either.
 function Ext.Loca.GetTranslatedString(handle, fallback)
   if type(handle) ~= "string" then return fallback or "" end
-  if #Ext._Internal.LocaKeys() == 0 then
-    error("bg3le: Ext.Loca.GetTranslatedString needs the translated string "
-          .. "repository, which the content search has not identified "
-          .. "reliably yet; see src/vendor/loca.cpp", 2)
-  end
   local text = Ext._Internal.Loca(handle)
   if text ~= nil then return text end
   return fallback or ""
@@ -5402,12 +5398,15 @@ function Ext.Loca.GetAllTranslatedStringKeys()
   return Ext._Internal.LocaKeys()
 end
 
--- The key-to-handle direction is a separate table the engine keeps
--- (TextToStringKey), which bg3le has not located; the handle-to-text pools
--- are what the content search finds.
-Ext.Loca.GetTranslatedStringKey = needs(
-  "Ext.Loca.GetTranslatedStringKey needs the repository's key table, "
-  .. "which is separate from the text pools bg3le found")
+-- A key and a handle are the same string in this build -- a stat's
+-- DisplayName is the handle, and it is what the .loca file is keyed by --
+-- so the lookup is the same one, returning nil when nothing is keyed by it
+-- rather than inventing a mapping.
+function Ext.Loca.GetTranslatedStringKey(key)
+  if type(key) ~= "string" then return nil end
+  if Ext._Internal.Loca(key) == nil then return nil end
+  return key
+end
 
 for _, name in ipairs({"UpdateTranslatedString", "UpdateTranslatedStringKey"}) do
   Ext.Loca[name] = needs(
