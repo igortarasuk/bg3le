@@ -55,12 +55,22 @@ file(GLOB LUA_SOURCES external/lua/*.c)
 # own headers rely on that: lua.h names CMetatable and TString without a
 # struct tag, which is only legal in C++.
 set_source_files_properties(${LUA_SOURCES} PROPERTIES LANGUAGE CXX)
+# CMP0119 NEW passes -x c++ for LANGUAGE CXX sources;
+# else clang++ warns about a .c input compiled as C++.
+if(POLICY CMP0119)
+    cmake_policy(SET CMP0119 NEW)
+endif()
 add_library(lua_static STATIC ${LUA_SOURCES})
 target_include_directories(lua_static PUBLIC external/lua)
 target_compile_definitions(lua_static PRIVATE LUA_USE_LINUX)
 # ltable.c uses uintptr_t, which MSVC's headers supply transitively and
 # libc++ does not.
 target_compile_options(lua_static PRIVATE -include cstdint)
+# Upstream fork's C idioms that clang flags as C++;
+# not ours to fix, so silenced for this target only.
+target_compile_options(lua_static PRIVATE
+    -Wno-string-plus-int -Wno-deprecated-enum-enum-conversion
+    -Wno-null-conversion)
 set_target_properties(lua_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------

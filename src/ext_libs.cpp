@@ -495,7 +495,9 @@ std::vector<PakModule> const& pak_modules() {
             });
 
         for (std::string const& name : names) {
-            PakModule module{path, name, {}};
+            PakModule module;
+            module.Pak = path;
+            module.Name = name;
             auto it = metas.find("Mods/" + name + "/meta.lsx");
             if (it != metas.end()) {
                 std::string const& meta = it->second;
