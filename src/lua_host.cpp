@@ -5605,11 +5605,14 @@ local function load_positions(modules)
   end
 
   local extra = 0
+  local missing = {}
   for _, uuid in ipairs(Ext._Internal.ModSettingsOrder() or {}) do
     if positions[uuid] == nil then
       after = after + 1
       positions[uuid] = after
       extra = extra + 1
+      local mod = Ext.Mod.GetMod(uuid)
+      missing[#missing + 1] = mod ~= nil and mod.Info.Name or uuid
     end
   end
 
@@ -5618,10 +5621,20 @@ local function load_positions(modules)
     -- what it needs where you are standing, and the rest of what the
     -- player enabled is still installed and still theirs to script
     -- against. reference/MOD-LOADING.md has the evidence.
-    Ext.Log.Print(string.format(
-      "bg3le: the engine's load order has %d modules; %d mods enabled in "
-      .. "modsettings.lsx are not among them, and their scripts load "
-      .. "after it", #Ext.Mod.GetLoadOrder(), extra))
+    -- Named rather than counted while there are few of them: one missing
+    -- mod is a question ("which?"), a long list is a summary.
+    if extra <= 5 then
+      Ext.Log.Print(string.format(
+        "bg3le: the engine's load order has %d modules; it does not include "
+        .. "%s, which modsettings.lsx enables, so %s scripts load after it",
+        #Ext.Mod.GetLoadOrder(), table.concat(missing, ", "),
+        extra == 1 and "its" or "their"))
+    else
+      Ext.Log.Print(string.format(
+        "bg3le: the engine's load order has %d modules; %d mods enabled in "
+        .. "modsettings.lsx are not among them, and their scripts load "
+        .. "after it", #Ext.Mod.GetLoadOrder(), extra))
+    end
   end
   return positions
 end

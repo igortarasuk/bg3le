@@ -1,7 +1,8 @@
 # What the engine loads, and what bg3le loads
 
-Written 2026-09-23, after installing the 57-mod Windows backup into the
-native Linux install and finding that the game loaded exactly one of them.
+Written 2026-09-23 after installing the 57-mod Windows backup into the
+native Linux install, and revised the same day when the cause turned out
+to be something else entirely.
 
 ## Where mods go
 
@@ -14,40 +15,42 @@ with the same paks in `<install>/Data/Mods` it reported **16**. That
 directory holds unpacked module trees — here only `GustavX/` — and the
 engine does not read paks from it.
 
-`modsettings.lsx` is read: Mod Configuration Menu appears in the load
-order when it is listed there and disappears when the entry is removed.
+## Why the engine loaded only one mod, and what fixed it
 
-## What the engine loads
+For a whole session of testing, the engine's load order held 14 modules:
+the 13 base ones and Mod Configuration Menu. The other 56 mods were
+listed in `modsettings.lsx`, present in `Mods`, and reported as available
+— and never loaded.
 
-Of the 57, the engine loads **Mod Configuration Menu** and nothing else,
-at the main menu and with a savegame up, on this machine.
+The cause was **`ModCrashSanityCheck`**. The game writes that directory
+into the profile while it runs and removes it on a clean exit; finding one
+at startup is how it decides the last run crashed, and it disables mods
+when it does. Every test run here ends with the game being killed, so the
+marker was there every time. bg3se removes it at startup for exactly this
+reason (`CleanupSanityCheck` in `ScriptExtenderClient.cpp`); bg3le did
+not. It does now, and the next run's load order held **69 modules**.
 
-That is not bg3le's doing. `NOPRELOAD=1 ./run-native.sh` runs the game
-with no shim at all, and `tools/memgrep <pid> <string>` reads its memory
-from outside: the vanilla game has none of 5eSpells' stat names in
-memory either, and the same fourteen modules in its list.
+The single exception is worth keeping, because it is what made the cause
+hard to see: MCM loaded even with mods disabled. That is content-driven
+mounting rather than the load order. Stripping MCM down establishes it:
 
-Ruled out, each by a launch with a purpose-built archive
-(`tools/modsettings --repack/--only/--without/--merge/--rename/--make`):
-
-| Changed | Result |
+| Archive | Loaded |
 | --- | --- |
-| The refused mod's meta given MCM's shape, version and attribute types | still refused |
-| The refused mod's UUID put on MCM | MCM still loads |
-| MCM's UUID and folder put on the refused mod | still refused |
-| The pak's priority byte set to MCM's 100 | still refused |
-| `LSWString` attributes rewritten as `LSString` | still refused |
-| MCM repacked uncompressed, folder renamed throughout | still loads |
-| MCM's `Mods/` tree alone | **refused** |
-| MCM's `Mods/` tree plus its `Localization/` | loads |
-| MCM's `Mods/` tree plus its `Public/` | loads |
-| MCM's `Mods/` + `Public/` plus the refused mod's `Public/<Folder>/` | loads |
+| MCM as shipped, and repacked uncompressed under another folder name | yes |
+| MCM's `Mods/` tree alone | **no** |
+| MCM's `Mods/` tree plus its `Localization/` | yes |
+| MCM's `Mods/` tree plus its `Public/` | yes |
+| MCM's `Mods/` + `Public/` plus another mod's `Public/<Folder>/` | yes |
 
-So it is the content, and specifically whether anything reads it where
-you are looking. MCM overrides `Public/Shared/GUI` and
-`Public/Shared/Content/UI`, which the main menu reads. Every other mod in
-the set keeps its content under `Mods/<Folder>/` or `Public/<Folder>/`,
-which nothing at the menu touches.
+MCM overrides `Public/Shared/GUI` and `Public/Shared/Content/UI`, which
+the main menu reads. Every other mod in the set keeps its content under
+`Mods/<Folder>/` or `Public/<Folder>/`, which nothing at the menu touches.
+
+Things ruled out along the way, each by a launch with a purpose-built
+archive (`tools/modsettings --repack/--only/--without/--merge/--rename/--make`):
+the metadata (MCM's meta.lsx shape, version, attribute types, even its
+UUID), the folder name, the pak's priority byte, its MD5, and its
+compression. None of them changes the answer.
 
 Two more things worth knowing:
 
@@ -63,12 +66,16 @@ Two more things worth knowing:
 
 Mod scripts, from inside the paks, for every mod in the engine's load
 order and then for anything else enabled in `modsettings.lsx`. The second
-half is a deliberate divergence from upstream, and the reason the five
-script mods in this set — BG3MCM, 5eSpells, LenonTweaks,
-TashasFightingStyles, TashasRanger — run at all here.
+half is a deliberate divergence from upstream; it is what kept the five
+script mods running while the engine was loading none of them, and it is
+harmless now that the engine loads them.
 
 Each mod gets `Mods[ModTable]` as its environment with the real globals
 behind it, `ModuleUUID` set for the duration of its bootstrap and left in
 its table afterwards, `require` resolving against its own `Lua/`
 directory, and `Ext.IO.LoadFile(path, "data")` falling through to the
 archives when the file is not on disk.
+
+`BootstrapClient.lua` is not run at all: bg3le has one Lua context, the
+server's. For a UI mod that is most of the mod, so the mods that ship one
+are named at load time.

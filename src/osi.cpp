@@ -452,6 +452,12 @@ bool load_cached_signatures(char const* story,
     std::unordered_map<std::string, DbEntry> loaded;
     char line[1024];
     while (std::fgets(line, sizeof(line), f) != nullptr) {
+        std::size_t story = 0;
+        if (std::sscanf(line, "# story %zu", &story) == 1) {
+            g_story_functions = story;
+            continue;
+        }
+
         char key[512] = {};
         int outs = 0;
         char types[256] = {};
@@ -498,6 +504,11 @@ void save_cached_signatures(char const* story) {
 
     std::FILE* f = std::fopen(path.c_str(), "w");
     if (f == nullptr) return;
+    // First line: how many of these the story defines itself. Counted while
+    // walking, and reported on a cached run too -- otherwise the line about
+    // uncallable procedures appears on the first run and vanishes on the
+    // second, which reads like something changed.
+    std::fprintf(f, "# story %zu\n", g_story_functions);
     for (auto const& entry : database()) {
         std::fprintf(f, "%s %d", entry.first.c_str(), entry.second.Outs);
         for (std::size_t i = 0; i < entry.second.Types.size(); ++i) {
@@ -631,6 +642,27 @@ std::size_t load_out_param_counts(std::vector<Function>* functions,
         }
     }
     type_offset() = bestHits > applied / 2 ? bestAt : 0;
+
+    // How many of these the story defines itself, counted here so the cache
+    // can carry it: story_functions() works it out again later, but the
+    // cache is written before that runs.
+    std::unordered_set<std::string> mapped;
+    for (Function const& fn : *functions) {
+        mapped.insert(fn.name + "/" + std::to_string(fn.params.size()));
+    }
+    g_story_functions = 0;
+    for (auto const& entry : by_name) {
+        if (mapped.count(entry.first) != 0 || entry.second.Def == 0) continue;
+        std::uint32_t type = 0;
+        std::uint32_t handle = 0;
+        if (type_offset() == 0
+            || !read_type_and_handle(entry.second.Def, type_offset(), &type,
+                                     &handle)
+            || handle == 0) {
+            ++g_story_functions;
+        }
+    }
+
     save_cached_signatures(story);
     // One known signature, dumped, so the parameter type list can be read
     // off rather than guessed at. BG3LE_DUMP_SIG=1.
