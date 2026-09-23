@@ -56,11 +56,13 @@ component's declared size with the size the engine recorded, and
   dispatch handle and so cannot go through the DIV boundary at all. They run
   the way the engine runs them: a tuple is inserted into the Rete node the
   function stands for. `Osi.DB_Foo(...)` inserts a fact, `Osi.DB_Foo:Get(...)`
-  reads them back with nil as a wildcard, and a bare `PROC_Foo(...)` works as
-  it does upstream. Osiris interns its strings, so an argument is interned
+  reads them back with nil as a wildcard, `Osi.DB_Foo:Delete(...)` retracts
+  with nil as a wildcard there too, and a bare `PROC_Foo(...)` works as it
+  does upstream. Osiris interns its strings, so an argument is interned
   through `COsiStringTable::AddStr` and released afterwards. Nothing here is
   bg3se's offsets: `InsertTuple` is at `+0x68` on this build, not `+0x50`,
-  and the structures were read out of `COsiris::Event`'s own disassembly —
+  `DeleteTuple` at `+0x70` and not `+0x78`, and the structures were read out
+  of the engine's own disassembly —
   see [reference/OSIRIS-STORY-CALLS.md](reference/OSIRIS-STORY-CALLS.md).
   Resolved on first mention rather than at load, as upstream resolves its
   own, so the level load still costs 0.09s
@@ -150,10 +152,6 @@ component's declared size with the size the engine recorded, and
   `BootstrapClient.lua` never runs — for a UI mod that is most of the mod.
   The mods that ship one are named at load time rather than half-loaded in
   silence
-- **`DB_Foo:Delete` raises.** Retracting a fact is a different slot in the
-  node vtable, and unlike the insert slot it has not been found in the
-  engine's own code yet, so it says so rather than calling a guess. Reading
-  and inserting both work
 - **One session per process.** The story-load work runs once, so loading a
   second save without restarting leaves Osiris bound to the first story's
   mappings and every mod's script from the first session. Upstream resets

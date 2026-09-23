@@ -104,6 +104,11 @@ enum class Status {
 // cached between runs, and recovering them walks Osiris' database.
 bool story_function(char const* name, bool* is_database);
 
+// Retracts facts from a story database. A `kNone` argument is a wildcard
+// for that column, as a nil is upstream.
+Status remove(char const* key, std::vector<Value> const& args,
+              std::string* why);
+
 // The facts a story database holds, one row per fact, typed as declared.
 bool facts(char const* key, std::vector<std::vector<Value>>* rows);
 

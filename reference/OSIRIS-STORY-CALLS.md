@@ -163,12 +163,32 @@ thread. So names resolve on first mention through a metatable, the way
 bg3se resolves its own `Osi.*`, and a session where no mod calls a
 procedure never pays. The level load spends 0.09s in bg3le either way.
 
-## What is not done
+## Retracting is +0x70
 
-`DB_Foo:Delete` raises. Retracting a fact is a different slot, and no
-call site in the engine's own code has been found for it yet; the
-neighbours suggest `+0x78`, which is exactly the kind of inference that
-would have put `InsertTuple` at `+0x58`.
+Found the same way, and worth spelling out because the neighbouring
+slots suggest `+0x78`. The rule-action dispatcher branches on the
+action's own insert/delete flag:
+
+```
+cmpb $0x0,0x10(%r13)
+je   <add>                 ; logs " [add fact]",    calls *0x68
+                           ; logs " [delete fact]", calls *0x70
+```
+
+Both arms take the node out of the same manager and pass the same
+parameter list, and the engine names each operation itself in the string
+it logs. Guessing from bg3se's spacing — `InsertTuple` then
+`PushDownTuple` then `DeleteTuple`, eight bytes apart — would have picked
+`+0x78`, which is the same mistake that puts `InsertTuple` at `+0x58`.
+
+A nil column in a retract is a wildcard, which the engine wants as a
+*cleared* value rather than an absent one: no type, `IsValid` off. That
+is bg3se's `TypedValue::ClearValue`, and `LuaToOsi`'s `allowNil` does the
+same thing on Windows.
+
+Verified on `DB_CRIME_Assault_NoFallback`: one fact to start, two after
+an insert, one after `Delete("BG3LE_DELETE_ME")` — the right one — and
+none after `Delete(nil)`. The story's own fact was put back afterwards.
 
 ## How it was proved
 

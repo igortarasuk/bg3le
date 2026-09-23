@@ -168,15 +168,31 @@ int osi_db_get(lua_State* L) {
     return 1;
 }
 
-// DB_Name:Delete(...) -- not yet: retracting a fact is a different
-// vtable slot, and this one has not been established from the engine's
-// own code the way the insert slot was. Erroring is the honest answer;
-// calling a slot on a guess is how the game goes down.
+// DB_Name:Delete(...) -- retracts every fact that matches, with nil as a
+// wildcard for a column, as upstream has it.
 int osi_db_delete(lua_State* L) {
     char const* name = lua_tostring(L, lua_upvalueindex(1));
-    return luaL_error(L,
-        "Osi.%s:Delete is not implemented yet: the retract slot in the node "
-        "vtable has not been identified on this build", name);
+    const int argc = lua_gettop(L) - 1;
+
+    std::vector<osi::Value> args;
+    args.reserve(argc > 0 ? argc : 0);
+    for (int i = 2; i <= lua_gettop(L); ++i) {
+        osi::Value v;
+        if (lua_isnil(L, i)) {
+            v.type = osi::kNone;  // any value in this column
+        } else if (!to_value(L, i, &v)) {
+            return luaL_error(L, "Osi.%s:Delete: argument %d has unsupported "
+                              "type %s", name, i - 1, luaL_typename(L, i));
+        }
+        args.push_back(std::move(v));
+    }
+
+    const std::string key = std::string(name) + "/" + std::to_string(argc);
+    std::string why;
+    if (osi::remove(key.c_str(), args, &why) != osi::Status::kHandled) {
+        return luaL_error(L, "Osi.%s:Delete: %s", name, why.c_str());
+    }
+    return 0;
 }
 
 // Osi.Name for a story-defined function, built the first time the name is

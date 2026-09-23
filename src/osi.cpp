@@ -1996,6 +1996,14 @@ namespace {
 // after. Interned strings are released afterwards all the same.
 constexpr std::uintptr_t kInsertTuple = 0x68;
 
+// And retracting one is +0x70, from the same standard of evidence: the
+// rule-action dispatcher branches on the action's insert/delete flag --
+// `cmpb $0x0,0x10(%r13)` -- and the two arms log " [add fact]" and
+// " [delete fact]" before calling +0x68 and +0x70 respectively, both with
+// the same node and the same parameter list. bg3se's spacing would have
+// suggested +0x78.
+constexpr std::uintptr_t kDeleteTuple = 0x70;
+
 struct TupleNode;
 
 struct alignas(8) TypedValueRec {
@@ -2174,7 +2182,7 @@ bool plausible_method(std::uintptr_t at) {
 // Put a tuple into a story function's node, which is what running it
 // means. `args` are already in the function's declared order.
 Status insert_tuple(char const* key, std::vector<Value> const& args,
-                    std::string* why) {
+                    std::uintptr_t slot, std::string* why) {
     auto fail = [why](char const* text) {
         if (why != nullptr) *why = text;
         return Status::kUnavailable;
@@ -2211,8 +2219,8 @@ Status insert_tuple(char const* key, std::vector<Value> const& args,
     }
 
     std::uintptr_t target = 0;
-    if (!peek(vtable + kInsertTuple, &target) || !plausible_method(target)) {
-        return fail("the node's insert slot does not hold a function");
+    if (!peek(vtable + slot, &target) || !plausible_method(target)) {
+        return fail("the node's tuple slot does not hold a function");
     }
 
     void* listVtable = reinterpret_cast<void*>(tuple_vtable());
@@ -2229,6 +2237,17 @@ Status insert_tuple(char const* key, std::vector<Value> const& args,
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::uint16_t declared = entry->second.Types[i];
         TypedValueRec& value = values[i];
+
+        // kNone is how the caller says nil, which on a retract means
+        // "any value in this column". The engine wants a cleared value
+        // for that -- no type and IsValid off -- not an absent one.
+        if (args[i].type == kNone) {
+            value.Type = kNone;
+            value.Flags = 0x02;
+            list.append(&nodes[i], &value);
+            continue;
+        }
+
         value.Type = declared;
         value.Flags = 0x02 | 0x08;  // TypedValue | IsValid
 
@@ -2280,7 +2299,12 @@ void probe_strings(char const* text) { probe_string_pool(text); }
 
 Status insert(char const* key, std::vector<Value> const& args,
               std::string* why) {
-    return insert_tuple(key, args, why);
+    return insert_tuple(key, args, kInsertTuple, why);
+}
+
+Status remove(char const* key, std::vector<Value> const& args,
+              std::string* why) {
+    return insert_tuple(key, args, kDeleteTuple, why);
 }
 
 // Does the story define a function by this name, and is it a database?
