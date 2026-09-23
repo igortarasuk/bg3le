@@ -23,10 +23,22 @@
 // then freed a pointer it had never allocated -- which crashed the game on
 // close. Anything handed to the engine has to come from the engine's heap.
 //
-// It reapplies, rather than patching once. The pool the menu reads is not
-// necessarily the one that exists eight seconds after load: the engine
-// builds pools as it goes, and a later one arrives with the original text
-// in it.
+// It reapplies rather than patching once, and a watcher thread catches the
+// string within a fraction of a second of it appearing.
+//
+// None of which is enough. The interface resolves this string into its own
+// copy -- rendered text is UTF-16 there -- and after that the source is
+// just data nobody reads. There is exactly one copy of the UTF-8 string in
+// the address space, it is patched correctly, and the menu shows the
+// original.
+//
+// bg3se does not edit the source. It calls
+// TranslatedStringRepository::UpdateTranslatedString, which goes through
+// the engine and takes whatever the interface caches with it. Getting
+// there needs that method's address, and no engine function in this build
+// carries a symbol -- so it needs code pattern-matching against the
+// image, the same capability the manager lookups want. Until that exists
+// this stays behind BG3LE_MENU_TEXT=1.
 
 #include <stdafx.h>
 
@@ -88,6 +100,8 @@ char const* build_replacement(char const* original) {
     return buffer;
 }
 
+// Counts UTF-16 copies of the line and shows what surrounds them, so the
+// interface's own string can be found rather than guessed at.
 }  // namespace
 
 // Patches every copy of the menu's version string. Returns how many it
