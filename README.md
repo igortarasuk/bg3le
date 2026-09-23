@@ -23,14 +23,44 @@ component's declared size with the size the engine recorded, and
 ## What works
 
 - Osiris is live: `Osi.*` and the bare-global helpers, callable from an
-  interactive prompt while the game runs
+  interactive prompt while the game runs. Out-parameter counts and parameter
+  types come from Osiris' own function database rather than from the
+  caller's argument count, and the answer is cached under the story version
+  — walking it costs 130,000 reads on the story thread otherwise
 - Lua host with `Ext.Log`, `Ext.Json`, `Ext.Math` (scalar), `Ext.Table`,
   `Ext.Timer`, `Ext.Utils`, and `_D`/`_P`/`_PW`/`_PE`. The interpreter is
   Norbyte's Lua fork, the same one bg3se uses — see
   [external/lua/README.bg3le](external/lua/README.bg3le) for why that is not
   optional
-- Loose-file mod loading: `Mods.<ModTable>`, `Config.json`, `BootstrapServer.lua`
-  and `Ext.Require`, discovered via `BG3LE_MOD_PATH`
+- **Installed mods run.** Mods ship their Lua inside a `.pak`, so bg3le reads
+  the archives in the profile's `Mods` directory and the install's
+  `Data/Mods`, finds each module by its `ScriptExtender/Config.json`, and
+  loads its bootstrap, `Ext.Require` targets and plain `require()` calls
+  straight out of the archive. Each mod gets `Mods[ModTable]` as its
+  environment with the real globals behind it, and `ModuleUUID` set before
+  its table enters `Mods` — Mod Configuration Menu watches that assignment,
+  so filling it in afterwards makes every mod look anonymous. Loose
+  directories still work, via `BG3LE_MOD_PATH`. Of one 57-mod set, all five
+  script mods load and run, MCM included (v1.40.1, "SE version 32")
+- **Achievements with mods active**, the way bg3se's `EnableAchievements`
+  does on Windows but by a different route: nothing here exports
+  `ls::ModuleSettings::IsModded` to patch, so bg3le hooks
+  `SteamInternal_FindOrCreateUserInterface`, patches the `ISteamUserStats`
+  vtable slot, and calls `SetAchievement`/`StoreStats` itself when Osiris
+  dispatches `UnlockAchievement`. Contributed by Igor Tarasyuk; the
+  investigation, dead ends included, is in
+  [reference/ACHIEVEMENTS-DIAGNOSIS.md](reference/ACHIEVEMENTS-DIAGNOSIS.md).
+  `BG3LE_ACHIEVEMENTS=0` turns it off
+- **The engine's own managers found once and remembered.** Everything located
+  by content — `RPGStats`, the mod load order, the spell and status
+  prototype managers — has the path from a static pointer to it recorded
+  under the build id, so later runs dereference instead of scanning. The
+  search runs backwards: what points at the manager, what points at that,
+  until something in the executable's own writable data does. Story-load
+  work went from 30.3s to 0.07s
+- **A line on the main menu**, as upstream has: the localisation string is
+  patched from the game's own heap the moment it appears, before the
+  interface resolves it into its own copy
 - `Ext.Entity` against the live ECS: `Ext.Entity.Get(uuid)`, component reads
   and writes, and `entity:Replicate(name)` that reaches the client. The engine
   names every ECS type index in its symbol table, so the component and
@@ -96,19 +126,34 @@ component's declared size with the size the engine recorded, and
 
 ## What is left
 
-- **Most of `Ext.*`.** Around 245 functions bg3se exposes have no equivalent
-  here yet — `Ext.Loca`, `Ext.Vars`, `Ext.Level`, `Ext.Net` and the
-  client-side modules are declared but empty. The ECS plumbing they need is
-  done, and `reference/ext-api-surface.txt` lists every one of them with its
-  shape, so they are no longer guesswork
-- **`ModId` on a stat, and `ModManager.Settings`.** Upstream does not read
-  `ModId` off the stat — there is no such field — it watches which mod's
-  `.txt` was open as each entry was parsed. bg3le is preloaded before the
-  game starts, so it can hook the same thing, but it does not yet, and the
-  two keys are absent rather than filled with a plausible guess. `Settings`
-  sits past a hash map whose size on this build is not established, so
-  `GetModManager` returns `BaseModule`, `LoadOrderedModules` and
-  `AvailableMods` and omits it
+- **86 of `Ext.*` refuse rather than answer.** Every name bg3se exposes is
+  present — `tools/api-coverage.lua` reports 715 of 715 — but the ones
+  needing machinery bg3le does not have raise instead of returning a
+  plausible wrong answer: stat writes, functor execution, `Ext.Level`'s
+  physics and pathfinding, `Entity.Create`/`Destroy`, the atlas and resource
+  managers, `GlobalSwitches`, and anything that sends over the network.
+  `reference/ext-api-surface.txt` lists them with their shapes
+- **No client Lua context.** bg3le runs the server's, so a mod's
+  `BootstrapClient.lua` never runs — for a UI mod that is most of the mod.
+  The mods that ship one are named at load time rather than half-loaded in
+  silence
+- **The story's own Osiris functions are readable but not callable.** All
+  3,425 of them resolve to a node that agrees about its id and its function,
+  and the node and database lists are located (153,863 and 15,868 entries),
+  so `Osi.PROC_*` and `Osi.DB_*` are within reach. What is missing is
+  strings: Osiris stores a handle rather than a pointer, and the handle's
+  encoding is not cracked yet — `BG3LE_PROBE_STRINGS=1` records what it is
+  not (no hash of the text matches any of 32,010 stored handles) and what it
+  is (composite and sequential, consecutive facts differing by 0x200001)
+- **One session per process.** The story-load work runs once, so loading a
+  second save without restarting leaves Osiris bound to the first story's
+  mappings and every mod's script from the first session. Upstream resets
+  its Lua state per session; telling a new session from the two or three
+  story loads that make up one needs the game state machine, which bg3le
+  does not read yet. It says so rather than resetting at the wrong moment
+- **`ModManager.Settings`.** It sits past a hash map whose size on this build
+  is not established, so `GetModManager` returns `BaseModule`,
+  `LoadOrderedModules` and `AvailableMods` and omits it
 - **Writing stats.** `Ext.Stats.Get` returns upstream's proxy object with its
   four methods, but `Sync`, `SetPersistence`, `SetRawAttribute` and
   `CopyFrom` raise: writing needs the engine's stat sync path, which is not
@@ -188,10 +233,42 @@ container matters for debugging: inside it, libraries are recorded under
 `/run/host`, which does not resolve from outside the namespace, and `perf`
 can symbolize nothing.
 
+Mods live in `~/.local/share/Larian Studios/Baldur's Gate 3/Mods` with the
+load order in `PlayerProfiles/Public/modsettings.lsx`, and one thing about
+that will waste a day if you do not know it: the game writes a
+`ModCrashSanityCheck` directory into the profile while it runs, deletes it on
+a clean exit, and **disables every mod when it finds one left behind**. Kill
+the game — as any test harness does — and the next run loads no mods. bg3le
+removes it at startup, as bg3se does; `BG3LE_KEEP_SANITY_CHECK=1` keeps it,
+which is how that was attributed (14 modules with it, 69 without).
+[reference/MOD-LOADING.md](reference/MOD-LOADING.md) has the rest, including
+that a savegame's module list replaces the load order.
+
 Offsets are pinned to game version `4.8.400.7143220`. `tools/find_slots.py` and
 `tools/recover_symbols.py` regenerate them for a new build. The reference
 capture in `reference/` was taken against game `v4.73.98.727`, recorded in
 `reference/version.txt` so a later mismatch is attributable.
+
+## Contributing
+
+Patches welcome. Four checks want running before a pull request, all of which
+work without the game:
+
+    ./tools/check-symbols.sh        # nothing references an undefined bg3le symbol
+    ./tools/check-prelude.sh        # the Lua embedded in lua_host.cpp parses
+    python3 client/tools/check-output.py   # the console's terminal handling
+    python3 client/tools/check-prompt.py   # prompt width against readline's idea of it
+
+`check-symbols.sh` is the one that matters most: the library links with
+undefined symbols allowed, because it has to interpose the engine's own, so a
+missing definition of *ours* builds cleanly and then kills the game at the
+first call. That has happened three times.
+
+Two conventions worth knowing. Anything located by content is validated
+before use — a structure has to agree about something only the real one could
+— and a diagnostic that established a layout stays behind an environment
+variable rather than being deleted, so the next game patch can re-run it.
+`git log` is written to be read; a commit explains why, not what.
 
 ## How it hooks
 

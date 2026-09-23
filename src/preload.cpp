@@ -16,6 +16,8 @@
 #include <atomic>
 #include <sched.h>
 #include <spawn.h>
+#include <strings.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <chrono>
 #include <thread>
@@ -212,7 +214,6 @@ void warm_stats_search() {
         std::this_thread::sleep_for(std::chrono::seconds(2));
 
         bool statsReady = false;
-        bool modsReady = false;
 
         // Five seconds, then ten, twenty and forty: a search that has not
         // succeeded by then is waiting on data the game has not built, and
@@ -240,9 +241,6 @@ void warm_stats_search() {
                 if (!search.Done) all = false;
                 if (std::strcmp(search.Name, "stats") == 0) {
                     statsReady = search.Done;
-                }
-                if (std::strcmp(search.Name, "mods") == 0) {
-                    modsReady = search.Done;
                 }
                 break;
             }
@@ -658,11 +656,103 @@ void dump_arg_desc(const void* desc, unsigned id, const char* kind) {
     }
 }
 
+// ISteamUserStats vtable hook state (installed later, once the game first
+// asks for the interface -- see "Steam achievement diagnostics" below).
+// Declared here, ahead of call_wrapper, so EnableAchievements can reach them;
+// still visible from that later, differently-scoped block via ordinary
+// outward name lookup once `using namespace bg3le;` is in effect there.
+using SetAchievementFn = bool (*)(void*, const char*);
+using StoreStatsFn = bool (*)(void*);
+std::atomic<SetAchievementFn> g_real_set_achievement{nullptr};
+std::atomic<StoreStatsFn> g_real_store_stats{nullptr};
+std::atomic<void*> g_user_stats_iface{nullptr};
+std::atomic<bool> g_user_stats_vtable_patched{false};
+
+// EnableAchievements (Linux equivalent of bg3se's IsModded/ThrowError patch):
+// the engine's own Osi.UnlockAchievement native handler silently no-ops when
+// the save is modded, well before it would ever reach
+// ISteamUserStats::SetAchievement -- confirmed by exhaustive live tracing
+// (see reference/ACHIEVEMENTS-DIAGNOSIS.md, "Session 4"). Rather than locate
+// and byte-patch that internal branch, force the real Steam call ourselves
+// from here: call_wrapper/achievement_gate_wrapper see every
+// Osi.UnlockAchievement dispatch (function id 0x80001669) regardless of what
+// the engine's own handler decides to do with it, since this fires before
+// the internal per-function dispatch.
+// The id of Osi.UnlockAchievement, taken from the engine's own function
+// mapping when the story loads rather than written down: a DIV id is a
+// property of the build, and the one this was developed against is not
+// necessarily the one running.
+std::atomic<unsigned> g_unlock_achievement_id{0};
+
+// BG3LE_ACHIEVEMENTS=0 turns the forcing off, for a run that wants the
+// engine's own behaviour.
+bool achievements_enabled() {
+    char const* opt = std::getenv("BG3LE_ACHIEVEMENTS");
+    return opt == nullptr || opt[0] != '0';
+}
+
+void maybe_force_unlock_achievement(unsigned id, const void* arg_desc) {
+    const unsigned wanted = g_unlock_achievement_id.load();
+    if (wanted == 0 || id != wanted) return;
+    if (!achievements_enabled()) return;
+
+    auto real = g_real_set_achievement.load();
+    void* iface = g_user_stats_iface.load();
+    if (real == nullptr || iface == nullptr) {
+        logf("EnableAchievements: steam hook not ready yet, skipping forced unlock");
+        return;
+    }
+
+    auto type_of = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc13GetOpaqueTypeEv");
+    auto get_str = next<const char* (*)(const void*)>(
+        "_ZNK16COsiArgumentDesc12GetAnyStringEv");
+    if (type_of == nullptr || get_str == nullptr) return;
+
+    // Walk the OsiArgumentDesc chain looking for the STRING argument (type 4
+    // per base_type_name above) -- the achievement id. The CHARACTER argument
+    // is a GUIDSTRING (type 5), not STRING, so this can't confuse the two.
+    const void* node = arg_desc;
+    for (unsigned n = 0; n < 4 && node != nullptr; ++n) {
+        std::uintptr_t next_param = 0;
+        if (!safe_read(node, &next_param, sizeof(next_param))) break;
+
+        if (type_of(node) == 4) {  // STRING
+            char buf[128];
+            const char* name = get_str(node);
+            if (safe_cstr(name, buf, sizeof(buf))) {
+                bool rc = real(iface, buf);
+                logf("EnableAchievements: forced SetAchievement(\"%s\") -> %s",
+                     buf, rc ? "true" : "false");
+                // SetAchievement only stages the change locally; StoreStats
+                // is what actually syncs it (and fires the toast).
+                auto store = g_real_store_stats.load();
+                if (store != nullptr) {
+                    bool stored = store(iface);
+                    logf("EnableAchievements: forced StoreStats() -> %s",
+                         stored ? "true" : "false");
+                }
+            }
+            return;
+        }
+        node = reinterpret_cast<const void*>(next_param);
+    }
+    logf("EnableAchievements: no STRING argument found in UnlockAchievement call");
+}
+
 long call_wrapper(long a, long b, long c, long d, long e, long f) {
     static unsigned long seen = 0;
     if (++seen <= 10) logf("DIV Call  arg0=0x%lx arg1=0x%lx", a, b);
     if (seen <= 3) dump_arg_desc(reinterpret_cast<const void*>(b),
                                  (unsigned)a, "DIV Call ");
+    maybe_force_unlock_achievement((unsigned)a, reinterpret_cast<const void*>(b));
+    return g_real_call != nullptr ? g_real_call(a, b, c, d, e, f) : 0;
+}
+
+// Lean, always-installed counterpart to call_wrapper: no per-call logging
+// overhead, just the achievement-unlock gate every build should carry
+// regardless of the BG3LE_WRAP_DIV diagnostic opt-in.
+long achievement_gate_wrapper(long a, long b, long c, long d, long e, long f) {
+    maybe_force_unlock_achievement((unsigned)a, reinterpret_cast<const void*>(b));
     return g_real_call != nullptr ? g_real_call(a, b, c, d, e, f) : 0;
 }
 
@@ -687,17 +777,26 @@ void* maybe_wrap_div_table(void* init_fn) {
         return init_fn;
     }
 
-    // Always record the handlers; interposing them is a separate opt-in.
+    // Always record the true originals first.
     g_real_call = reinterpret_cast<Thunk6>(copy[1]);
     g_real_query = reinterpret_cast<Thunk6>(copy[2]);
-    osi::set_handlers(reinterpret_cast<void*>(copy[1]),
-                      reinterpret_cast<void*>(copy[2]));
 
     const char* opt = std::getenv("BG3LE_WRAP_DIV");
-    if (opt == nullptr || opt[0] != '1') return init_fn;
+    if (opt == nullptr || opt[0] != '1') {
+        copy[1] = reinterpret_cast<std::uintptr_t>(&achievement_gate_wrapper);
+        // osi::invoke() (bg3le's own Lua-facing Osi.* bridge) calls straight
+        // through whatever handler osi::set_handlers was given -- it never
+        // goes through this DIV table at all, so it needs the wrapper too or
+        // Lua-triggered UnlockAchievement calls silently skip the gate above.
+        osi::set_handlers(reinterpret_cast<void*>(copy[1]),
+                          reinterpret_cast<void*>(copy[2]));
+        return copy;
+    }
 
     copy[1] = reinterpret_cast<std::uintptr_t>(&call_wrapper);
     copy[2] = reinterpret_cast<std::uintptr_t>(&query_wrapper);
+    osi::set_handlers(reinterpret_cast<void*>(copy[1]),
+                      reinterpret_cast<void*>(copy[2]));
     logf("DIV wrap: active (call=%p query=%p)", (void*)g_real_call, (void*)g_real_query);
     return copy;
 }
@@ -891,6 +990,19 @@ void dump_osiris_api(void* self) {
         statusf("Osiris: %zu story-defined functions are not callable yet "
                 "(procedures and databases need node insertion)",
                 osi::story_function_count());
+    }
+
+    for (osi::Function const& fn : bindable) {
+        if (fn.name == "UnlockAchievement") {
+            g_unlock_achievement_id.store(fn.id);
+            break;
+        }
+    }
+    if (achievements_enabled() && g_unlock_achievement_id.load() != 0) {
+        // bg3se says "Modded achievements enabled." at its own equivalent
+        // point; ours works differently enough to be worth naming.
+        statusf("Modded achievements enabled (UnlockAchievement forced "
+                "through Steam directly)");
     }
 
     lua_bind_osi(bindable);
@@ -1093,6 +1205,84 @@ extern "C" long _ZN7COsiris12PrepareMergeEPKw(void* self, const wchar_t* a) {
     long rc = real != nullptr ? real(self, a) : 0;
     logf("COsiris::PrepareMerge took %.2fs", now_s() - t0);
     return rc;
+}
+
+// ---- Steam achievement diagnostics ----
+//
+// bg3's own PLT has zero relocations against
+// SteamAPI_ISteamUserStats_SetAchievement/StoreStats (confirmed via
+// `readelf -r`) -- it is a normal C++ Steamworks SDK consumer, not a flat-API
+// one. It gets its ISteamUserStats* through
+// SteamInternal_FindOrCreateUserInterface(hSteamUser, "STEAMUSERSTATS_..."]
+// (this symbol *is* PLT-imported, many call sites) and then calls straight
+// through the interface's vtable. libsteam_api.so's own
+// SteamAPI_ISteamUserStats_SetAchievement is just `jmp [rax+0x38]` on that
+// same object (confirmed by disassembly), i.e. slot index 7 -- so that is the
+// slot to patch, not a symbol to interpose.
+
+namespace {
+
+bool hooked_set_achievement(void* self, const char* name) {
+    logf("ISteamUserStats::SetAchievement(%p, \"%s\")", self,
+         name != nullptr ? name : "(null)");
+    // Every thread's stack, which is how the engine's own gate was located
+    // in the first place -- but far too much to log on a live call.
+    if (std::getenv("BG3LE_DUMP_ACHIEVEMENT_STACKS") != nullptr) {
+        dump_all_thread_stacks("SetAchievement call");
+    }
+    auto real = g_real_set_achievement.load();
+    bool rc = real != nullptr ? real(self, name) : false;
+    logf("ISteamUserStats::SetAchievement -> %s", rc ? "true" : "false");
+    return rc;
+}
+
+// vtable is a shared, effectively-static table (one C++ class, one set of
+// thunks) -- patch it once, the first time an ISteamUserStats interface
+// pointer is seen, rather than on every FindOrCreateUserInterface call.
+void maybe_hook_user_stats_vtable(void* iface) {
+    if (iface == nullptr) return;
+    g_user_stats_iface.store(iface);
+    bool expected = false;
+    if (!g_user_stats_vtable_patched.compare_exchange_strong(expected, true)) return;
+
+    void** vtable = *reinterpret_cast<void***>(iface);
+    void** slot = vtable + 7;  // +0x38 -- SetAchievement, per the flat-API thunk
+    // +0x50 -- StoreStats, per the flat-API thunk. Not patched, just cached:
+    // EnableAchievements calls it directly to sync a forced SetAchievement.
+    g_real_store_stats.store(reinterpret_cast<StoreStatsFn>(vtable[10]));
+
+    const long page = ::sysconf(_SC_PAGESIZE);
+    const auto addr = reinterpret_cast<std::uintptr_t>(slot);
+    auto* page_start = reinterpret_cast<void*>(addr & ~(std::uintptr_t)(page - 1));
+    const std::size_t span = (addr + sizeof(void*)) - (std::uintptr_t)page_start;
+    if (::mprotect(page_start, span, PROT_READ | PROT_WRITE) != 0) {
+        logf("steam hook: mprotect failed for ISteamUserStats vtable %p", vtable);
+        g_user_stats_vtable_patched.store(false);
+        return;
+    }
+    g_real_set_achievement.store(reinterpret_cast<SetAchievementFn>(*slot));
+    *slot = reinterpret_cast<void*>(&hooked_set_achievement);
+    ::mprotect(page_start, span, PROT_READ);
+
+    logf("steam hook: ISteamUserStats vtable %p, SetAchievement slot -> %p (was %p)",
+         vtable, (void*)&hooked_set_achievement, (void*)g_real_set_achievement.load());
+}
+
+}  // namespace
+
+extern "C" void* SteamInternal_FindOrCreateUserInterface(int32_t hSteamUser,
+                                                          const char* version) {
+    static auto real = next<void* (*)(int32_t, const char*)>(
+        "SteamInternal_FindOrCreateUserInterface");
+    void* iface = real != nullptr ? real(hSteamUser, version) : nullptr;
+    logf("SteamInternal_FindOrCreateUserInterface(\"%s\") -> %p",
+         version != nullptr ? version : "(null)", iface);
+    // Case-insensitive: the real constant is all-caps
+    // ("STEAMUSERSTATS_INTERFACE_VERSIONxxx"), unlike this match string.
+    if (version != nullptr && ::strcasestr(version, "UserStats") != nullptr) {
+        maybe_hook_user_stats_vtable(iface);
+    }
+    return iface;
 }
 
 // ---- entry point ----

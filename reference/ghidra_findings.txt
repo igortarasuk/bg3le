@@ -1,0 +1,41 @@
+bg3le achievements-gate hunt -- Ghidra xref + decompile dump
+Program: bg3
+======================================================================
+
+--- xrefs to 0x7d5af48 ---
+  047de3bd  in FUN_047de360 @ 047de360  (refType=WRITE)
+
+--- xrefs to 0x7d5af64 ---
+  (no references found)
+
+--- xrefs to 0x7d5af70 ---
+  04f4974d  in FUN_04f496f0 @ 04f496f0  (refType=WRITE)
+
+--- xrefs to 0x7d5af68 ---
+  04f4973a  in FUN_04f496f0 @ 04f496f0  (refType=WRITE)
+  04f49733  in FUN_04f496f0 @ 04f496f0  (refType=DATA)
+
+--- xrefs to 0x7d25a38 ---
+  04797f1d  in FUN_04797ec0 @ 04797ec0  (refType=WRITE)
+
+--- xrefs to 0x7d26444 ---
+  (no references found)
+
+======================================================================
+Functions referencing the official-GUID globals, by hit count:
+======================================================================
+
+### FUN_04f496f0 @ 04f496f0 -- 2/6 targets
+targets hit: 0x7d5af70 0x7d5af68
+decompile FAILED: 
+
+### FUN_047de360 @ 047de360 -- 1/6 targets
+targets hit: 0x7d5af48
+decompile FAILED: 
+
+### FUN_04797ec0 @ 04797ec0 -- 1/6 targets
+targets hit: 0x7d25a38
+decompile FAILED: 
+
+======================================================================
+Done. 3 distinct functions reference at least one target.
