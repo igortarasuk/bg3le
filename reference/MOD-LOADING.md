@@ -30,6 +30,13 @@ marker was there every time. bg3se removes it at startup for exactly this
 reason (`CleanupSanityCheck` in `ScriptExtenderClient.cpp`); bg3le did
 not. It does now, and the next run's load order held **69 modules**.
 
+Attributed rather than assumed: `BG3LE_KEEP_SANITY_CHECK=1` leaves the
+marker in place, and two runs back to back with the same load order and
+the same save gave 14 modules with it and 69 without. Osiris' node count
+moves with it too -- 151,453 against 153,863 -- and 153,863 is what bg3se
+reported for the same save on Windows, which is a useful check that both
+are reading the same story.
+
 The single exception is worth keeping, because it is what made the cause
 hard to see: MCM loaded even with mods disabled. That is content-driven
 mounting rather than the load order. Stripping MCM down establishes it:

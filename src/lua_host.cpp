@@ -5610,9 +5610,14 @@ local function load_positions(modules)
     if positions[uuid] == nil then
       after = after + 1
       positions[uuid] = after
-      extra = extra + 1
-      local mod = Ext.Mod.GetMod(uuid)
-      missing[#missing + 1] = mod ~= nil and mod.Info.Name or uuid
+      -- Only a mod with scripts is worth mentioning. A data-only mod may
+      -- be absent from the engine's module list for reasons of its own --
+      -- one of these declares its Folder as "Game", so its content merges
+      -- into the base module -- and none of that concerns bg3le.
+      if scripted[uuid] ~= nil then
+        extra = extra + 1
+        missing[#missing + 1] = scripted[uuid]
+      end
     end
   end
 

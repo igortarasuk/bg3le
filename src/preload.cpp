@@ -1091,6 +1091,15 @@ void cleanup_sanity_check() {
     char const* home = std::getenv("HOME");
     if (home == nullptr) return;
 
+    // BG3LE_KEEP_SANITY_CHECK=1 leaves it alone, which is how the effect
+    // was attributed: with the marker in place the engine loads 14
+    // modules, without it 69.
+    char const* keep = std::getenv("BG3LE_KEEP_SANITY_CHECK");
+    if (keep != nullptr && keep[0] == '1') {
+        logf("Kept ModCrashSanityCheck (BG3LE_KEEP_SANITY_CHECK=1)");
+        return;
+    }
+
     const std::string path = std::string(home)
                              + "/.local/share/Larian Studios/Baldur's Gate 3"
                              + "/ModCrashSanityCheck";
