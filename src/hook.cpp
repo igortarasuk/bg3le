@@ -143,22 +143,27 @@ bool hook_slot(std::uintptr_t slot_offset, std::uintptr_t expected_offset,
         return false;
     }
 
+    if (!hook_pointer(slot, replacement, original)) {
+        logf("hook: mprotect failed for slot %#lx", (unsigned long)slot_offset);
+        return false;
+    }
+
+    logf("hook: slot %#lx -> %p (was %p)", (unsigned long)slot_offset, replacement,
+         original != nullptr ? *original : nullptr);
+    return true;
+}
+
+bool hook_pointer(void** slot, void* replacement, void** original) {
     // The table lives in .data.rel.ro, which is read-only once relocated.
     const long page = ::sysconf(_SC_PAGESIZE);
     auto addr = reinterpret_cast<std::uintptr_t>(slot);
     auto* page_start = reinterpret_cast<void*>(addr & ~(std::uintptr_t)(page - 1));
     const std::size_t span = (addr + sizeof(void*)) - (std::uintptr_t)page_start;
-    if (::mprotect(page_start, span, PROT_READ | PROT_WRITE) != 0) {
-        logf("hook: mprotect failed for slot %#lx", (unsigned long)slot_offset);
-        return false;
-    }
+    if (::mprotect(page_start, span, PROT_READ | PROT_WRITE) != 0) return false;
 
     if (original != nullptr) *original = *slot;
     *slot = replacement;
     ::mprotect(page_start, span, PROT_READ);
-
-    logf("hook: slot %#lx -> %p (was %p)", (unsigned long)slot_offset, replacement,
-         original != nullptr ? *original : nullptr);
     return true;
 }
 

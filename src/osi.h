@@ -109,6 +109,22 @@ bool story_function(char const* name, bool* is_database);
 Status remove(char const* key, std::vector<Value> const& args,
               std::string* why);
 
+// Called when the story runs a procedure, raises an event, or puts a fact
+// into a database or takes one out -- all of which are the same tuple
+// operation. `event` is "before", "after", "beforeDelete" or
+// "afterDelete", as upstream names them.
+//
+// Runs on the thread Osiris runs on, inside the engine's own call.
+using TriggerFn = void (*)(char const* name, std::size_t arity,
+                           char const* event, std::vector<Value> const& values);
+
+void set_trigger_sink(TriggerFn fn);
+
+// Starts watching, by replacing the tuple slots in the two node classes
+// that hold tuples. Idempotent, and not done until something asks: until
+// then every node keeps the engine's own pointers.
+bool watch_story_triggers();
+
 // The facts a story database holds, one row per fact, typed as declared.
 bool facts(char const* key, std::vector<std::vector<Value>>* rows);
 

@@ -16,6 +16,13 @@
 
 namespace bg3le {
 
+// Replaces one pointer in a table that is read-only once relocated, which
+// is where vtables live. The caller has already decided the slot is the
+// right one; this only handles the page protection and the store. Used for
+// vtables that belong to a shared library rather than to the executable,
+// where there is no link-time offset to check against.
+bool hook_pointer(void** slot, void* replacement, void** original);
+
 // Replaces the pointer in slot_offset with replacement, first checking that
 // it currently holds expected_offset. The check is what makes this safe
 // across game patches: if the binary has shifted, the hook is refused rather

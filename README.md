@@ -65,7 +65,14 @@ component's declared size with the size the engine recorded, and
   of the engine's own disassembly —
   see [reference/OSIRIS-STORY-CALLS.md](reference/OSIRIS-STORY-CALLS.md).
   Resolved on first mention rather than at load, as upstream resolves its
-  own, so the level load still costs 0.09s
+  own, so the level load still costs 0.08s
+- **`Ext.Osiris.RegisterListener` fires.** `before`, `after`,
+  `beforeDelete` and `afterDelete` on any story function, which is how a mod
+  watches the game rather than polling it. The two tuple slots are replaced
+  in the two node classes that use them — bg3se's `NodeHooks.cpp` does the
+  same — and only once a mod subscribes, so until then every node keeps the
+  engine's own pointers. Engine-side activity reaches it too: a listener on a
+  database sees the fact a procedure's own rule inserts
 - **The engine's own managers found once and remembered.** Everything located
   by content — `RPGStats`, the mod load order, the spell and status
   prototype managers — has the path from a static pointer to it recorded

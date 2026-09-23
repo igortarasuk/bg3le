@@ -147,12 +147,36 @@ resolves that to `GuidString` through an array indexed by type id,
 string at index 6 and comes back as `"HealingSpiritHeal"`, which is how
 the need for it was noticed.
 
-The array is found by content — sixty-four consecutive entries each
-holding their own index, with aliases that all resolve — and then copied
-out and cached alongside the signatures, because the aliases belong to
-the compiled story and the search is a pass over every writable mapping.
-It confirms what the facts implied: 4 and 5 are themselves, 26 and 40 are
-integers.
+That array is not in this process. A scan of every writable mapping for
+sixty-four consecutive entries each holding their own index finds exactly
+one match, an array of `{index, 1}` pairs, and it is something else.
+Taking it made every aliased type an integer — so a GUID argument to a
+procedure silently became `0`, and a fact written by the procedure's own
+rule read back as `[0, ...]`.
+
+It survived two rounds of checking because the obvious diagnostic cannot
+see it. `resolve_alias(4)` and `resolve_alias(5)` return 4 and 5 whatever
+the table says: they are base types and return before it is consulted.
+The line printed "type 4 -> 4, 5 -> 5" and looked correct. Quoting a type
+id above 5 would have shown it immediately, and the log does now.
+
+What the story stores answers the question directly, with no structure at
+all. A string handle's bits above the low 21 are never zero — consecutive
+facts differ by `0x200001` — and a genuine small integer has nothing
+there, so a column whose values all carry those bits *and* resolve to
+text is a string, and one whose values are all under 2^21 is an integer.
+The two do not overlap even for the first pool record. String or GUID
+string is decided by the text, because `AddStr` wants to know which, and
+a GUID string ends in a uuid.
+
+On this save that learns 20 of them from 65,536 facts: 19 GUID strings,
+one integer, one column with too little evidence. It is cached with the
+signatures, because it belongs to the compiled story. An aliased type
+that appears in no fact anywhere stays unknown, and then the value in
+hand decides — reading goes by the shape of the value, and writing goes
+by what the caller passed, which is strictly better than writing a zero.
+A caller that passes a number where a known string type is declared gets
+an error naming the type, as upstream raises for the same mistake.
 
 ## What it costs
 
@@ -201,3 +225,28 @@ wrote a fact derived from an argument bg3le interned. A direct
 `Osi.DB_CRIME_Assault_NoFallback("BG3LE_PROBE")` shows the same for a
 database node: one row before, two after, the new one reading back as its
 text.
+
+## Watching, rather than calling
+
+`Ext.Osiris.RegisterListener(name, arity, event, handler)` with `before`,
+`after`, `beforeDelete` or `afterDelete` is the same operation observed
+instead of performed, so it is the same two slots: they are replaced in
+the two tuple-holding node classes, and the replacement fires the
+listeners and calls what was there. bg3se's `NodeHooks.cpp` patches
+`InsertTuple` and `DeleteTuple` for its Database and Proc classes, which
+are these two.
+
+The vtables belong to libOsiris rather than to the executable, so there
+is no link-time offset to check a slot against the way
+`hook_slot` does. What stands in for that check is the class name behind
+the vtable, read from its typeinfo: a slot is only patched in a vtable
+whose class is `CReteEvent` or `CReteFact`.
+
+Nothing is patched until a mod subscribes. Until then every node keeps
+the engine's own pointers, and the reverse index from `Function` pointer
+to name — which is what lets a firing node be named — is not built
+either.
+
+Engine-side activity reaches it, which is the point: a listener on
+`DB_AnubisConfigs_DelayAssignment` fires for the fact the matching
+procedure's *rule* inserts, not just for a fact bg3le inserts itself.

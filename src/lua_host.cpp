@@ -195,6 +195,49 @@ int osi_db_delete(lua_State* L) {
     return 0;
 }
 
+// Where osi.cpp sends a story trigger. Runs inside the engine's own call,
+// on Osiris' thread, so a failing handler is logged rather than thrown:
+// unwinding out of here would unwind through Osiris.
+void osiris_trigger(char const* name, std::size_t arity, char const* event,
+                    std::vector<osi::Value> const& values) {
+    if (g_lua == nullptr) return;
+
+    lua_getglobal(g_lua, "Ext");
+    if (!lua_istable(g_lua, -1)) {
+        lua_pop(g_lua, 1);
+        return;
+    }
+    lua_getfield(g_lua, -1, "_Internal");
+    lua_remove(g_lua, -2);
+    lua_getfield(g_lua, -1, "FireOsirisListener");
+    lua_remove(g_lua, -2);
+    if (!lua_isfunction(g_lua, -1)) {
+        lua_pop(g_lua, 1);
+        return;
+    }
+
+    lua_pushstring(g_lua, name);
+    lua_pushinteger(g_lua, (lua_Integer)arity);
+    lua_pushstring(g_lua, event);
+    for (osi::Value const& value : values) push_value(g_lua, value);
+
+    if (lua_pcall(g_lua, 3 + (int)values.size(), 0, 0) != LUA_OK) {
+        logf("lua: Osiris listener dispatch failed: %s",
+             lua_tostring(g_lua, -1));
+        lua_pop(g_lua, 1);
+    }
+}
+
+// Ext._Internal.WatchOsiris() -- starts watching the story's tuple
+// operations, which is what a listener needs. Called when the first
+// listener registers rather than at load: it patches two vtable slots and
+// builds a reverse index of Osiris' function database.
+int l_watch_osiris(lua_State* L) {
+    osi::set_trigger_sink(&osiris_trigger);
+    lua_pushboolean(L, osi::watch_story_triggers() ? 1 : 0);
+    return 1;
+}
+
 // Osi.Name for a story-defined function, built the first time the name is
 // asked for.
 //
@@ -3037,6 +3080,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "WorldProbe");
     lua_pushcfunction(g_lua, osi_story_lookup);
     lua_setfield(g_lua, -2, "StoryFunction");
+    lua_pushcfunction(g_lua, l_watch_osiris);
+    lua_setfield(g_lua, -2, "WatchOsiris");
     lua_pushcfunction(g_lua, l_get_field);
     lua_setfield(g_lua, -2, "GetField");
     lua_pushcfunction(g_lua, l_set_field);
@@ -3682,10 +3727,26 @@ Ext.Osiris = {}
 
 local osiris_listeners = {}
 
+local osiris_events = {
+  before = true, after = true, beforeDelete = true, afterDelete = true
+}
+
 function Ext.Osiris.RegisterListener(name, arity, event, handler)
   if type(name) ~= "string" or type(handler) ~= "function" then
     error("Ext.Osiris.RegisterListener(name, arity, event, handler)", 2)
   end
+  if not osiris_events[event] then
+    error("Ext.Osiris.RegisterListener: event must be one of before, after, " ..
+          "beforeDelete, afterDelete; got " .. tostring(event), 2)
+  end
+
+  -- Watching costs two patched vtable slots and an index of Osiris'
+  -- function database, so it does not start until someone subscribes.
+  if not Ext._Internal.WatchOsiris() then
+    error("Ext.Osiris.RegisterListener: bg3le could not start watching " ..
+          "Osiris (no story loaded yet?)", 2)
+  end
+
   local key = name .. "/" .. tostring(arity) .. "/" .. tostring(event)
   osiris_listeners[key] = osiris_listeners[key] or {}
   table.insert(osiris_listeners[key], handler)

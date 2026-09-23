@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "hook.h"
 #include "log.h"
 #include "mem.h"
 
@@ -1155,7 +1156,6 @@ void report_value_shapes() {
 constexpr std::uint16_t kTypeString = 4;
 constexpr std::uint16_t kTypeGuidString = 5;
 constexpr std::uint16_t kTypeUndefined = 0x7f;
-constexpr std::size_t kAliasProbe = 64;
 
 constexpr std::size_t kTypeCount = 128;  // ids are 7 bits
 
@@ -1187,85 +1187,143 @@ bool is_string_type(std::uint16_t type) {
     return base == kTypeString || base == kTypeGuidString;
 }
 
-bool alias_array_at(std::uintptr_t at) {  // NOLINT(misc-no-recursion)
-    std::uint16_t entries[kAliasProbe * 2] = {};
-    if (!peek(at, &entries)) return false;
+// Learned from what the story stores, not from the engine's table.
+//
+// bg3se resolves an alias through OsiTypeDb::Aliases, an array of
+// {uint16 TypeId; uint16 AliasTypeId} indexed by type id. Nothing of that
+// shape is in this process: a scan of every writable mapping for
+// sixty-four consecutive entries holding their own index finds one array
+// of {index, 1} pairs, which is something else -- taking it made every
+// aliased type an integer, and a GUID argument to a procedure silently
+// became 0. It looked right because the two type ids one naturally checks,
+// 4 and 5, are base types that resolve without consulting the table.
+//
+// What the story stores answers the question directly and needs no
+// structure at all. A stored string is a handle, and a handle's bits above
+// the low 21 are never zero -- consecutive facts differ by 0x200001 -- so
+// a column whose values all carry those bits and resolve to text is a
+// string, and one whose values are all under 2^21 is an integer. The two
+// do not overlap: a genuine small integer has nothing above bit 21, and a
+// handle to even the first pool record does.
+//
+// String or GUID string is decided by the text: Osiris wants to know which
+// when interning, and a GUID string ends in a uuid.
+constexpr std::size_t kAliasEvidence = 4;
 
-    std::size_t aliased = 0;
-    for (std::size_t i = 0; i < kAliasProbe; ++i) {
-        if (entries[i * 2] != (std::uint16_t)i) return false;
+// Defined below, with the rest of the pool reading; wanted here because
+// deciding a type means trying to read a string through it.
+bool string_of(std::uint64_t handle, std::string* out);
 
-        const std::uint16_t alias = entries[i * 2 + 1];
-        if (alias > kTypeUndefined) return false;
-        if (i > kTypeGuidString && alias != 0 && alias != (std::uint16_t)i) {
-            ++aliased;
+bool guid_looking(std::string const& text) {
+    if (text.size() < 36) return false;
+
+    char const* at = text.c_str() + text.size() - 36;
+    for (int i = 0; i < 36; ++i) {
+        const bool dash = i == 8 || i == 13 || i == 18 || i == 23;
+        if (dash) {
+            if (at[i] != '-') return false;
+        } else if (std::isxdigit((unsigned char)at[i]) == 0) {
+            return false;
         }
     }
-
-    // An index ramp with no aliases in it is some other table.
-    return aliased >= 4;
+    return true;
 }
 
-// Scanned rather than walked, for the reason above. Writable regions
-// only: the table is allocated through Osiris' own allocator.
-bool find_alias_table() {
-    if (g_alias_ready) return true;
+// Does this value look like a handle to text, rather than a number?
+bool handle_looking(std::uint64_t raw, std::string* text) {
+    if ((raw >> 21) == 0) return false;
+    return string_of(raw, text) && !text->empty();
+}
 
-    std::FILE* maps = std::fopen("/proc/self/maps", "r");
-    if (maps == nullptr) return false;
+void learn_aliases() {
+    if (g_alias_ready) return;
 
-    constexpr std::size_t kChunk = 1u << 20;
-    constexpr std::size_t kSpan = kAliasProbe * 4;
-    std::vector<unsigned char> block(kChunk + kSpan);
+    struct Evidence {
+        std::size_t Handles = 0;
+        std::size_t Numbers = 0;
+        std::size_t Guids = 0;
+    };
+    std::map<std::uint16_t, Evidence> seen;
 
-    char line[1024];
-    while (std::fgets(line, sizeof(line), maps) != nullptr && !g_alias_ready) {
-        unsigned long long from = 0;
-        unsigned long long to = 0;
-        if (!bg3le_scannable_region(line, &from, &to)) continue;
+    for (StoredValue const& value : stored_values(1u << 16)) {
+        if (value.Type <= kTypeGuidString || value.Type >= kTypeCount) {
+            continue;  // a base type says nothing about aliases
+        }
+        if (value.Raw == 0) continue;
 
-        for (unsigned long long at = from; at < to && !g_alias_ready;
-             at += kChunk) {
-            std::size_t want = (std::size_t)(to - at);
-            if (want > block.size()) want = block.size();
-            const std::size_t got =
-                safe_read_some((void const*)at, block.data(), want);
-            if (got < kSpan) continue;
-            scan_yield();
-
-            for (std::size_t off = 0; off + kSpan <= got; off += 4) {
-                auto const* words =
-                    reinterpret_cast<std::uint16_t const*>(block.data() + off);
-
-                // The cheap rejection first: two entries that hold their
-                // own index. Everything else is rare enough to afford.
-                if (words[0] != 0 || words[2] != 1) continue;
-                if (!alias_array_at((std::uintptr_t)(at + off))) continue;
-
-                for (std::size_t i = 0; i < kTypeCount; ++i) {
-                    std::uint16_t alias = 0;
-                    peek((std::uintptr_t)(at + off) + i * 4 + 2, &alias);
-                    g_alias[i] = alias;
-                }
-                g_alias_ready = true;
-                g_alias_at = (std::uintptr_t)(at + off);
-                break;
-            }
+        Evidence& evidence = seen[value.Type];
+        std::string text;
+        if (handle_looking(value.Raw, &text)) {
+            ++evidence.Handles;
+            if (guid_looking(text)) ++evidence.Guids;
+        } else if ((value.Raw >> 21) == 0) {
+            ++evidence.Numbers;
         }
     }
-    std::fclose(maps);
 
-    if (!g_alias_ready) {
-        logf("osiris: no type alias table found");
-        return false;
+    std::size_t strings = 0;
+    std::size_t guids = 0;
+    std::size_t numbers = 0;
+    std::size_t unclear = 0;
+    for (auto const& entry : seen) {
+        Evidence const& evidence = entry.second;
+        const std::size_t total = evidence.Handles + evidence.Numbers;
+        if (total < kAliasEvidence) {
+            ++unclear;
+            continue;
+        }
+
+        if (evidence.Handles > evidence.Numbers * 4) {
+            const bool guid = evidence.Guids * 2 >= evidence.Handles;
+            g_alias[entry.first] = guid ? kTypeGuidString : kTypeString;
+            if (guid) {
+                ++guids;
+            } else {
+                ++strings;
+            }
+        } else if (evidence.Numbers > evidence.Handles * 4) {
+            g_alias[entry.first] = kInteger;
+            ++numbers;
+        } else {
+            ++unclear;
+        }
     }
 
-    // Say what it decided, since every string read now depends on it.
-    logf("osiris: type aliases read from 0x%lx (type 4 -> %u, 5 -> %u, "
-         "26 -> %u, 40 -> %u)", (unsigned long)g_alias_at,
-         resolve_alias(4), resolve_alias(5), resolve_alias(26),
-         resolve_alias(40));
-    return true;
+    if (strings + guids + numbers == 0) {
+        logf("osiris: the story stores nothing that says what its own types "
+             "are; aliased columns will be read by the shape of each value");
+        return;
+    }
+
+    g_alias_ready = true;
+    logf("osiris: learned %zu type aliases from the story's own facts "
+         "(%zu guid strings, %zu strings, %zu integers; %zu with too little "
+         "evidence, decided per value)",
+         strings + guids + numbers, guids, strings, numbers, unclear);
+}
+
+// A value whose type says nothing, read by its own shape. Used for an
+// aliased type that appears in no fact anywhere, so nothing could be
+// learned about it.
+Value value_by_shape(std::uint64_t raw) {
+    Value value;
+    std::string text;
+    if (handle_looking(raw, &text)) {
+        value.type = kString;
+        value.text = std::move(text);
+    } else {
+        value.type = kInteger;
+        value.integer = (std::int32_t)(std::uint32_t)raw;
+    }
+    return value;
+}
+
+// Whether the alias of this type is known at all. An aliased type that
+// appears in no fact anywhere is not, and a caller has to fall back to
+// the shape of the value it was given rather than write a zero.
+bool type_known(std::uint16_t type) {
+    if (type <= kTypeGuidString) return true;
+    return type < kTypeCount && g_alias[type] != 0;
 }
 
 // GetStr, done by reading rather than calling: the encoding is known, and
@@ -1642,11 +1700,11 @@ std::size_t load_out_param_counts(std::vector<Function>* functions,
         if (cached != nullptr) *cached = true;
         // The cache carries the aliases too; only fall back to searching
         // for the engine's table if it did not.
-        if (!g_alias_ready) find_alias_table();
+        learn_aliases();
         return fromStore;
     }
 
-    find_alias_table();
+    learn_aliases();
 
     std::uintptr_t holder = 0;
     if (!peek(base + kFunctionDbHolder, &holder) || holder < 0x1000) {
@@ -2251,11 +2309,34 @@ Status insert_tuple(char const* key, std::vector<Value> const& args,
         value.Type = declared;
         value.Flags = 0x02 | 0x08;  // TypedValue | IsValid
 
-        switch (resolve_alias(declared)) {
+        // An aliased type that appears in no fact anywhere could not be
+        // learned, so what the caller passed decides. Better than writing
+        // a zero, which is what a wrong guess produces and what sends a
+        // mod author looking in the wrong place.
+        std::uint16_t base = resolve_alias(declared);
+        if (!type_known(declared)) {
+            base = args[i].type == kString
+                       ? (guid_looking(args[i].text) ? kTypeGuidString
+                                                     : kTypeString)
+                       : args[i].type;
+        } else if ((base == kTypeString || base == kTypeGuidString)
+                   != (args[i].type == kString)) {
+            if (why != nullptr) {
+                *why = std::string("argument ") + std::to_string(i + 1)
+                       + " of " + key + " is declared type "
+                       + std::to_string(declared) + ", which wants a "
+                       + ((base == kTypeString || base == kTypeGuidString)
+                              ? "string" : "number");
+            }
+            for (std::uint64_t held : interned) release_string(held);
+            return Status::kUnavailable;
+        }
+
+        switch (base) {
         case kTypeString:
         case kTypeGuidString: {
             const std::uint64_t handle = intern_string(
-                args[i].text.c_str(), resolve_alias(declared) == kTypeGuidString);
+                args[i].text.c_str(), base == kTypeGuidString);
             if (handle == 0) {
                 for (std::uint64_t held : interned) release_string(held);
                 return fail("a string argument could not be interned");
@@ -2289,6 +2370,199 @@ Status insert_tuple(char const* key, std::vector<Value> const& args,
     for (std::uint64_t held : interned) release_string(held);
     return Status::kHandled;
 }
+// ---------------------------------------------------------------------------
+// Watching the story: Ext.Osiris.RegisterListener.
+//
+// A listener fires when a procedure runs, an event is raised, or a fact
+// goes into or out of a database -- which are all the same operation, the
+// tuple insert above. So the two slots that operation goes through are
+// replaced in the two node classes that use them, and the replacement
+// fires the listeners and calls what was there.
+//
+// bg3se does exactly this (NodeHooks.cpp patches InsertTuple and
+// DeleteTuple for the Database and Proc classes), and the same two slot
+// numbers this file already established apply. The vtables belong to
+// libOsiris rather than to the executable, so there is no link-time
+// offset to check the slot against; what stands in for that check is the
+// class name behind the vtable, read from its typeinfo.
+//
+// Installed only once a mod actually registers a listener. Until then
+// every node keeps the engine's own pointers.
+using NodeTupleProc = void (*)(void*, void*);
+
+struct Hooked {
+    NodeTupleProc Insert = nullptr;
+    NodeTupleProc Delete = nullptr;
+};
+
+std::unordered_map<std::uintptr_t, Hooked> g_hooked;  // by vtable
+TriggerFn g_trigger = nullptr;
+bool g_watching = false;
+
+// Def pointer -> "name/arity", so a node can be named without searching.
+std::unordered_map<std::uintptr_t, std::string>& def_names() {
+    static std::unordered_map<std::uintptr_t, std::string> names;
+    return names;
+}
+
+// The values in a parameter list the engine is about to act on.
+std::vector<Value> tuple_values(void* tuple) {
+    std::vector<Value> out;
+    auto* list = static_cast<ParameterList*>(tuple);
+    if (list == nullptr) return out;
+
+    TupleNode const* sentinel = reinterpret_cast<TupleNode const*>(&list->Last);
+    TupleNode const* at = list->First;
+    for (std::size_t i = 0; i < kMaxParams && at != nullptr && at != sentinel;
+         ++i) {
+        TypedValueRec record{};
+        if (!peek(reinterpret_cast<std::uintptr_t>(at->Item), &record)) break;
+
+        if (!type_known(record.Type)) {
+            out.push_back(value_by_shape(record.Value));
+            at = at->Next;
+            continue;
+        }
+
+        Value value;
+        value.type = record.Type;
+        switch (resolve_alias(record.Type)) {
+        case kTypeString:
+        case kTypeGuidString:
+            value.type = kString;
+            string_of(record.Value, &value.text);
+            break;
+        case kReal: {
+            float real = 0.f;
+            std::memcpy(&real, &record.Value, sizeof(real));
+            value.type = kReal;
+            value.real = real;
+            break;
+        }
+        case kInteger64:
+            value.type = kInteger64;
+            value.integer = (std::int64_t)record.Value;
+            break;
+        default:
+            value.type = kInteger;
+            value.integer = (std::int32_t)(std::uint32_t)record.Value;
+            break;
+        }
+        out.push_back(std::move(value));
+        at = at->Next;
+    }
+    return out;
+}
+
+// What the node stands for, as "name/arity".
+std::string const* node_name(void* node) {
+    std::uintptr_t def = 0;
+    if (!peek(reinterpret_cast<std::uintptr_t>(node) + 0x10, &def)
+        || def == 0) {
+        return nullptr;
+    }
+
+    auto found = def_names().find(def);
+    return found == def_names().end() ? nullptr : &found->second;
+}
+
+void fire(void* node, void* tuple, char const* before, char const* after,
+          NodeTupleProc original) {
+    std::string const* key = node_name(node);
+    if (key == nullptr || g_trigger == nullptr) {
+        if (original != nullptr) original(node, tuple);
+        return;
+    }
+
+    const std::size_t slash = key->rfind('/');
+    const std::string name = key->substr(0, slash);
+    const std::size_t arity =
+        (std::size_t)std::strtoul(key->c_str() + slash + 1, nullptr, 10);
+
+    const std::vector<Value> values = tuple_values(tuple);
+    g_trigger(name.c_str(), arity, before, values);
+    if (original != nullptr) original(node, tuple);
+    g_trigger(name.c_str(), arity, after, values);
+}
+
+Hooked const* hooked_for(void* node) {
+    std::uintptr_t vtable = 0;
+    if (!peek(reinterpret_cast<std::uintptr_t>(node), &vtable)) return nullptr;
+    auto found = g_hooked.find(vtable);
+    return found == g_hooked.end() ? nullptr : &found->second;
+}
+
+void watched_insert(void* node, void* tuple) {
+    Hooked const* hooked = hooked_for(node);
+    fire(node, tuple, "before", "after",
+         hooked != nullptr ? hooked->Insert : nullptr);
+}
+
+void watched_delete(void* node, void* tuple) {
+    Hooked const* hooked = hooked_for(node);
+    fire(node, tuple, "beforeDelete", "afterDelete",
+         hooked != nullptr ? hooked->Delete : nullptr);
+}
+
+bool install_node_hooks() {
+    if (g_watching) return true;
+    if (g_nodes.First == 0 || !bind_defs()) return false;
+
+    // Naming a node needs the reverse of the function database.
+    def_names().clear();
+    for (auto const& entry : database()) {
+        if (entry.second.Def != 0) def_names()[entry.second.Def] = entry.first;
+    }
+
+    // The two classes that hold tuples, found from the nodes that use
+    // them rather than from an address written down here.
+    std::unordered_map<std::uintptr_t, std::string> classes;
+    for (std::uint32_t i = 0; i < g_nodes.Count && classes.size() < 2; ++i) {
+        std::uintptr_t node = 0;
+        if (!peek(g_nodes.First + (std::uintptr_t)i * 8, &node)
+            || node < 0x1000) {
+            continue;
+        }
+        std::uintptr_t vtable = 0;
+        if (!peek(node, &vtable) || vtable < 0x1000) continue;
+
+        const std::string cls = class_of(vtable);
+        if (cls != "10CReteEvent" && cls != "9CReteFact") continue;
+        classes[vtable] = cls;
+    }
+    if (classes.size() != 2) {
+        logf("osiris: only %zu of the two tuple node classes found; "
+             "listeners stay inactive", classes.size());
+        return false;
+    }
+
+    for (auto const& entry : classes) {
+        Hooked hooked;
+        auto** insert = reinterpret_cast<void**>(entry.first + kInsertTuple);
+        auto** remove = reinterpret_cast<void**>(entry.first + kDeleteTuple);
+
+        void* wasInsert = nullptr;
+        void* wasDelete = nullptr;
+        if (!hook_pointer(insert, reinterpret_cast<void*>(&watched_insert),
+                          &wasInsert)
+            || !hook_pointer(remove, reinterpret_cast<void*>(&watched_delete),
+                             &wasDelete)) {
+            logf("osiris: could not make %s's vtable writable; listeners "
+                 "stay inactive", entry.second.c_str());
+            return false;
+        }
+
+        hooked.Insert = reinterpret_cast<NodeTupleProc>(wasInsert);
+        hooked.Delete = reinterpret_cast<NodeTupleProc>(wasDelete);
+        g_hooked[entry.first] = hooked;
+        logf("osiris: watching %s (insert %p, delete %p)",
+             entry.second.c_str(), wasInsert, wasDelete);
+    }
+
+    g_watching = true;
+    return true;
+}
+
 }  // namespace
 
 std::size_t story_function_count() { return g_story_functions; }
@@ -2306,6 +2580,10 @@ Status remove(char const* key, std::vector<Value> const& args,
               std::string* why) {
     return insert_tuple(key, args, kDeleteTuple, why);
 }
+
+void set_trigger_sink(TriggerFn fn) { g_trigger = fn; }
+
+bool watch_story_triggers() { return install_node_hooks(); }
 
 // Does the story define a function by this name, and is it a database?
 //
@@ -2339,6 +2617,7 @@ bool story_function(char const* name, bool* is_database) {
     if (found && is_database != nullptr) *is_database = database_only;
     return found;
 }
+
 
 // The facts a story database holds, as text where the column is a string
 // type. Reading these is the other half of what a database is for: a mod
@@ -2392,6 +2671,10 @@ bool facts(char const* key, std::vector<std::vector<Value>>* rows) {
 
             Value value;
             value.type = type;
+            if (!type_known(type)) {
+                row.push_back(value_by_shape(raw));
+                continue;
+            }
             switch (resolve_alias(type)) {
             case kTypeString:
             case kTypeGuidString:
