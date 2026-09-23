@@ -43,14 +43,16 @@ component's declared size with the size the engine recorded, and
   directories still work, via `BG3LE_MOD_PATH`. Of one 57-mod set, all five
   script mods load and run, MCM included (v1.40.1, "SE version 32")
 - **Achievements with mods active**, the way bg3se's `EnableAchievements`
-  does on Windows but by a different route: nothing here exports
-  `ls::ModuleSettings::IsModded` to patch, so bg3le hooks
-  `SteamInternal_FindOrCreateUserInterface`, patches the `ISteamUserStats`
-  vtable slot, and calls `SetAchievement`/`StoreStats` itself when Osiris
-  dispatches `UnlockAchievement`. Contributed by Igor Tarasyuk; the
-  investigation, dead ends included, is in
-  [reference/ACHIEVEMENTS-DIAGNOSIS.md](reference/ACHIEVEMENTS-DIAGNOSIS.md).
-  `BG3LE_ACHIEVEMENTS=0` turns it off
+  does on Windows. bg3se patches `ls::ModuleSettings::IsModded`; nothing here
+  exports that name, so bg3le byte-patches the engine's per-module "is this
+  module official" predicate to return true, at startup and before the
+  game's `fork()`, which opens every consumer of the mod check at once
+  (the Osiris `UnlockAchievement` native's two checks and the cached
+  "modded" badges on the Load Game list). Off with `BG3LE_ACHIEVEMENTS=0`
+  or `"EnableAchievements": false` in `ScriptExtenderSettings.json`.
+  Contributed by Igor Tarasyuk; the investigation and the addresses a
+  maintainer needs when the binary updates are in
+  [reference/ACHIEVEMENTS-DIAGNOSIS.md](reference/ACHIEVEMENTS-DIAGNOSIS.md)
 - **The story's own procedures and databases are callable.** All 3,425 of
   them — `Osi.PROC_*`, `Osi.DB_*` and the story's events, which carry no
   dispatch handle and so cannot go through the DIV boundary at all. They run
