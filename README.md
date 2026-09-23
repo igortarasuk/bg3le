@@ -51,6 +51,19 @@ component's declared size with the size the engine recorded, and
   investigation, dead ends included, is in
   [reference/ACHIEVEMENTS-DIAGNOSIS.md](reference/ACHIEVEMENTS-DIAGNOSIS.md).
   `BG3LE_ACHIEVEMENTS=0` turns it off
+- **The story's own procedures and databases are callable.** All 3,425 of
+  them — `Osi.PROC_*`, `Osi.DB_*` and the story's events, which carry no
+  dispatch handle and so cannot go through the DIV boundary at all. They run
+  the way the engine runs them: a tuple is inserted into the Rete node the
+  function stands for. `Osi.DB_Foo(...)` inserts a fact, `Osi.DB_Foo:Get(...)`
+  reads them back with nil as a wildcard, and a bare `PROC_Foo(...)` works as
+  it does upstream. Osiris interns its strings, so an argument is interned
+  through `COsiStringTable::AddStr` and released afterwards. Nothing here is
+  bg3se's offsets: `InsertTuple` is at `+0x68` on this build, not `+0x50`,
+  and the structures were read out of `COsiris::Event`'s own disassembly —
+  see [reference/OSIRIS-STORY-CALLS.md](reference/OSIRIS-STORY-CALLS.md).
+  Resolved on first mention rather than at load, as upstream resolves its
+  own, so the level load still costs 0.09s
 - **The engine's own managers found once and remembered.** Everything located
   by content — `RPGStats`, the mod load order, the spell and status
   prototype managers — has the path from a static pointer to it recorded
@@ -137,14 +150,10 @@ component's declared size with the size the engine recorded, and
   `BootstrapClient.lua` never runs — for a UI mod that is most of the mod.
   The mods that ship one are named at load time rather than half-loaded in
   silence
-- **The story's own Osiris functions are readable but not callable.** All
-  3,425 of them resolve to a node that agrees about its id and its function,
-  and the node and database lists are located (153,863 and 15,868 entries),
-  so `Osi.PROC_*` and `Osi.DB_*` are within reach. What is missing is
-  strings: Osiris stores a handle rather than a pointer, and the handle's
-  encoding is not cracked yet — `BG3LE_PROBE_STRINGS=1` records what it is
-  not (no hash of the text matches any of 32,010 stored handles) and what it
-  is (composite and sequential, consecutive facts differing by 0x200001)
+- **`DB_Foo:Delete` raises.** Retracting a fact is a different slot in the
+  node vtable, and unlike the insert slot it has not been found in the
+  engine's own code yet, so it says so rather than calling a guess. Reading
+  and inserting both work
 - **One session per process.** The story-load work runs once, so loading a
   second save without restarting leaves Osiris bound to the first story's
   mappings and every mod's script from the first session. Upstream resets

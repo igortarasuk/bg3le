@@ -98,6 +98,26 @@ enum class Status {
     kUnavailable,  // could not be invoked at all
 };
 
+// Whether the story defines a function called `name`, and whether every
+// declaration of it is a database. Resolved on demand from the Lua side:
+// the Function objects behind these are heap pointers that cannot be
+// cached between runs, and recovering them walks Osiris' database.
+bool story_function(char const* name, bool* is_database);
+
+// The facts a story database holds, one row per fact, typed as declared.
+bool facts(char const* key, std::vector<std::vector<Value>>* rows);
+
+// Runs a story-defined function -- a procedure, an event, or a database
+// insert -- by putting a tuple into the node that stands for it. This is
+// the only route to them: they carry no dispatch handle, so `invoke` and
+// the DIV boundary cannot reach them.
+//
+// Must be called on the thread Osiris runs on. `args` are in the
+// function's declared order and are converted to its declared types;
+// `why` is filled in when the answer is kUnavailable.
+Status insert(char const* key, std::vector<Value> const& args,
+              std::string* why);
+
 // Invokes fn with inputs, appending any out-parameters to outputs.
 // Distinguishing kRejected from kUnavailable matters: a query returning
 // false is a normal answer, not a failure.

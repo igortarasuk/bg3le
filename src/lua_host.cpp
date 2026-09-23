@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <ctime>
 #include <dirent.h>
@@ -46,13 +47,10 @@ bool to_value(lua_State* L, int idx, osi::Value* out) {
             out->integer = lua_toboolean(L, idx);
             return true;
         case LUA_TNUMBER:
-            if (lua_isinteger(L, idx)) {
-                out->type = osi::kInteger;
-                out->integer = lua_tointeger(L, idx);
-            } else {
-                out->type = osi::kReal;
-                out->real = lua_tonumber(L, idx);
-            }
+            out->integer = (std::int64_t)lua_tonumber(L, idx);
+            out->real = lua_tonumber(L, idx);
+            out->type = lua_isinteger(L, idx) ? osi::kInteger : osi::kReal;
+            if (lua_isinteger(L, idx)) out->integer = lua_tointeger(L, idx);
             return true;
         default:
             return false;
@@ -66,6 +64,163 @@ void push_value(lua_State* L, const osi::Value& v) {
         case osi::kReal: lua_pushnumber(L, v.real); break;
         default: lua_pushinteger(L, v.integer); break;
     }
+}
+
+// Osi.Name(...) for a function the story defines itself.
+//
+// These have no dispatch handle, so they are run by inserting a tuple
+// into their node. The name is the upvalue rather than a resolved
+// function, because Osiris keys by name and arity both: the same name can
+// be declared with two different signatures, and which one is meant is
+// decided by how many arguments arrive.
+int osi_story_dispatch(lua_State* L) {
+    char const* name = lua_tostring(L, lua_upvalueindex(1));
+    const bool method = lua_toboolean(L, lua_upvalueindex(2)) != 0;
+    const int first = method ? 2 : 1;
+    const int argc = lua_gettop(L) - first + 1;
+
+    std::vector<osi::Value> args;
+    args.reserve(argc > 0 ? argc : 0);
+    for (int i = first; i <= lua_gettop(L); ++i) {
+        osi::Value v;
+        if (!to_value(L, i, &v)) {
+            return luaL_error(L, "Osi.%s: argument %d has unsupported type %s",
+                              name, i - first + 1, luaL_typename(L, i));
+        }
+        args.push_back(std::move(v));
+    }
+
+    const std::string key = std::string(name) + "/" + std::to_string(argc);
+    std::string why;
+    const osi::Status status = osi::insert(key.c_str(), args, &why);
+    if (status != osi::Status::kHandled) {
+        return luaL_error(L, "Osi.%s: %s", name, why.c_str());
+    }
+    return 0;
+}
+
+// Does a fact match the filter the caller gave? A nil argument is a
+// wildcard, and a GUID compares on its last thirty-six characters, as
+// bg3se's MatchTuple does: the story writes "Name_<uuid>" where a caller
+// has only the uuid.
+bool row_matches(lua_State* L, int first, std::vector<osi::Value> const& row) {
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        const int idx = first + (int)i;
+        if (idx > lua_gettop(L) || lua_isnil(L, idx)) continue;
+
+        switch (row[i].type) {
+        case osi::kString:
+        case osi::kGuidString: {
+            char const* want = lua_tostring(L, idx);
+            if (want == nullptr) return false;
+            std::string const& held = row[i].text;
+            const std::size_t wantLen = std::strlen(want);
+            if (wantLen >= 36 && held.size() >= 36) {
+                if (::strcasecmp(held.c_str() + held.size() - 36,
+                                 want + wantLen - 36) != 0) {
+                    return false;
+                }
+            } else if (::strcasecmp(held.c_str(), want) != 0) {
+                return false;
+            }
+            break;
+        }
+        case osi::kReal:
+            if (std::fabs(row[i].real - lua_tonumber(L, idx)) > 0.00001) {
+                return false;
+            }
+            break;
+        default:
+            if (row[i].integer != lua_tointeger(L, idx)) return false;
+            break;
+        }
+    }
+    return true;
+}
+
+// DB_Name:Get(...) -- the facts that match, as an array of arrays.
+int osi_db_get(lua_State* L) {
+    char const* name = lua_tostring(L, lua_upvalueindex(1));
+
+    // The arity is the filter's length, which for Get is however many
+    // arguments were passed -- including the nils.
+    const int argc = lua_gettop(L) - 1;
+    const std::string key = std::string(name) + "/" + std::to_string(argc);
+
+    std::vector<std::vector<osi::Value>> rows;
+    if (!osi::facts(key.c_str(), &rows)) {
+        return luaL_error(L, "Osi.%s:Get: the database could not be read",
+                          name);
+    }
+
+    lua_createtable(L, (int)rows.size(), 0);
+    int kept = 0;
+    for (std::vector<osi::Value> const& row : rows) {
+        if (!row_matches(L, 2, row)) continue;
+
+        lua_createtable(L, (int)row.size(), 0);
+        for (std::size_t i = 0; i < row.size(); ++i) {
+            push_value(L, row[i]);
+            lua_rawseti(L, -2, (int)i + 1);
+        }
+        lua_rawseti(L, -2, ++kept);
+    }
+    return 1;
+}
+
+// DB_Name:Delete(...) -- not yet: retracting a fact is a different
+// vtable slot, and this one has not been established from the engine's
+// own code the way the insert slot was. Erroring is the honest answer;
+// calling a slot on a guess is how the game goes down.
+int osi_db_delete(lua_State* L) {
+    char const* name = lua_tostring(L, lua_upvalueindex(1));
+    return luaL_error(L,
+        "Osi.%s:Delete is not implemented yet: the retract slot in the node "
+        "vtable has not been identified on this build", name);
+}
+
+// Osi.Name for a story-defined function, built the first time the name is
+// asked for.
+//
+// These are not bound during the level load. Their Function objects are
+// heap pointers that cannot be cached between runs, and recovering them
+// means walking Osiris' whole function database -- half a second that a
+// session where no mod calls a procedure should not pay. bg3se resolves
+// its Osi.* through a metatable for the same reason; a name that is never
+// used costs nothing.
+int osi_story_lookup(lua_State* L) {
+    char const* name = luaL_checkstring(L, 1);
+
+    bool isDatabase = false;
+    if (!osi::story_function(name, &isDatabase)) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    if (!isDatabase) {
+        lua_pushstring(L, name);
+        lua_pushboolean(L, 0);
+        lua_pushcclosure(L, osi_story_dispatch, 2);
+        return 1;
+    }
+
+    // A database reads as well as writes: DB_Foo(...) inserts,
+    // DB_Foo:Get(...) queries.
+    lua_createtable(L, 0, 2);
+    lua_pushstring(L, name);
+    lua_pushcclosure(L, osi_db_get, 1);
+    lua_setfield(L, -2, "Get");
+    lua_pushstring(L, name);
+    lua_pushcclosure(L, osi_db_delete, 1);
+    lua_setfield(L, -2, "Delete");
+
+    lua_createtable(L, 0, 1);
+    lua_pushstring(L, name);
+    lua_pushboolean(L, 1);
+    lua_pushcclosure(L, osi_story_dispatch, 2);
+    lua_setfield(L, -2, "__call");
+    lua_setmetatable(L, -2);
+    return 1;
 }
 
 // Osi.Name(inputs...) -- whatever the caller omits is treated as an output,
@@ -2864,6 +3019,8 @@ void lua_init() {
     lua_setfield(g_lua, -2, "Replicate");
     lua_pushcfunction(g_lua, l_world_probe);
     lua_setfield(g_lua, -2, "WorldProbe");
+    lua_pushcfunction(g_lua, osi_story_lookup);
+    lua_setfield(g_lua, -2, "StoryFunction");
     lua_pushcfunction(g_lua, l_get_field);
     lua_setfield(g_lua, -2, "GetField");
     lua_pushcfunction(g_lua, l_set_field);
@@ -6450,13 +6607,39 @@ for name in pairs(Osi) do lower[string.lower(name)] = name end
 setmetatable(Osi, {
   __index = function(t, key)
     local real = lower[string.lower(key)]
-    if real == nil then return nil end
-    Ext.Log.PrintWarning(string.format(
-      "COMPATIBILITY WARNING: Osiris symbol '%s' referenced using incorrect " ..
-      "case; the correct name is '%s'", key, real))
-    local fn = rawget(t, real)
-    rawset(t, key, fn)  -- cache, so the warning fires once per name
-    return fn
+    if real ~= nil then
+      Ext.Log.PrintWarning(string.format(
+        "COMPATIBILITY WARNING: Osiris symbol '%s' referenced using incorrect " ..
+        "case; the correct name is '%s'", key, real))
+      local fn = rawget(t, real)
+      rawset(t, key, fn)  -- cache, so the warning fires once per name
+      return fn
+    end
+
+    -- The story's own procedures, events and databases, which are not
+    -- bound up front: the first mention of one resolves it.
+    local story = Ext._Internal.StoryFunction(key)
+    if story ~= nil then
+      rawset(t, key, story)
+      lower[string.lower(key)] = key
+      _G[key] = story  -- bare calls work too, as they do upstream
+      return story
+    end
+    return nil
+  end
+})
+
+-- A bare PROC_Foo(...) is idiomatic, and the engine's own symbols are
+-- already globals. Story names become globals as they resolve; until one
+-- is asked for, this is what finds it.
+setmetatable(_G, {
+  __index = function(_, key)
+    if type(key) ~= "string" then return nil end
+    if key:find("^DB_") == nil and key:find("^PROC_") == nil
+       and key:find("^QRY_") == nil then
+      return nil
+    end
+    return Osi[key]
   end
 })
 )LUA");

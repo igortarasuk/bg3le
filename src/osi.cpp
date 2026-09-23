@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <array>
+#include <map>
 #include "osi.h"
 
 #include <cctype>
@@ -459,24 +461,184 @@ NodeList find_database_db(std::uintptr_t base) {
     return NodeList{};
 }
 
-// Osiris interns its strings: a TypedValue holding one holds a handle
-// into a string pool, not a pointer -- the facts dump shows values like
+// Osiris interns its strings, so a TypedValue holding one holds a handle
+// into a string pool rather than a pointer: a fact reads as
 // 0x256d01df940f035 where a heap address on this build looks like
 // 0x52f40519ee0.
 //
-// Reading one back, and building one to pass to a procedure, both need
-// that pool. It is not found yet: bg3se's COsiStringTable is three pools
-// of {float, unordered_map, vector<COsiString>, vector<uint32>} with
-// COsiString at 32 bytes, and searching every pointer in libOsiris'
-// writable data for a vector of 32-byte records pointing at text finds
-// nothing, so the layout differs here. The next thing to try is the other
-// direction: take a string Osiris is known to hold -- the host
-// character's UUID, which comes back through the DIV boundary as plain
-// text -- find it in memory, and look at what points at it.
+// COsiStringTable::GetStr is exported, and its body is the entire
+// encoding -- eight instructions:
 //
-// COsiStringTable::AddStr and ::GetStr are exported from libOsiris, so
-// once the table itself is located, interning is a call rather than more
-// reverse engineering.
+//   index = handle & 0x1fffff;        // the upper bits are never read
+//   if (index == 0) return "";
+//   return *(*(*this + 0x28) + index * 32);
+//
+// So a record is 32 bytes with the text pointer first, the record array
+// hangs off the table at +0x28 with its end at +0x30, and `this` is a
+// COsiStringTable** -- bg3se types the export the same way and calls it
+// as GetString(*Globals.StringTable, handle). AddStr agrees: it keeps a
+// refcount at record+0x18 and a free list of indices at +0x40/+0x48.
+//
+// bg3se reads the table from the first of ten globals that the COsiris
+// constructor stores, and the same ten stores are here -- but this build
+// embeds containers that Windows heap-allocates, which shifts the run and
+// is why the earlier structural search, looking for the vector of
+// COsiString that bg3se describes, found nothing. The slot is found by
+// content instead, which the layout above makes cheap to test.
+constexpr std::uint64_t kStringIndexMask = 0x1fffff;
+constexpr std::uintptr_t kPoolRecords = 0x28;
+constexpr std::uintptr_t kPoolRecordsEnd = 0x30;
+constexpr std::size_t kRecordSize = 32;
+constexpr std::uintptr_t kRecordRefs = 0x18;
+
+// Only the table address is worth keeping: the record array is a vector,
+// so interning a new string can reallocate it and both its address and
+// its extent change underneath. Every access re-reads them, which is two
+// loads and removes a whole class of stale-pointer bug -- interning a
+// string and then failing to read it back is how that was noticed.
+struct StringPool {
+    std::uintptr_t Table = 0;  // what GetStr and AddStr want as `this`
+    std::uintptr_t Records = 0;
+    std::size_t Count = 0;
+};
+
+StringPool g_strings;
+
+bool pool_now(std::uintptr_t* records, std::size_t* count) {
+    if (g_strings.Table == 0) return false;
+
+    std::uintptr_t object = 0;
+    std::uintptr_t begin = 0;
+    std::uintptr_t end = 0;
+    if (!peek(g_strings.Table, &object) || object < 0x1000) return false;
+    if (!peek(object + kPoolRecords, &begin)) return false;
+    if (!peek(object + kPoolRecordsEnd, &end)) return false;
+    if (begin < 0x1000 || end <= begin) return false;
+
+    *records = begin;
+    *count = (end - begin) / kRecordSize;
+    return true;
+}
+
+// A record's text: NUL-terminated printable ASCII. Osiris holds
+// identifiers and GUIDs, so this is a tight test, and it is only ever
+// applied to a few hundred records at once.
+bool record_text(std::uintptr_t at, std::string* out) {
+    if (at < 0x1000) return false;
+
+    // One read of a fixed window rather than a byte at a time: a string
+    // that runs past it is not one of Osiris'.
+    char window[72] = {};
+    if (!peek(at, &window)) return false;
+
+    for (std::size_t i = 0; i < sizeof(window); ++i) {
+        const unsigned char c = (unsigned char)window[i];
+        if (c == 0) {
+            if (i == 0) return false;
+            if (out != nullptr) out->assign(window, i);
+            return true;
+        }
+        if (c < 0x20 || c > 0x7e) return false;
+    }
+    return false;
+}
+
+// Does this address behave as GetStr's `this`?
+bool pool_from(std::uintptr_t table, StringPool* out) {
+    std::uintptr_t object = 0;
+    if (!peek(table, &object) || object < 0x1000) return false;
+
+    std::uintptr_t records = 0;
+    std::uintptr_t end = 0;
+    if (!peek(object + kPoolRecords, &records)) return false;
+    if (!peek(object + kPoolRecordsEnd, &end)) return false;
+    if (records < 0x1000 || end <= records) return false;
+    if ((end - records) % kRecordSize != 0) return false;
+
+    const std::size_t count = (end - records) / kRecordSize;
+    if (count < 64 || count > (kStringIndexMask + 1)) return false;
+
+    // Index 0 is the empty string and holds no pointer, so sampling
+    // starts at 1. A freed record is empty too; what decides it is that
+    // nothing occupied is anything other than text.
+    std::size_t text = 0;
+    std::size_t other = 0;
+    for (std::size_t i = 1; i < count && text < 64 && other == 0; ++i) {
+        std::uintptr_t at = 0;
+        if (!peek(records + i * kRecordSize, &at)) return false;
+        if (at == 0) continue;
+        if (record_text(at, nullptr)) {
+            ++text;
+        } else {
+            ++other;
+        }
+    }
+    if (text < 32 || other > 0) return false;
+
+    *out = StringPool{table, records, count};
+    return true;
+}
+
+// libOsiris' writable segment, which is where the global lives.
+struct Segment {
+    std::uintptr_t Begin = 0;
+    std::uintptr_t End = 0;
+};
+
+int find_osiris_data(struct dl_phdr_info* info, std::size_t, void* data) {
+    if (info->dlpi_name == nullptr) return 0;
+    if (std::strstr(info->dlpi_name, "libOsiris.so") == nullptr) return 0;
+
+    auto* out = static_cast<Segment*>(data);
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        ElfW(Phdr) const& ph = info->dlpi_phdr[i];
+        if (ph.p_type != PT_LOAD || (ph.p_flags & PF_W) == 0) continue;
+        const std::uintptr_t begin = info->dlpi_addr + ph.p_vaddr;
+        if (out->Begin == 0 || begin < out->Begin) out->Begin = begin;
+        if (begin + ph.p_memsz > out->End) out->End = begin + ph.p_memsz;
+    }
+    return 1;
+}
+
+bool find_string_table() {
+    if (g_strings.Records != 0) return true;
+
+    std::uintptr_t base = 0;
+    ::dl_iterate_phdr(find_osiris, &base);
+
+    Segment segment;
+    ::dl_iterate_phdr(find_osiris_data, &segment);
+    if (segment.Begin == 0 || segment.End <= segment.Begin) {
+        logf("strings: libOsiris has no writable segment");
+        return false;
+    }
+
+    for (std::uintptr_t at = segment.Begin; at + 8 <= segment.End; at += 8) {
+        StringPool found;
+
+        // The global holds a COsiStringTable**, so the slot is one
+        // dereference away from what GetStr is passed. The slot itself is
+        // tried as well, in case this build stores the object inline as it
+        // does the node and database lists.
+        std::uintptr_t indirect = 0;
+        if (peek(at, &indirect) && indirect >= 0x1000
+            && pool_from(indirect, &found)) {
+            g_strings = found;
+        } else if (pool_from(at, &found)) {
+            g_strings = found;
+        } else {
+            continue;
+        }
+
+        logf("osiris: string table at libOsiris+%#lx holds %zu strings",
+             (unsigned long)(at - base), g_strings.Count);
+        return true;
+    }
+
+    logf("osiris: no string table found in libOsiris' data");
+    return false;
+}
+
 
 NodeList find_node_db(std::uintptr_t base) {
     for (std::intptr_t delta = -0x80; delta <= 0x80; delta += 8) {
@@ -800,6 +962,52 @@ std::vector<Candidate> handle_candidates(char const* text) {
 
 // Every handle the databases hold, so a derived value can be looked for
 // among them.
+struct StoredValue {
+    std::uint64_t Raw = 0;
+    std::uint16_t Type = 0;
+};
+
+std::vector<StoredValue> stored_values(std::size_t limit) {
+    std::vector<StoredValue> out;
+    if (g_databases.First == 0) return out;
+
+    for (std::uint32_t i = 0; i < g_databases.Count && out.size() < limit;
+         ++i) {
+        std::uintptr_t db = 0;
+        if (!peek(g_databases.First + (std::uintptr_t)i * 8, &db)
+            || db < 0x1000) {
+            continue;
+        }
+
+        std::uintptr_t head = 0;
+        std::uint64_t facts = 0;
+        if (!peek(db + kFactsHead, &head) || !peek(db + kFactsCount, &facts)) {
+            continue;
+        }
+        if (facts == 0 || facts > (1u << 20) || head < 0x1000) continue;
+
+        std::uintptr_t node = head;
+        for (std::uint64_t f = 0; f < facts && out.size() < limit; ++f) {
+            std::uintptr_t values = 0;
+            std::uint64_t width = 0;
+            if (!peek(node + 0x10, &values) || !peek(node + 0x18, &width)
+                || values < 0x1000 || width == 0 || width > 32) {
+                break;
+            }
+            for (std::uint64_t k = 0; k < width && out.size() < limit; ++k) {
+                StoredValue value;
+                if (!peek(values + k * 16, &value.Raw)
+                    || !peek(values + k * 16 + 8, &value.Type)) {
+                    break;
+                }
+                out.push_back(value);
+            }
+            if (!peek(node + 0x00, &node) || node < 0x1000) break;
+        }
+    }
+    return out;
+}
+
 std::vector<std::uint64_t> stored_handles(std::size_t limit) {
     std::vector<std::uint64_t> out;
     if (g_databases.First == 0) return out;
@@ -893,47 +1101,403 @@ std::vector<std::uint64_t> handles_of(char const* key) {
     return out;
 }
 
-void probe_string_pool(char const* text) {
-    if (text == nullptr || std::strlen(text) < 8) return;
+// What the stored values look like, grouped by their declared type. The
+// point is whether every type encodes a value the same way: a plain string
+// and a GUID string may well not.
+void report_value_shapes() {
+    const std::vector<StoredValue> values = stored_values(1u << 17);
+    logf("strings: %zu stored values", values.size());
 
-    // A database whose contents are known by other means gives the pairing
-    // this needs: whatever handle stands for the host character in a
-    // player database is the handle for this text. The names are searched
-    // for rather than guessed -- the story's own naming is not something
-    // to assume.
-    std::size_t reported = 0;
-    for (auto const& entry : database()) {
-        if (reported >= 6) break;
-        if (entry.first.rfind("DB_", 0) != 0) continue;
-        if (entry.first.find("layer") == std::string::npos
-            && entry.first.find("Party") == std::string::npos) {
-            continue;
-        }
+    std::map<std::uint16_t, std::vector<std::uint64_t>> byType;
+    for (StoredValue const& value : values) {
+        auto& list = byType[value.Type];
+        if (list.size() < 6) list.push_back(value.Raw);
+    }
 
-        const std::vector<std::uint64_t> handles = handles_of(entry.first.c_str());
-        if (handles.empty()) continue;
+    std::map<std::uint16_t, std::size_t> counts;
+    for (StoredValue const& value : values) ++counts[value.Type];
 
+    for (auto const& entry : byType) {
         std::string shown;
-        for (std::size_t i = 0; i < handles.size() && i < 8; ++i) {
-            char one[32] = {};
-            std::snprintf(one, sizeof(one), "%#llx ",
-                          (unsigned long long)handles[i]);
+        for (std::uint64_t raw : entry.second) {
+            char one[48] = {};
+            // Split the way the sequential handles suggested: a field at
+            // bit 21 and up, and the twenty-one bits below it.
+            std::snprintf(one, sizeof(one), "%#llx(%llu|%llu) ",
+                          (unsigned long long)raw,
+                          (unsigned long long)(raw >> 21),
+                          (unsigned long long)(raw & 0x1fffff));
             shown += one;
         }
-        logf("strings: %s holds %zu values: %s", entry.first.c_str(),
-             handles.size(), shown.c_str());
-        ++reported;
+        logf("strings:   type %u: %zu values: %s", entry.first,
+             counts[entry.first], shown.c_str());
+    }
+}
+
+// A stored value only means a string handle if its type says so, and
+// most types are aliases: the story declares CHARACTERGUID, the engine
+// resolves that to GuidString. Osiris keeps the resolution in an array
+// indexed by type id -- bg3se's OsiTypeDb::AliasInfo, {uint16 TypeId;
+// uint16 AliasTypeId} -- and walks it until the id is String or
+// GuidString.
+//
+// The array hangs off the type database, whose global is one of the ten
+// the COsiris constructor stores, at an offset past a 1023-slot hash
+// table that this build does not have to size the same way. Finding it
+// directly is easier and self-proving: an array whose every entry holds
+// its own index, for sixty-four entries running, with aliases that all
+// resolve to a base type, is not something an arena produces by
+// accident.
+//
+// Without it a type-1 integer value of 6 reads as the string at index 6
+// and looks convincing -- "HealingSpiritHeal" -- which is how the need
+// for this was noticed.
+constexpr std::uint16_t kTypeString = 4;
+constexpr std::uint16_t kTypeGuidString = 5;
+constexpr std::uint16_t kTypeUndefined = 0x7f;
+constexpr std::size_t kAliasProbe = 64;
+
+constexpr std::size_t kTypeCount = 128;  // ids are 7 bits
+
+// Copied out of the engine's table once rather than read through a
+// pointer per value: a fact row asks about every column, and the answer
+// cannot change while a story is loaded.
+std::array<std::uint16_t, kTypeCount> g_alias{};
+bool g_alias_ready = false;
+std::uintptr_t g_alias_at = 0;  // where they were read from, for the log
+
+// Resolve as the engine does, with a bound: a cycle in the table would
+// otherwise spin.
+std::uint16_t resolve_alias(std::uint16_t type) {
+    if (!g_alias_ready) return type;
+
+    for (int step = 0; step < 16; ++step) {
+        if (type <= kTypeGuidString || type == kTypeUndefined) return type;
+        if (type >= kTypeCount) return type;
+
+        const std::uint16_t next = g_alias[type];
+        if (next == type || next == 0) return type;
+        type = next;
+    }
+    return type;
+}
+
+bool is_string_type(std::uint16_t type) {
+    const std::uint16_t base = resolve_alias(type);
+    return base == kTypeString || base == kTypeGuidString;
+}
+
+bool alias_array_at(std::uintptr_t at) {  // NOLINT(misc-no-recursion)
+    std::uint16_t entries[kAliasProbe * 2] = {};
+    if (!peek(at, &entries)) return false;
+
+    std::size_t aliased = 0;
+    for (std::size_t i = 0; i < kAliasProbe; ++i) {
+        if (entries[i * 2] != (std::uint16_t)i) return false;
+
+        const std::uint16_t alias = entries[i * 2 + 1];
+        if (alias > kTypeUndefined) return false;
+        if (i > kTypeGuidString && alias != 0 && alias != (std::uint16_t)i) {
+            ++aliased;
+        }
     }
 
-    // And where the text itself lives, to compare against.
-    const std::vector<std::uintptr_t> places = find_bytes(text);
-    std::string addresses;
-    for (std::size_t i = 0; i < places.size() && i < 12; ++i) {
-        char one[32] = {};
-        std::snprintf(one, sizeof(one), "%#lx ", (unsigned long)places[i]);
-        addresses += one;
+    // An index ramp with no aliases in it is some other table.
+    return aliased >= 4;
+}
+
+// Scanned rather than walked, for the reason above. Writable regions
+// only: the table is allocated through Osiris' own allocator.
+bool find_alias_table() {
+    if (g_alias_ready) return true;
+
+    std::FILE* maps = std::fopen("/proc/self/maps", "r");
+    if (maps == nullptr) return false;
+
+    constexpr std::size_t kChunk = 1u << 20;
+    constexpr std::size_t kSpan = kAliasProbe * 4;
+    std::vector<unsigned char> block(kChunk + kSpan);
+
+    char line[1024];
+    while (std::fgets(line, sizeof(line), maps) != nullptr && !g_alias_ready) {
+        unsigned long long from = 0;
+        unsigned long long to = 0;
+        if (!bg3le_scannable_region(line, &from, &to)) continue;
+
+        for (unsigned long long at = from; at < to && !g_alias_ready;
+             at += kChunk) {
+            std::size_t want = (std::size_t)(to - at);
+            if (want > block.size()) want = block.size();
+            const std::size_t got =
+                safe_read_some((void const*)at, block.data(), want);
+            if (got < kSpan) continue;
+            scan_yield();
+
+            for (std::size_t off = 0; off + kSpan <= got; off += 4) {
+                auto const* words =
+                    reinterpret_cast<std::uint16_t const*>(block.data() + off);
+
+                // The cheap rejection first: two entries that hold their
+                // own index. Everything else is rare enough to afford.
+                if (words[0] != 0 || words[2] != 1) continue;
+                if (!alias_array_at((std::uintptr_t)(at + off))) continue;
+
+                for (std::size_t i = 0; i < kTypeCount; ++i) {
+                    std::uint16_t alias = 0;
+                    peek((std::uintptr_t)(at + off) + i * 4 + 2, &alias);
+                    g_alias[i] = alias;
+                }
+                g_alias_ready = true;
+                g_alias_at = (std::uintptr_t)(at + off);
+                break;
+            }
+        }
     }
-    logf("strings: \"%s\" is at %s", text, addresses.c_str());
+    std::fclose(maps);
+
+    if (!g_alias_ready) {
+        logf("osiris: no type alias table found");
+        return false;
+    }
+
+    // Say what it decided, since every string read now depends on it.
+    logf("osiris: type aliases read from 0x%lx (type 4 -> %u, 5 -> %u, "
+         "26 -> %u, 40 -> %u)", (unsigned long)g_alias_at,
+         resolve_alias(4), resolve_alias(5), resolve_alias(26),
+         resolve_alias(40));
+    return true;
+}
+
+// GetStr, done by reading rather than calling: the encoding is known, and
+// a read cannot take the game down on a handle the pool has since freed.
+bool string_of(std::uint64_t handle, std::string* out) {
+    std::uintptr_t records = 0;
+    std::size_t count = 0;
+    if (!pool_now(&records, &count)) return false;
+
+    const std::uint64_t index = handle & kStringIndexMask;
+    if (index == 0) {
+        if (out != nullptr) out->clear();
+        return true;
+    }
+    if (index >= count) return false;
+
+    std::uintptr_t at = 0;
+    if (!peek(records + (std::uintptr_t)index * kRecordSize, &at)) return false;
+    return record_text(at, out);
+}
+
+// How many references the pool holds for a handle. Worth reading because
+// interning is meant to bump it: a round trip that returns the same index
+// and one more reference is the whole layout confirmed.
+std::uint32_t string_refs(std::uint64_t handle) {
+    std::uintptr_t records = 0;
+    std::size_t count = 0;
+    if (!pool_now(&records, &count)) return 0;
+
+    const std::uint64_t index = handle & kStringIndexMask;
+    if (index == 0 || index >= count) return 0;
+
+    std::uint32_t refs = 0;
+    peek(records + (std::uintptr_t)index * kRecordSize + kRecordRefs, &refs);
+    return refs;
+}
+
+// AddStr, which has to be a call: it allocates through Osiris' own
+// allocator, keeps the hash map that makes interning idempotent, and
+// refcounts the record. Called on the story thread, as bg3se does.
+using AddStrProc = std::uint64_t (*)(void*, char const*, bool);
+
+AddStrProc add_str() {
+    static AddStrProc proc = reinterpret_cast<AddStrProc>(
+        ::dlsym(RTLD_DEFAULT, "_ZN15COsiStringTable6AddStrEPKcb"));
+    return proc;
+}
+
+std::uint64_t intern_string(char const* text, bool guid) {
+    if (g_strings.Table == 0 || text == nullptr || text[0] == '\0') return 0;
+
+    AddStrProc proc = add_str();
+    if (proc == nullptr) return 0;
+
+    return proc(reinterpret_cast<void*>(g_strings.Table), text, guid);
+}
+
+// The Function objects, bound on demand.
+//
+// A cached signature carries names, arities, types and out-parameter
+// counts, but not the address of the Function object behind each one:
+// that is a heap pointer, different every run, and caching it would be
+// wrong rather than merely stale. Calling a story function needs it --
+// the node a tuple is inserted into is reached through it -- so the tree
+// walk still has to happen, just not during the level load. The first
+// call pays the ~0.4s; a session where no mod calls Osiris never does.
+bool bind_defs() {
+    static bool bound = false;
+    if (bound) return true;
+
+    // The signature walk fills these in as it goes, so when it ran this
+    // run there is nothing to do: walking a second time cost half a
+    // second of the level load before this check existed.
+    for (auto const& entry : database()) {
+        if (entry.second.Def != 0) {
+            bound = true;
+            return true;
+        }
+    }
+
+    std::uintptr_t base = 0;
+    ::dl_iterate_phdr(find_osiris, &base);
+    if (base == 0) return false;
+
+    std::uintptr_t holder = 0;
+    if (!peek(base + kFunctionDbHolder, &holder) || holder < 0x1000) {
+        return false;
+    }
+
+    std::unordered_map<std::string, DbEntry> live;
+    for (std::size_t i = 0; i < kBuckets; ++i) {
+        std::uintptr_t root = 0;
+        if (!peek(holder + 0x10 + i * kSlotStride + 0x08, &root)) continue;
+        std::unordered_set<std::uintptr_t> seen;
+        visit_tree(root, &live, 0, &seen);
+    }
+    if (live.empty()) {
+        logf("osiris: no function objects found; story calls stay unavailable");
+        return false;
+    }
+
+    // The cache wins on types -- it was verified against the engine's own
+    // mapping -- so only the pointer is taken from the walk.
+    std::size_t added = 0;
+    for (auto const& entry : live) {
+        auto it = database().find(entry.first);
+        if (it == database().end()) {
+            database().emplace(entry.first, entry.second);
+            ++added;
+            continue;
+        }
+        it->second.Def = entry.second.Def;
+        if (it->second.Types.empty()) it->second.Types = entry.second.Types;
+    }
+
+    bound = true;
+    logf("osiris: bound %zu function objects (%zu the cache did not have)",
+         live.size(), added);
+    return true;
+}
+
+// Which class each node is, by its vtable.
+//
+// Running a procedure means calling Node::InsertTuple, and that is a
+// virtual: bg3se puts it at +0x50 of the node vtable, counting from a
+// Destroy slot. That offset cannot be carried over, because the Itanium
+// ABI spends two slots on destructors where MSVC spends one, so every
+// slot after the first shifts by eight. Nothing here names those methods,
+// so the slot has to be established rather than assumed.
+//
+// This is the first half: the vtable each kind of node actually uses,
+// with an example function for each, so the proc node class is known by
+// what uses it rather than by its position in a list.
+void report_node_vtables() {
+    if (g_nodes.First == 0 || !bind_defs()) return;
+
+    std::map<std::uintptr_t, std::size_t> counts;
+    for (std::uint32_t i = 0; i < g_nodes.Count; ++i) {
+        std::uintptr_t node = 0;
+        if (!peek(g_nodes.First + (std::uintptr_t)i * 8, &node)
+            || node < 0x1000) {
+            continue;
+        }
+        std::uintptr_t vmt = 0;
+        if (!peek(node, &vmt) || vmt < 0x1000) continue;
+        ++counts[vmt];
+    }
+
+    // An example name per vtable, which is what tells the classes apart:
+    // a DB_ function's node is a database node, and a procedure's is not.
+    std::map<std::uintptr_t, std::string> examples;
+    for (auto const& entry : database()) {
+        if (entry.second.Def == 0) continue;
+        const std::uintptr_t node = node_for(entry.second.Def);
+        if (node == 0) continue;
+        std::uintptr_t vmt = 0;
+        if (!peek(node, &vmt) || vmt < 0x1000) continue;
+
+        std::string& shown = examples[vmt];
+        // Prefer a name that says what the node is for.
+        if (shown.empty() || (shown.rfind("DB_", 0) != 0
+                              && entry.first.rfind("DB_", 0) == 0)) {
+            shown = entry.first;
+        }
+    }
+
+    std::uintptr_t base = 0;
+    ::dl_iterate_phdr(find_osiris, &base);
+    for (auto const& entry : counts) {
+        logf("nodes: vtable libOsiris+%#lx used by %zu nodes, e.g. %s",
+             (unsigned long)(entry.first - base), entry.second,
+             examples.count(entry.first) != 0
+                 ? examples[entry.first].c_str() : "(no named function)");
+    }
+}
+
+void probe_string_pool(char const* text) {
+    report_node_vtables();
+    report_value_shapes();
+    if (!find_string_table()) return;
+
+    // Resolution, on values the engine put there itself: one sample of
+    // every type that carries a string.
+    const std::vector<StoredValue> values = stored_values(1u << 17);
+    std::map<std::uint16_t, std::size_t> shown;
+    std::size_t resolved = 0;
+    std::size_t failed = 0;
+    for (StoredValue const& value : values) {
+        if (!is_string_type(value.Type)) continue;
+
+        std::string held;
+        if (!string_of(value.Raw, &held) || held.empty()) {
+            ++failed;
+            continue;
+        }
+        ++resolved;
+        if (shown[value.Type]++ < 2) {
+            logf("strings: type %u %#llx -> \"%s\"", value.Type,
+                 (unsigned long long)value.Raw, held.c_str());
+        }
+    }
+    logf("strings: %zu of %zu string-typed values resolve to text", resolved,
+         resolved + failed);
+
+    // And interning, which has to be idempotent: a string the pool
+    // already holds comes back as the handle it already has. That is the
+    // round trip a procedure argument needs.
+    for (StoredValue const& value : values) {
+        if (!is_string_type(value.Type)) continue;
+
+        std::string held;
+        if (!string_of(value.Raw, &held) || held.empty()) continue;
+
+        const bool guid = resolve_alias(value.Type) == kTypeGuidString;
+        const std::uint32_t before = string_refs(value.Raw);
+        const std::uint64_t again = intern_string(held.c_str(), guid);
+        logf("strings: intern(\"%s\", guid=%d) -> %#llx: index %llu, wanted "
+             "%llu; refs %u -> %u", held.c_str(), guid ? 1 : 0,
+             (unsigned long long)again,
+             (unsigned long long)(again & kStringIndexMask),
+             (unsigned long long)(value.Raw & kStringIndexMask), before,
+             string_refs(again));
+        break;
+    }
+
+    if (text == nullptr || std::strlen(text) < 8) return;
+
+    const std::uint64_t handle = intern_string(text, std::strlen(text) > 30);
+    std::string back;
+    string_of(handle, &back);
+    logf("strings: intern(\"%s\") -> %#llx -> \"%s\"", text,
+         (unsigned long long)handle, back.c_str());
 }
 
 // Which offset holds FunctionType, decided once by agreement with the
@@ -971,6 +1535,16 @@ bool load_cached_signatures(char const* story,
         std::size_t story = 0;
         if (std::sscanf(line, "# story %zu", &story) == 1) {
             g_story_functions = story;
+            continue;
+        }
+
+        unsigned int type = 0;
+        unsigned int alias = 0;
+        if (std::sscanf(line, "# alias %u %u", &type, &alias) == 2) {
+            if (type < kTypeCount) {
+                g_alias[type] = (std::uint16_t)alias;
+                g_alias_ready = true;
+            }
             continue;
         }
 
@@ -1025,6 +1599,15 @@ void save_cached_signatures(char const* story) {
     // uncallable procedures appears on the first run and vanishes on the
     // second, which reads like something changed.
     std::fprintf(f, "# story %zu\n", g_story_functions);
+    // The type aliases, which decide whether a stored value is a string.
+    // Scanning for the engine's table costs a pass over every writable
+    // mapping, so once is enough per story.
+    if (g_alias_ready) {
+        for (std::size_t i = 0; i < kTypeCount; ++i) {
+            if (g_alias[i] == 0) continue;
+            std::fprintf(f, "# alias %zu %u\n", i, g_alias[i]);
+        }
+    }
     for (auto const& entry : database()) {
         std::fprintf(f, "%s %d", entry.first.c_str(), entry.second.Outs);
         for (std::size_t i = 0; i < entry.second.Types.size(); ++i) {
@@ -1052,12 +1635,18 @@ std::size_t load_out_param_counts(std::vector<Function>* functions,
     // is a handful of reads rather than a walk.
     find_node_db(base);
     find_database_db(base);
+    find_string_table();
 
     std::size_t fromStore = 0;
     if (load_cached_signatures(story, functions, &fromStore)) {
         if (cached != nullptr) *cached = true;
+        // The cache carries the aliases too; only fall back to searching
+        // for the engine's table if it did not.
+        if (!g_alias_ready) find_alias_table();
         return fromStore;
     }
+
+    find_alias_table();
 
     std::uintptr_t holder = 0;
     if (!peek(base + kFunctionDbHolder, &holder) || holder < 0x1000) {
@@ -1349,19 +1938,466 @@ std::vector<Function> story_functions(std::vector<Function> const& known) {
     // what will confirm it again after a game patch.
     if (std::getenv("BG3LE_DUMP_DBFACTS") != nullptr) dump_database_facts();
 
-    g_story_functions = noId;
+    // On a cached run the entries carry no Function pointer, so nothing
+    // reaches the handle check and noId counts nothing: the count comes
+    // from the cache instead. Overwriting it with zero made the line say
+    // something different on the second run than on the first.
+    if (noId != 0) g_story_functions = noId;
     logf("osiris: database holds %zu entries: %zu the engine already maps, "
-         "%zu callable through the dispatch, %zu story-defined (no "
-         "dispatch handle)",
-         database().size(), already, out.size(), noId);
+         "%zu callable through the dispatch, %zu the story defines itself "
+         "(reached by tuple insert, resolved on first use)",
+         database().size(), already, out.size(), g_story_functions);
     return out;
 }
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Running a story-defined function.
+//
+// A procedure a mod calls carries no dispatch handle, so the DIV boundary
+// cannot reach it: the story's own functions are run by putting a tuple
+// into the Rete node that stands for them. bg3se does the same thing --
+// node->InsertTuple(&tuple) -- but its slot number and its structure
+// layouts are MSVC's, and neither transfers. Both came from the engine's
+// own code instead: COsiris::Event is exported, and raising an event is
+// exactly this operation.
+//
+// What that function does, in order:
+//
+//   1. builds a COsipParameterList on the stack from its COsiArgumentDesc
+//   2. finds the OsiFunctionDef by id in the function database
+//   3. reads the node id from the def, takes the node out of the node
+//      list, and calls the node's vtable slot at +0x68 with the list
+//   4. destroys the list
+//
+// So +0x68 is the slot, and it is not +0x50: the Itanium ABI spends two
+// vtable slots on destructors where MSVC spends one, and this Osiris has
+// virtuals bg3se's list does not. Guessing from bg3se's offset would have
+// called PushDownTupleDelete.
+//
+// The structures, read off the same two functions:
+//
+//   COsipParameterList  +0x00 vtable
+//                       +0x08 last node, and the sentinel's own address
+//                       +0x10 first node
+//                       +0x18 count
+//   node                +0x00 prev, +0x08 next, +0x10 TypedValue*
+//   TypedValue          +0x00 value, +0x08 type, +0x0a index, +0x0b flags
+//
+// The sentinel is the +0x08 field itself: both pointers start out holding
+// its address, so the first insertion writes the first node through what
+// is nominally the sentinel's next pointer, which is the +0x10 field. The
+// engine's six stores are mirrored exactly rather than reasoned about.
+//
+// Nothing here is allocated from Osiris' allocator, unlike the engine's
+// own path: the tuple lives for one call and the values are copied by
+// whatever consumes them -- which is why bg3se can free its own straight
+// after. Interned strings are released afterwards all the same.
+constexpr std::uintptr_t kInsertTuple = 0x68;
+
+struct TupleNode;
+
+struct alignas(8) TypedValueRec {
+    std::uint64_t Value = 0;
+    std::uint16_t Type = 0;
+    std::int8_t Index = -1;
+    std::uint8_t Flags = 0x02;  // TypedValue, as the engine initialises it
+    std::uint32_t Unused = 0;
+};
+static_assert(sizeof(TypedValueRec) == 16, "TypedValue is 16 bytes");
+
+struct TupleNode {
+    TupleNode* Prev = nullptr;
+    TupleNode* Next = nullptr;
+    TypedValueRec* Item = nullptr;
+};
+static_assert(sizeof(TupleNode) == 24, "tuple node is 24 bytes");
+
+struct ParameterList {
+    void* Vtable = nullptr;
+    TupleNode* Last = nullptr;
+    TupleNode* First = nullptr;
+    std::uint64_t Count = 0;
+
+    // The +0x08 field doubles as the head sentinel.
+    TupleNode* sentinel() { return reinterpret_cast<TupleNode*>(&Last); }
+
+    void init(void* vtable) {
+        Vtable = vtable;
+        Last = sentinel();
+        First = sentinel();
+        Count = 0;
+    }
+
+    void append(TupleNode* node, TypedValueRec* value) {
+        node->Prev = nullptr;
+        node->Item = value;
+        node->Next = sentinel();
+
+        TupleNode* prev = Last;
+        node->Prev = prev;
+        prev->Next = node;
+        Last = node;
+        ++Count;
+    }
+};
+static_assert(sizeof(ParameterList) == 32, "parameter list is 32 bytes");
+
+// The mangled name of a class, from its vtable: one slot back is the
+// typeinfo, and the typeinfo's second field is the name. Used to check
+// that a node is the class its function claims, rather than trusting an
+// offset.
+std::string class_of(std::uintptr_t vtable) {
+    // Nine node classes share a hundred and fifty thousand nodes, so the
+    // answer is kept: asking once per function cost four reads each and
+    // showed up in the level load.
+    static std::unordered_map<std::uintptr_t, std::string> known;
+    auto cached = known.find(vtable);
+    if (cached != known.end()) return cached->second;
+
+    std::uintptr_t info = 0;
+    std::uintptr_t name = 0;
+    std::string out;
+    if (peek(vtable - 8, &info) && info >= 0x1000 && peek(info + 8, &name)
+        && name >= 0x1000) {
+        record_text(name, &out);
+    }
+
+    known.emplace(vtable, out);
+    return out;
+}
+
+// libOsiris' whole mapped image, for searching inside it.
+struct Image {
+    std::uintptr_t Begin = 0;
+    std::uintptr_t End = 0;
+};
+
+int find_osiris_image(struct dl_phdr_info* info, std::size_t, void* data) {
+    if (info->dlpi_name == nullptr) return 0;
+    if (std::strstr(info->dlpi_name, "libOsiris.so") == nullptr) return 0;
+
+    auto* out = static_cast<Image*>(data);
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        ElfW(Phdr) const& ph = info->dlpi_phdr[i];
+        if (ph.p_type != PT_LOAD) continue;
+        const std::uintptr_t begin = info->dlpi_addr + ph.p_vaddr;
+        if (out->Begin == 0 || begin < out->Begin) out->Begin = begin;
+        if (begin + ph.p_memsz > out->End) out->End = begin + ph.p_memsz;
+    }
+    return 1;
+}
+
+// Every qword in libOsiris' image that equals `wanted`.
+std::vector<std::uintptr_t> image_pointers_to(Image const& image,
+                                              std::uintptr_t wanted,
+                                              std::size_t limit) {
+    std::vector<std::uintptr_t> out;
+    for (std::uintptr_t at = image.Begin; at + 8 <= image.End && out.size() < limit;
+         at += 8) {
+        std::uintptr_t word = 0;
+        if (peek(at, &word) && word == wanted) out.push_back(at);
+    }
+    return out;
+}
+
+// The vtable of a class named in the image, found by content: the mangled
+// name is a string in the image, the typeinfo points at it eight bytes
+// in, and the vtable points at the typeinfo eight bytes back. Used for
+// the tuple class, whose vtable the engine puts in every list it builds.
+std::uintptr_t vtable_named(char const* mangled) {
+    Image image;
+    ::dl_iterate_phdr(find_osiris_image, &image);
+    if (image.Begin == 0) return 0;
+
+    const std::size_t length = std::strlen(mangled);
+    std::uintptr_t name = 0;
+    for (std::uintptr_t at = image.Begin; at + length + 1 <= image.End; ++at) {
+        char window[64] = {};
+        if (length + 1 > sizeof(window)) return 0;
+        if (!peek(at, &window)) {
+            at += 0xfff;  // an unmapped hole; skip past it
+            continue;
+        }
+        if (std::memcmp(window, mangled, length + 1) == 0) {
+            name = at;
+            break;
+        }
+    }
+    if (name == 0) return 0;
+
+    for (std::uintptr_t info : image_pointers_to(image, name, 8)) {
+        // The name sits at typeinfo+8.
+        for (std::uintptr_t vtable : image_pointers_to(image, info - 8, 8)) {
+            return vtable + 8;
+        }
+    }
+    return 0;
+}
+
+std::uintptr_t tuple_vtable() {
+    static std::uintptr_t found = vtable_named("18COsipParameterList");
+    return found;
+}
+
+using InsertProc = void (*)(void*, void*);
+using RemoveStrProc = void (*)(void*, std::uint64_t);
+
+RemoveStrProc remove_str() {
+    static RemoveStrProc proc = reinterpret_cast<RemoveStrProc>(
+        ::dlsym(RTLD_DEFAULT, "_ZN15COsiStringTable9RemoveStrE16COsiStringHandle"));
+    return proc;
+}
+
+void release_string(std::uint64_t handle) {
+    if (g_strings.Table == 0 || (handle & kStringIndexMask) == 0) return;
+
+    RemoveStrProc proc = remove_str();
+    if (proc != nullptr) proc(reinterpret_cast<void*>(g_strings.Table), handle);
+}
+
+// Is this really a function, rather than one of the many slots that are a
+// bare `ret` or a constant? A wrong slot number is the one mistake here
+// that takes the game down, so the target is looked at before it is
+// called.
+bool plausible_method(std::uintptr_t at) {
+    unsigned char head[4] = {};
+    if (!peek(at, &head)) return false;
+
+    if (head[0] == 0xc3) return false;                       // ret
+    if (head[0] == 0xb0 && head[2] == 0xc3) return false;    // mov $x,%al; ret
+    if (head[0] == 0x31 && head[1] == 0xc0) return false;    // xor %eax,%eax
+    return true;
+}
+
+// Put a tuple into a story function's node, which is what running it
+// means. `args` are already in the function's declared order.
+Status insert_tuple(char const* key, std::vector<Value> const& args,
+                    std::string* why) {
+    auto fail = [why](char const* text) {
+        if (why != nullptr) *why = text;
+        return Status::kUnavailable;
+    };
+
+    if (!bind_defs()) return fail("Osiris' function database is unreadable");
+    if (!find_string_table()) return fail("Osiris' string pool was not found");
+
+    auto entry = database().find(key);
+    if (entry == database().end() || entry->second.Def == 0) {
+        return fail("no such story function");
+    }
+    if (entry->second.Types.size() != args.size()) {
+        if (why != nullptr) {
+            *why = "expected " + std::to_string(entry->second.Types.size())
+                   + " arguments, got " + std::to_string(args.size());
+        }
+        return Status::kUnavailable;
+    }
+
+    const std::uintptr_t node = node_for(entry->second.Def);
+    if (node == 0) return fail("the function has no node");
+
+    std::uintptr_t vtable = 0;
+    if (!peek(node, &vtable) || vtable < 0x1000) return fail("node has no vtable");
+
+    // Only the two classes that hold tuples: a procedure or event node,
+    // and a database node. Anything else is a rule or a condition, and
+    // inserting into one is not what a caller means.
+    const std::string cls = class_of(vtable);
+    if (cls != "10CReteEvent" && cls != "9CReteFact") {
+        if (why != nullptr) *why = "node is a " + cls + ", which holds no tuple";
+        return Status::kUnavailable;
+    }
+
+    std::uintptr_t target = 0;
+    if (!peek(vtable + kInsertTuple, &target) || !plausible_method(target)) {
+        return fail("the node's insert slot does not hold a function");
+    }
+
+    void* listVtable = reinterpret_cast<void*>(tuple_vtable());
+    if (listVtable == nullptr) return fail("the tuple class was not found");
+
+    // Everything the call needs lives on the stack for the duration.
+    std::vector<TypedValueRec> values(args.size());
+    std::vector<TupleNode> nodes(args.size());
+    std::vector<std::uint64_t> interned;
+
+    ParameterList list;
+    list.init(listVtable);
+
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::uint16_t declared = entry->second.Types[i];
+        TypedValueRec& value = values[i];
+        value.Type = declared;
+        value.Flags = 0x02 | 0x08;  // TypedValue | IsValid
+
+        switch (resolve_alias(declared)) {
+        case kTypeString:
+        case kTypeGuidString: {
+            const std::uint64_t handle = intern_string(
+                args[i].text.c_str(), resolve_alias(declared) == kTypeGuidString);
+            if (handle == 0) {
+                for (std::uint64_t held : interned) release_string(held);
+                return fail("a string argument could not be interned");
+            }
+            interned.push_back(handle);
+            value.Value = handle;
+            break;
+        }
+        case kReal: {
+            const float real = (float)args[i].real;
+            std::memcpy(&value.Value, &real, sizeof(real));
+            break;
+        }
+        case kInteger64:
+            value.Value = (std::uint64_t)args[i].integer;
+            break;
+        default: {
+            const std::int32_t narrow = (std::int32_t)args[i].integer;
+            std::memcpy(&value.Value, &narrow, sizeof(narrow));
+            break;
+        }
+        }
+
+        list.append(&nodes[i], &value);
+    }
+
+    reinterpret_cast<InsertProc>(target)(reinterpret_cast<void*>(node), &list);
+
+    // The engine copies what it keeps, so the references taken above are
+    // ours to give back.
+    for (std::uint64_t held : interned) release_string(held);
+    return Status::kHandled;
+}
+}  // namespace
 
 std::size_t story_function_count() { return g_story_functions; }
 
 std::size_t node_count() { return g_nodes.Count; }
 
 void probe_strings(char const* text) { probe_string_pool(text); }
+
+Status insert(char const* key, std::vector<Value> const& args,
+              std::string* why) {
+    return insert_tuple(key, args, why);
+}
+
+// Does the story define a function by this name, and is it a database?
+//
+// Asked by the Lua side when a name misses, so story functions resolve on
+// demand rather than being bound during the level load: the pointers
+// cannot be cached across runs, and walking Osiris' database to get them
+// costs half a second that a session which never calls one should not
+// pay. bg3se resolves its Osi.* the same way, through a metatable.
+bool story_function(char const* name, bool* is_database) {
+    if (name == nullptr || !bind_defs()) return false;
+
+    const std::string prefix = std::string(name) + "/";
+    bool found = false;
+    bool database_only = true;
+    for (auto const& entry : database()) {
+        if (entry.first.compare(0, prefix.size(), prefix) != 0) continue;
+        if (entry.second.Def == 0) continue;
+
+        const std::uintptr_t node = node_for(entry.second.Def);
+        if (node == 0) continue;
+        std::uintptr_t vtable = 0;
+        if (!peek(node, &vtable) || vtable < 0x1000) continue;
+
+        const std::string cls = class_of(vtable);
+        if (cls != "10CReteEvent" && cls != "9CReteFact") continue;
+
+        found = true;
+        if (cls != "9CReteFact") database_only = false;
+    }
+
+    if (found && is_database != nullptr) *is_database = database_only;
+    return found;
+}
+
+// The facts a story database holds, as text where the column is a string
+// type. Reading these is the other half of what a database is for: a mod
+// asks DB_Foo:Get(...) far more often than it inserts.
+bool facts(char const* key, std::vector<std::vector<Value>>* rows) {
+    if (rows == nullptr || !bind_defs()) return false;
+    if (g_databases.First == 0) return false;
+
+    auto entry = database().find(key);
+    if (entry == database().end() || entry->second.Def == 0) return false;
+
+    const std::uintptr_t node = node_for(entry->second.Def);
+    if (node == 0) return false;
+
+    std::uint32_t dbId = 0;
+    if (!peek(node + 0x18, &dbId) || dbId == 0 || dbId > g_databases.Count) {
+        return false;
+    }
+
+    std::uintptr_t db = 0;
+    if (!peek(g_databases.First + (std::uintptr_t)(dbId - 1) * 8, &db)
+        || db < 0x1000) {
+        return false;
+    }
+
+    std::uintptr_t head = 0;
+    std::uint64_t count = 0;
+    if (!peek(db + kFactsHead, &head) || !peek(db + kFactsCount, &count)) {
+        return false;
+    }
+    if (head < 0x1000 || count > (1u << 20)) return false;
+
+    std::uintptr_t at = head;
+    for (std::uint64_t f = 0; f < count; ++f) {
+        std::uintptr_t values = 0;
+        std::uint64_t width = 0;
+        if (!peek(at + 0x10, &values) || !peek(at + 0x18, &width)
+            || values < 0x1000 || width == 0 || width > kMaxParams) {
+            break;
+        }
+
+        std::vector<Value> row;
+        row.reserve((std::size_t)width);
+        for (std::uint64_t k = 0; k < width; ++k) {
+            std::uint64_t raw = 0;
+            std::uint16_t type = 0;
+            if (!peek(values + k * 16, &raw)
+                || !peek(values + k * 16 + 8, &type)) {
+                break;
+            }
+
+            Value value;
+            value.type = type;
+            switch (resolve_alias(type)) {
+            case kTypeString:
+            case kTypeGuidString:
+                value.type = kString;
+                string_of(raw, &value.text);
+                break;
+            case kReal: {
+                float real = 0.f;
+                std::memcpy(&real, &raw, sizeof(real));
+                value.type = kReal;
+                value.real = real;
+                break;
+            }
+            case kInteger64:
+                value.type = kInteger64;
+                value.integer = (std::int64_t)raw;
+                break;
+            default:
+                value.type = kInteger;
+                value.integer = (std::int32_t)(std::uint32_t)raw;
+                break;
+            }
+            row.push_back(std::move(value));
+        }
+        rows->push_back(std::move(row));
+
+        if (!peek(at + 0x00, &at) || at < 0x1000) break;
+    }
+    return true;
+}
 
 void set_handlers(void* call, void* query) {
     g_call = reinterpret_cast<Thunk6>(call);
