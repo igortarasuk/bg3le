@@ -383,44 +383,81 @@ extern "C" char const* bg3le_fixed_string(std::uint32_t index,
                                           std::uint32_t* length) {
     void* table = bg3le_string_table();
     if (table == nullptr) return nullptr;
-    return resolve(table, index, length);
+
+    // Resolved once per id. The text lives in the engine's own entry and
+    // stays put for as long as the entry does, so the pointer keeps.
+    // Worth caching because resolving walks the sub-table, the bucket
+    // array and the header -- three reads -- and reading a stat asks for
+    // a couple of hundred strings, most of them the same ones over and
+    // over.
+    struct Known {
+        char const* Text;
+        std::uint32_t Length;
+    };
+    static std::unordered_map<std::uint32_t, Known> known;
+
+    auto found = known.find(index);
+    if (found != known.end()) {
+        if (length != nullptr) *length = found->second.Length;
+        return found->second.Text;
+    }
+
+    std::uint32_t got = 0;
+    char const* text = resolve(table, index, &got);
+    if (text == nullptr) return nullptr;
+
+    known.emplace(index, Known{text, got});
+    if (length != nullptr) *length = got;
+    return text;
 }
 
 
 // A FixedString for text the game does not already hold.
 //
-// Needed because a string attribute on a stat holds an index into a pool of
-// FixedString ids, so a mod assigning one -- 5eSpells appends to
-// PotentSpellcasting.Boosts -- needs an id for text that has never existed.
+// Needed because a string attribute on a stat holds an index into a pool
+// of FixedString ids, so a mod assigning one -- 5eSpells appends to
+// PotentSpellcasting.Boosts -- needs an id for text that has never
+// existed.
 //
 // The sub-tables are length classes: entry sizes 48 through 2080, each
-// holding the header and up to entrySize - 0x18 bytes of text. Entries
-// inside a class are allocated out of fixed-size buckets, and field_1100
-// counts how many have been taken -- 42,275 of sub 0's 32 x 1365, 5,325 of
-// sub 7's 29 x 186 -- so the next entry the engine itself would hand out is
-// the one at that index, and taking it and incrementing the count is what
-// the engine does. That is the whole point of doing it this way rather than
-// writing into unused space: space the engine still considers free is space
-// it will hand to someone else.
+// holding a 24-byte header and the text. Free entries are kept on a list
+// threaded through the headers' NextFreeIndex, and field_1180 is its
+// head.
+//
+// That is not a guess. Every sub-table's field_1180 has its own index in
+// the low four bits -- 0 through 10, all eleven of them -- which is the
+// bottom of a FixedString id, and the rest decodes the same way ids do:
+// sub-table in the low four bits, bucket in the next sixteen, entry above
+// that, with a counter in the high thirty-two that the engine bumps to
+// keep two threads from popping the same entry. For sub-table 6 the head
+// reads bucket 172 of 173 and entry 25 of 292, which are in range and
+// would not be if the reading were wrong.
+//
+// So an entry is taken the way the engine takes one: pop the head and put
+// what it pointed at in its place -- with a compare-and-swap, because
+// that counter is the signature of a tagged lock-free stack and the
+// engine is interning on other threads the whole time a level loads.
+// Popping with a plain load and store worked perfectly with the game
+// sitting idle and lost the race every time during a load, which is what
+// sent the engine into its grind the second time.
+//
+// The first version of this did something else -- it took the entry at
+// field_1100, which is a count of live entries rather than a high-water
+// mark, so that entry was somewhere in the middle of the allocated region
+// and, being free, was on this list. Writing over it cut the chain. The
+// engine then handed the same entry out again (a stat's Boosts read back
+// as a Gustav animation path) and spent the rest of the level load at
+// 250% CPU, which is what walking a severed free list looks like from
+// outside.
+//
+// The refcount is set high enough never to reach zero, so the entry never
+// returns to the list and the id a mod holds stays its own.
 //
 // Nothing is added to the hash map the engine interns through, which is a
-// deliberate limitation rather than an oversight: the map's layout is not
-// established here, and the only consequence of staying out of it is that
-// the engine interning the same text later makes its own second entry. Two
-// entries with the same text is what the table looks like anyway when a
-// string arrives twice before either is released.
-//
-// The refcount is set high enough never to reach zero. An entry released
-// down to zero would go back on the engine's free list, and the id a mod is
-// holding would then be handed to someone else's text.
-//
-// Verified before anything is written: the entry about to be taken, and the
-// ones after it, have to read as unused. That is what tells the tail of the
-// allocated region from a hole inside it -- field_1100 is a high-water
-// mark, not a count of live entries, so the entry below it is often free
-// too. Requiring that neighbour to be *used* was the first attempt and it
-// refused a write it should have allowed, which is the right direction for
-// a check to fail in.
+// deliberate limitation: the map's layout is not established here, and the
+// only consequence is that the engine interning the same text later makes
+// its own second entry -- which is what the table looks like anyway when a
+// string arrives twice before either copy is released.
 constexpr std::uint32_t kInternRefCount = 0x100000;
 
 extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
@@ -431,15 +468,10 @@ extern "C" bool bg3le_fixed_string_intern(char const* text,
     if (text == nullptr || out == nullptr) return false;
 
     // What has already been interned here, so the same text asked for
-    // twice costs nothing.
-    //
-    // Deliberately not a search of the engine's table first. That search
-    // reads every bucket of every sub-table -- about a million and a half
-    // entries -- and at eighty milliseconds a call it turned a mod's stat
-    // pass into minutes. The cost of skipping it is a second entry for
-    // text the table already holds, which is what the table looks like
-    // anyway whenever a string arrives twice before either copy is
-    // released.
+    // twice costs nothing. Deliberately not a search of the engine's
+    // table first: that reads every bucket of every sub-table, about a
+    // million and a half entries, and at eighty milliseconds a call it
+    // turned a mod's stat pass into minutes.
     static std::unordered_map<std::string, std::uint32_t> ours;
     auto known = ours.find(text);
     if (known != ours.end()) {
@@ -466,53 +498,67 @@ extern "C" bool bg3le_fixed_string_intern(char const* text,
             read_at<std::uint32_t>(st, offsetof(SubTable, NumBuckets));
         auto** buckets =
             read_at<std::uint8_t**>(st, offsetof(SubTable, Buckets));
-        const auto used = read_at<std::uint32_t>(st, 0x1100);
         if (perBucket == 0 || buckets == nullptr) continue;
 
-        const std::uint64_t capacity =
-            (std::uint64_t)perBucket * (std::uint64_t)numBuckets;
-        if (used == 0 || used >= capacity) {
-            logf("string table: sub-table %zu holds %u of %llu entries, so "
-                 "there is no room for %zu bytes of text; the engine grows "
-                 "this by allocating a bucket, which bg3le does not do",
-                 sub, used, (unsigned long long)capacity, length);
-            return false;
+        auto* headAt = (std::uint64_t*)((char*)st + 0x1180);
+        std::uint8_t* target = nullptr;
+        std::uint32_t id = 0;
+        std::uint32_t bucketIdx = 0;
+        std::uint32_t entryIdx = 0;
+
+        // Pop, competing with the engine's own threads. Everything up to
+        // the exchange is a read, so losing simply means going round
+        // again.
+        constexpr int kAttempts = 64;
+        bool popped = false;
+        for (int attempt = 0; attempt < kAttempts && !popped; ++attempt) {
+            std::uint64_t head = 0;
+            __atomic_load(headAt, &head, __ATOMIC_ACQUIRE);
+
+            id = (std::uint32_t)(head & 0xffffffffu);
+            if ((id & 0x0f) != sub) {
+                logf("string table: sub-table %zu has a free list head of "
+                     "%#llx, whose sub-table nibble is %u; not touching it",
+                     sub, (unsigned long long)head, id & 0x0f);
+                return false;
+            }
+
+            bucketIdx = (id >> 4) & 0xffff;
+            entryIdx = id >> 20;
+            if (bucketIdx >= numBuckets || entryIdx >= perBucket) {
+                logf("string table: sub-table %zu's free list head names "
+                     "bucket %u of %u and entry %u of %u, which is out of "
+                     "range; not touching it", sub, bucketIdx, numBuckets,
+                     entryIdx, perBucket);
+                return false;
+            }
+
+            std::uint8_t* bucket = nullptr;
+            if (!safe_read(&buckets[bucketIdx], &bucket, sizeof(bucket))
+                || bucket == nullptr) {
+                return false;
+            }
+            target = bucket + (std::size_t)entryIdx * entrySize;
+
+            // It has to read as free, or this is not the free list.
+            Header current{};
+            if (!safe_read(target, &current, sizeof(current))) return false;
+            if (current.RefCount != 0 || current.Length != 0) {
+                // Lost the race between the load and this read: whoever
+                // won has filled it in. Try again.
+                continue;
+            }
+
+            std::uint64_t next = current.NextFreeIndex;
+            popped = __atomic_compare_exchange(headAt, &head, &next, false,
+                                               __ATOMIC_ACQ_REL,
+                                               __ATOMIC_ACQUIRE);
         }
 
-        auto entry_at = [&](std::uint32_t index) -> std::uint8_t* {
-            std::uint8_t* bucket = nullptr;
-            if (!safe_read(&buckets[index / perBucket], &bucket,
-                           sizeof(bucket))
-                || bucket == nullptr) {
-                return nullptr;
-            }
-            return bucket + (std::size_t)(index % perBucket) * entrySize;
-        };
-
-        std::uint8_t* target = entry_at(used);
-        if (target == nullptr) return false;
-
-        // The entry being taken and its followers, all of which have to be
-        // untouched: a run of free entries is the tail, a free entry with
-        // used ones after it is a hole and belongs to the engine's free
-        // list.
-        constexpr std::uint32_t kRun = 4;
-        for (std::uint32_t ahead = 0; ahead < kRun; ++ahead) {
-            const std::uint32_t index = used + ahead;
-            if (index >= capacity) break;
-            if (index / perBucket != used / perBucket) break;  // next bucket
-
-            std::uint8_t* at = entry_at(index);
-            if (at == nullptr) break;
-
-            Header h{};
-            if (!safe_read(at, &h, sizeof(h))) return false;
-            if (h.RefCount == 0 && h.Length == 0) continue;
-
-            logf("string table: entry %u of sub-table %zu reads refs %u len "
-                 "%u, so entry %u is a hole in the allocated region rather "
-                 "than the tail of it; nothing written", index, sub,
-                 h.RefCount, h.Length, used);
+        if (!popped) {
+            logf("string table: could not take an entry from sub-table "
+                 "%zu's free list in %d attempts; the engine is holding it",
+                 sub, kAttempts);
             return false;
         }
 
@@ -520,45 +566,29 @@ extern "C" bool bg3le_fixed_string_intern(char const* text,
         header.Hash = 0;  // the hash map is not touched; see above
         header.RefCount = kInternRefCount;
         header.Length = (std::uint32_t)length;
-        // Every live entry in this table reads 1 here, whatever the field
-        // means; it is plainly not the entry's own id.
-        header.Id = 1;
+        header.Id = 1;  // what every live entry in this table reads
         header.NextFreeIndex = 0;
 
         std::memcpy(target, &header, sizeof(header));
         std::memcpy(target + sizeof(Header), text, length + 1);
-
-        // BG3LE_STRING_TABLE_BUMP=0 leaves the engine's own entry counter
-        // alone, so "is incrementing it what upsets the engine?" can be
-        // answered without a rebuild. Leaving it alone means the engine
-        // will eventually hand the same entry to someone else.
-        char const* bump = std::getenv("BG3LE_STRING_TABLE_BUMP");
-        if (bump == nullptr || bump[0] != '0') {
-            const auto next = (std::uint32_t)(used + 1);
-            std::memcpy((void*)((char*)st + 0x1100), &next, sizeof(next));
-        }
-
-        const std::uint32_t id = (std::uint32_t)sub
-                                 | ((used / perBucket) << 4)
-                                 | ((used % perBucket) << 20);
 
         // Proved by reading it back the way everything else reads one.
         std::uint32_t got = 0;
         char const* back = resolve(table, id, &got);
         if (back == nullptr || got != length
             || std::strcmp(back, text) != 0) {
-            logf("string table: wrote \"%s\" as id %#x but it reads back as "
-                 "%s; the entry is left in place and refcounted so nothing "
-                 "reuses it", text, id, back == nullptr ? "nothing" : back);
+            logf("string table: wrote \"%.48s\" as id %#x but it reads back "
+                 "as %s; the entry is off the free list and refcounted, so "
+                 "nothing reuses it", text, id,
+                 back == nullptr ? "nothing" : back);
             return false;
         }
 
-        // Quiet after the first few: a mod's stat pass interns dozens.
         static std::size_t said = 0;
         if (++said <= 3) {
             logf("string table: interned %zu bytes as id %#x in sub-table "
-                 "%zu (entry %u of %llu): \"%.64s%s\"", length, id, sub,
-                 used, (unsigned long long)capacity, text,
+                 "%zu (bucket %u entry %u, off the free list): \"%.64s%s\"",
+                 length, id, sub, bucketIdx, entryIdx, text,
                  length > 64 ? "..." : "");
         }
 
@@ -616,9 +646,39 @@ extern "C" void bg3le_fixed_string_dump() {
         }
 
         logf("string table: sub %zu entrySize %llu perBucket %u buckets %u "
-             "(%zu allocated) field_1100 %u field_1180 %llu", sub,
+             "(%zu allocated) field_1100 %u field_1180 %#llx", sub,
              (unsigned long long)entrySize, perBucket, numBuckets, live,
              f1100, (unsigned long long)f1180);
+
+        // Is field_1180 the head of the free list? Two readings are
+        // plausible -- an entry index, or a pointer to the entry -- and
+        // each is checked by whether what it lands on reads as free.
+        if (f1180 != 0) {
+            const std::uint64_t asIndex = f1180;
+            if (asIndex < (std::uint64_t)perBucket * numBuckets) {
+                std::uint8_t* bucket = nullptr;
+                if (safe_read(&buckets[asIndex / perBucket], &bucket,
+                              sizeof(bucket))
+                    && bucket != nullptr) {
+                    Header h{};
+                    if (safe_read(bucket + (asIndex % perBucket) * entrySize,
+                                  &h, sizeof(h))) {
+                        logf("string table:   as an index it is entry %llu: "
+                             "refs %u len %u next %#llx",
+                             (unsigned long long)asIndex, h.RefCount,
+                             h.Length, (unsigned long long)h.NextFreeIndex);
+                    }
+                }
+            }
+
+            Header h{};
+            if (safe_read((void const*)(std::uintptr_t)f1180, &h,
+                          sizeof(h))) {
+                logf("string table:   as a pointer it reads refs %u len %u "
+                     "next %#llx", h.RefCount, h.Length,
+                     (unsigned long long)h.NextFreeIndex);
+            }
+        }
 
         // One live entry, to confirm Header.Id is the id it is found by.
         for (std::uint32_t b = 0; b < numBuckets && b < 4; ++b) {
@@ -639,7 +699,7 @@ extern "C" void bg3le_fixed_string_dump() {
                 safe_read(bucket + (std::size_t)e * entrySize + sizeof(Header),
                           text, sizeof(text) - 1);
                 logf("string table:   id %#x -> hash %#x refs %u len %u "
-                     "Header.Id %#x nextFree %llu \"%.32s\"", id, h.Hash,
+                     "Header.Id %#x nextFree %#llx \"%.32s\"", id, h.Hash,
                      h.RefCount, h.Length, h.Id,
                      (unsigned long long)h.NextFreeIndex, text);
             }

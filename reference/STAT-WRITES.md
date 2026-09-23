@@ -45,47 +45,73 @@ Verified: after 5eSpells' pass, `Interrupt_AttackOfOpportunity.Conditions`
 reads `"not S5E_IsInvisibleSeen() and IsAbleToReact(context.Observer)
 and ..."` — the mod's prefix in front of the engine's own text.
 
-## FixedString attributes do not work, and this is where it stands
+## FixedString attributes: correct, and still not usable
 
 A string attribute needs a string-table id, and text a mod builds at
 runtime has none. `ls::FixedString` is a 32-bit index: sub-table in the
 low four bits, bucket in the next sixteen, entry above that. The
-sub-tables are length classes — entry sizes 48 through 2080, each holding
-a 24-byte header and the text — and `field_1100` counts entries taken, so
-the next entry the engine itself would hand out is the one at that index.
+sub-tables are length classes -- entry sizes 48 through 2080, each holding
+a 24-byte header and the text.
 
-All of that works. `bg3le_fixed_string_intern` places an entry, the id
-resolves to the text through the same path every other read uses, and the
-pool slot holding it lands correctly:
+Free entries are kept on a list threaded through the headers'
+`NextFreeIndex`, and **`field_1180` is its head**. That is not a guess:
+every sub-table's `field_1180` has its own index in the low four bits --
+0 through 10, all eleven of them -- which is the bottom of a FixedString
+id, and the rest decodes the way ids do. For sub-table 6 the head reads
+bucket 172 of 173 and entry 25 of 292, both in range, which they would
+not be if the reading were wrong.
 
-    string table: interned 162 bytes as id 0xe500a66 in sub-table 6
-                  (entry 48701 of 50224)
-    stats: string id 0xe500a66 written to pool slot 30989
+So an entry is taken the way the engine takes one: pop the head, put what
+it pointed at in its place, with a compare-and-swap -- that 32-bit counter
+above the id is the signature of a tagged lock-free stack, and the engine
+interns on other threads throughout a level load.
 
-And then the engine spends the rest of the level load at 250% CPU in its
-own code and never finishes. `perf` puts the time in `bg3`, not in
-`libbg3le.so`, so it is the engine reacting to something, not bg3le being
-slow.
+Two wrong versions came first, and both are worth recording:
 
-Three theories tested and eliminated:
+- **Taking the entry at `field_1100`.** That field is a count of live
+  entries, not a high-water mark, so the entry sat in the middle of the
+  allocated region and was *on* the free list. Writing over it cut the
+  chain. The engine then handed the same entry out again -- a stat's
+  `Boosts` read back as a Gustav animation path -- and spent the rest of
+  the level load at 250% CPU, which is what walking a severed free list
+  looks like from outside.
+- **Popping with a plain load and store.** Correct with the game idle,
+  and it lost the race every time during a load.
 
-- **The entry counter.** Incrementing `field_1100` is what the engine does
-  when it takes an entry, but taking one without incrementing it
-  (`BG3LE_STRING_TABLE_BUMP=0`) stalls exactly the same.
-- **The array size.** Raising the pool's size to include the new slot
-  fixed the condition path completely, and changed nothing here.
-- **The mod's own workload.** The handler never reaches its end, and the
-  stall begins at the *first* string write, with conditions already
-  written and logged before it.
+What works now, verified: an entry is placed off the free list, the id
+resolves through the same path every other read uses, the pool slot lands,
+and `PotentSpellcasting.Boosts` reads back as the mod's appended text
+through a fresh `Ext.Stats.Get`. A staged probe during the level load
+(`BG3LE_PROBE_INTERN=1/2/3`) shows each step is harmless on its own:
+placing an entry, taking a pool slot, and pointing the attribute at it all
+leave the load finishing in about a second.
 
-What is left untested: the entry is not in the hash map the engine interns
-through, and its `Hash` field is zero. Nothing should walk it — the map is
-a separate structure — but that is the assumption this rests on, and it is
-the next thing to check. The other candidate is the attribute itself:
-`PotentSpellcasting.Boosts` is a passive's boost list, and the engine may
-re-evaluate it in a way that a string it did not intern upsets.
+What is not usable is a mod that does hundreds. With string writes on,
+5eSpells gets past the write that used to stop it and then spends **369
+seconds between one string write and the next**, in its own code -- the
+console times out, so the story thread is inside the handler. It is
+progressing, not deadlocked, and it never finishes in any reasonable time.
 
-`BG3LE_STAT_STRING_WRITES=1` turns it on for whoever picks this up.
+That is a performance problem in what the mod does after the point it
+previously died at, and it is not the string writes themselves. Three
+rounds of optimisation went in on the way and none of them was enough:
+
+- modifier metadata, a list's modifiers and an object's indexed properties
+  are each read once rather than once per attribute per stat;
+- the decoded text behind a pool index is kept, since whole families of
+  stats share the same expressions;
+- `Ext.Stats.Get` no longer snapshots every attribute. It returns a proxy
+  that reads on access, which is what upstream's does -- the snapshot cost
+  two hundred decodes and two hundred table entries whether or not the
+  caller wanted one of them, and because a mod keeps what it fetches, the
+  collector's share of each fetch grew with the heap: 8ms per stat at two
+  thousand, 40ms at six, 120ms at ten. Quadratic, and it read as a hang.
+  Attribute names are indexed per modifier list so reading a field by name
+  is a lookup rather than a walk.
+
+Measuring the next step means instrumenting what the mod does in those six
+minutes, not guessing again. `BG3LE_STAT_STRING_WRITES=1` turns it on for
+whoever picks that up.
 
 ## What is not attempted
 

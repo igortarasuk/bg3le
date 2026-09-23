@@ -117,9 +117,15 @@ component's declared size with the size the engine recorded, and
   `HashMap<StaticDataTypeIndex, GuidResourceBankBase*>`, and a table whose
   keys are all drawn from the 121 static data type indices the symbol table
   already names is that manager rather than a coincidence
-- `Ext.Stats`: 15,754 stats, enumerable and readable by name, with every
-  attribute kind decoded — ints, floats, strings, GUIDs, enumerations and
-  flag sets. `RPGStats` has no symbol and its layout is not ours (our
+- `Ext.Stats`: 15,754 stats, enumerable and readable by name, through a
+  proxy that reads an attribute when it is asked for, as upstream's does.
+  Snapshotting all two hundred of them per fetch made a mod's stats pass
+  quadratic — the collector's share grew with a heap the mod keeps, 8ms per
+  stat at two thousand and 120ms at ten — and modifier metadata, a list's
+  modifiers, an object's properties and the text behind a pool index are
+  each read once rather than per attribute per stat. Every attribute kind
+  is decoded — ints, floats, strings, GUIDs, enumerations and flag sets;
+  `RPGStats` has no symbol and its layout is not ours (our
   `TreasureRarities` sits at 800 where the engine's is at 3648), so nothing
   is read through a member offset: the anchor is seven consecutive
   `FixedString` indices spelling the treasure rarities, and everything past
@@ -191,9 +197,10 @@ component's declared size with the size the engine recorded, and
   into the spare capacity of the engine's own condition pool. 5eSpells
   rewrites a few hundred interrupt conditions this way and they read back
   through a fresh `Ext.Stats.Get`. A `FixedString` attribute can be written
-  too — the string-table entry and the pool slot both work — but with it
-  enabled the engine spends the rest of the level load at 250% CPU in its
-  own code, so it is off unless `BG3LE_STAT_STRING_WRITES=1`. Functors,
+  too, off the engine's own free list and with a compare-and-swap, and it
+  reads back — but a mod that makes hundreds of them spends minutes of the
+  level load between one and the next in its *own* code, so it is off
+  unless `BG3LE_STAT_STRING_WRITES=1`. Functors,
   roll conditions and requirements are held compiled by the engine and are
   not attempted; `SetPersistence` and `CopyFrom` still raise, and `Sync`
   reports what it cannot do rather than raising, because a mod that writes

@@ -1522,6 +1522,40 @@ extern "C" std::size_t bg3le_stats_attr_count(void const* object) {
     return attrs.Size;
 }
 
+// Which index an attribute has, by name.
+//
+// A property of the modifier list rather than of the stat -- every weapon
+// shares one, every spell another, and there are nine in the game -- so
+// the map is built once per list. Scanning instead cost a walk of a
+// couple of hundred attributes for every field a mod read, which is what
+// made reading a stat lazily no cheaper than reading all of it.
+extern "C" int bg3le_stats_attr_index(void const* object,
+                                      char const* wanted) {
+    if (object == nullptr || wanted == nullptr) return -1;
+
+    void const* list = list_for(object);
+    if (list == nullptr) return -1;
+
+    static std::unordered_map<void const*,
+                              std::unordered_map<std::string, int>> byList;
+    auto known = byList.find(list);
+    if (known == byList.end()) {
+        std::unordered_map<std::string, int> names;
+        std::vector<void const*> const* mods = modifiers_of(list);
+        if (mods != nullptr) {
+            for (std::size_t i = 0; i < mods->size(); ++i) {
+                ModifierMeta const* meta = meta_of((*mods)[i]);
+                if (meta == nullptr || meta->Name == nullptr) continue;
+                names.emplace(meta->Name, (int)i);
+            }
+        }
+        known = byList.emplace(list, std::move(names)).first;
+    }
+
+    auto found = known->second.find(wanted);
+    return found == known->second.end() ? -1 : found->second;
+}
+
 extern "C" bool bg3le_stats_attr_at(void const* object, std::size_t index,
                                     char const** nameOut,
                                     char const** typeNameOut, int* kindOut,
@@ -1655,12 +1689,19 @@ extern "C" char const* bg3le_stats_attr_string(int raw) {
     if (raw <= 0 || f.Strings.Buffer == nullptr) return nullptr;
     if ((std::size_t)raw >= f.Strings.Size) return nullptr;
 
-    std::uint32_t id = 0;
-    if (!read_as((char const*)f.Strings.Buffer
-                     + (std::size_t)raw * sizeof(std::uint32_t), &id)) {
-        return nullptr;
+    // The pool slot's id, kept: slots are only ever appended to, and the
+    // id behind one does not change.
+    static std::unordered_map<int, std::uint32_t> known;
+    auto found = known.find(raw);
+    if (found == known.end()) {
+        std::uint32_t id = 0;
+        if (!read_as((char const*)f.Strings.Buffer
+                         + (std::size_t)raw * sizeof(std::uint32_t), &id)) {
+            return nullptr;
+        }
+        found = known.emplace(raw, id).first;
     }
-    return bg3le_fixed_string(id, nullptr);
+    return bg3le_fixed_string(found->second, nullptr);
 }
 
 // A TranslatedString attribute's loca handle, e.g.
@@ -1717,6 +1758,7 @@ std::size_t& strings_taken() {
 
 extern "C" bool bg3le_fixed_string_intern(char const* text,
                                           std::uint32_t* out);
+extern "C" char const* bg3le_stats_attr_condition(int raw);
 
 bool write_bytes(void* at, void const* from, std::size_t size) {
     // The pools are ordinary heap, not the read-only image, so there is no
@@ -1803,6 +1845,7 @@ extern "C" int bg3le_stats_condition_intern(char const* text) {
 
     ++conditions_taken();
     ours.emplace(text, (int)slot);
+    bg3le_stats_attr_condition((int)slot);  // into the read cache too
 
     // Truncated, and quiet after the first few: these run to six hundred
     // characters and a mod writes dozens.
@@ -1921,13 +1964,22 @@ extern "C" char const* bg3le_stats_attr_condition(int raw) {
     if (raw <= 0 || f.Conditions.Buffer == nullptr) return nullptr;
     if ((std::size_t)raw >= f.Conditions.Size) return nullptr;
 
-    // Held until the next call, like the other text this file hands out.
-    static thread_local std::string text;
+    // Kept rather than re-read. A condition is a Larian string, so
+    // reading one means a read for the header and another through its
+    // pointer, and whole families of stats share the same expression --
+    // a mod that walks every spell asks for the same handful thousands of
+    // times. Entries are only ever appended, so an index that has been
+    // read once cannot change.
+    static std::unordered_map<int, std::string> known;
+    auto found = known.find(raw);
+    if (found != known.end()) return found->second.c_str();
+
+    std::string text;
     if (!read_ls_string((char const*)f.Conditions.Buffer
                             + (std::size_t)raw * 16, &text)) {
         return nullptr;
     }
-    return text.c_str();
+    return known.emplace(raw, std::move(text)).first->second.c_str();
 }
 
 // Object::AIFlags, which upstream reads off the object rather than out of

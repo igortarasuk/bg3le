@@ -48,6 +48,17 @@ std::once_flag g_init_struct_once;
 void ensure_symbols();
 
 // Defined in src/vendor/platform_linux.cpp.
+extern "C" bool bg3le_fixed_string_intern(char const* text,
+                                          unsigned int* out);
+extern "C" int bg3le_stats_string_intern(char const* text);
+extern "C" void* bg3le_stats_find(char const* wanted);
+extern "C" std::size_t bg3le_stats_attr_count(void const* object);
+extern "C" bool bg3le_stats_attr_at(void const* object, std::size_t index,
+                                    char const** nameOut,
+                                    char const** typeNameOut, int* kindOut,
+                                    int* rawOut);
+extern "C" bool bg3le_stats_attr_set(void const* object, std::size_t index,
+                                     int raw);
 extern "C" bool bg3le_install_game_allocator(void* alloc, void* free);
 
 // Points bg3se's GameAllocRaw/GameFree at the engine's own heap, so any bg3se
@@ -1021,6 +1032,55 @@ void dump_osiris_api(void* self) {
     phase("the searches");
 
     lua_load_mods();  // after Osi, so a mod's load-time code can call it
+
+    // BG3LE_PROBE_INTERN=1: place one FixedString during the level load and
+    // touch nothing else. Writing a string attribute during a load sends
+    // the engine into a grind that the same write, made from the console
+    // after the load, does not -- so this asks whether placing the entry is
+    // what does it, with no pool slot and no attribute involved.
+    // 1 places a string-table entry, 2 also takes a pool slot, 3 also
+    // points a stat's attribute at it. Each step is the previous one plus
+    // one thing, which is how the step that upsets the engine gets named.
+    char const* probeIntern = std::getenv("BG3LE_PROBE_INTERN");
+    if (probeIntern != nullptr) {
+        const int level = std::atoi(probeIntern);
+        char const* text =
+            "IF(IsClericCantrip()):DamageBonus(max(0, WisdomModifier));"
+            "IF(SpellId('Target_TollTheDead')):DamageBonus(max(0, "
+            "WisdomModifier))";
+
+        unsigned int id = 0;
+        const bool placed = bg3le_fixed_string_intern(text, &id);
+        logf("strings: probe level %d: intern -> %s, id %#x", level,
+             placed ? "placed" : "refused", id);
+
+        if (level >= 2) {
+            const int slot = bg3le_stats_string_intern(text);
+            logf("strings: probe level %d: pool slot -> %d", level, slot);
+
+            if (level >= 3 && slot > 0) {
+                void const* object = bg3le_stats_find("PotentSpellcasting");
+                bool written = false;
+                if (object != nullptr) {
+                    const std::size_t count =
+                        bg3le_stats_attr_count(object);
+                    for (std::size_t i = 0; i < count; ++i) {
+                        char const* name = nullptr;
+                        if (!bg3le_stats_attr_at(object, i, &name, nullptr,
+                                                 nullptr, nullptr)
+                            || name == nullptr
+                            || std::strcmp(name, "Boosts") != 0) {
+                            continue;
+                        }
+                        written = bg3le_stats_attr_set(object, i, slot);
+                        break;
+                    }
+                }
+                logf("strings: probe level %d: attribute write -> %s", level,
+                     written ? "done" : "not done");
+            }
+        }
+    }
 
     // BG3LE_PROBE_STRINGS=1: work back from a string Osiris certainly holds
     // to the pool that interns it. The host character's UUID comes back
