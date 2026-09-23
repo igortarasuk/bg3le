@@ -144,6 +144,19 @@ constexpr std::uintptr_t kFunctionDbHolder = 0x119d50;
 // 324 functions both sources list, which puts the node id at +0x20.
 constexpr std::uintptr_t kTypeCandidates[] = {0x24, 0x28};
 
+// OsiFunctionDef's NodeRef, immediately before FunctionType.
+constexpr std::uintptr_t kNodeRef = 0x20;
+
+// Inside a Node: its own id and the function it belongs to. A data node
+// also holds the id of the database it stands for, at +0x18, which is
+// what reading facts through a function will use.
+constexpr std::uintptr_t kNodeId = 0x08;
+constexpr std::uintptr_t kNodeFunction = 0x10;
+
+// Inside a Database: the facts list header and its count.
+constexpr std::uintptr_t kFactsHead = 0x10;
+constexpr std::uintptr_t kFactsCount = 0x20;
+
 // bg3se's OsirisFunctionHandle: the handle the dispatch handlers take is
 // built from the key, and how depends on the function's type.
 std::uint32_t function_handle(std::uint32_t type, std::uint32_t part2,
@@ -381,6 +394,85 @@ struct NodeList {
 };
 
 NodeList g_nodes;
+NodeList g_databases;
+
+// Osiris' database list, found the same way and told apart from the node
+// list by its contents: a Database holds its own one-based id in its first
+// four bytes, so a sample of elements that agree with their index is the
+// list, and anything else is not.
+NodeList find_database_db(std::uintptr_t base) {
+    // A wider window than the node list needed: the globals are a run of
+    // pointer slots, but which run and in what order is this build's
+    // business, not bg3se's Windows order.
+    for (std::intptr_t delta = -0x400; delta <= 0x400; delta += 8) {
+        std::uintptr_t db = 0;
+        if (!peek(base + kFunctionDbHolder + delta, &db) || db < 0x1000) {
+            continue;
+        }
+
+        std::uint32_t size = 0;
+        std::uintptr_t begin = 0;
+        std::uintptr_t end = 0;
+        if (!peek(db + 0x00, &size) || size < 16 || size > (1u << 22)) {
+            continue;
+        }
+        if (!peek(db + 0x08, &begin) || !peek(db + 0x10, &end)) continue;
+        if (begin < 0x1000 || end <= begin) continue;
+        if ((end - begin) / 8 != size) continue;
+
+        // Sparse lists are normal -- an unused slot is null -- so nulls are
+        // skipped and only what is there has to agree.
+        int agreed = 0;
+        int disagreed = 0;
+        for (std::uint32_t i = 0; i < size && agreed < 8 && disagreed == 0;
+             ++i) {
+            std::uintptr_t element = 0;
+            if (!peek(begin + i * 8, &element) || element < 0x1000) continue;
+            std::uint32_t id = 0;
+            if (!peek(element + 0x00, &id)) break;
+            if (id == i + 1) {
+                ++agreed;
+            } else {
+                ++disagreed;
+            }
+        }
+        if (agreed < 4 || disagreed > 0) {
+            if (agreed > 0) {
+                logf("osiris: candidate list at libOsiris+%#lx (%u entries) "
+                     "had %d ids agree and %d disagree",
+                     (unsigned long)(kFunctionDbHolder + delta), size,
+                     agreed, disagreed);
+            }
+            continue;
+        }
+
+        logf("osiris: database list at libOsiris+%#lx holds %u databases",
+             (unsigned long)(kFunctionDbHolder + delta), size);
+        g_databases = NodeList{begin, size};
+        return g_databases;
+    }
+    logf("osiris: no database list found near the function database");
+    return NodeList{};
+}
+
+// Osiris interns its strings: a TypedValue holding one holds a handle
+// into a string pool, not a pointer -- the facts dump shows values like
+// 0x256d01df940f035 where a heap address on this build looks like
+// 0x52f40519ee0.
+//
+// Reading one back, and building one to pass to a procedure, both need
+// that pool. It is not found yet: bg3se's COsiStringTable is three pools
+// of {float, unordered_map, vector<COsiString>, vector<uint32>} with
+// COsiString at 32 bytes, and searching every pointer in libOsiris'
+// writable data for a vector of 32-byte records pointing at text finds
+// nothing, so the layout differs here. The next thing to try is the other
+// direction: take a string Osiris is known to hold -- the host
+// character's UUID, which comes back through the DIV boundary as plain
+// text -- find it in memory, and look at what points at it.
+//
+// COsiStringTable::AddStr and ::GetStr are exported from libOsiris, so
+// once the table itself is located, interning is a call rather than more
+// reverse engineering.
 
 NodeList find_node_db(std::uintptr_t base) {
     for (std::intptr_t delta = -0x80; delta <= 0x80; delta += 8) {
@@ -418,6 +510,92 @@ NodeList find_node_db(std::uintptr_t base) {
     }
     logf("osiris: no node list found near the function database");
     return NodeList{};
+}
+
+// The node a function runs through, by the id in OsiFunctionDef+0x20.
+//
+// Ids are one-based into the node vector, as bg3se's
+// Nodes->Db.Elements[Node.Id - 1] has it. The node is only accepted if it
+// agrees: a Node holds its own id at +0x08 and a pointer back to its
+// function at +0x10, so a wrong list or a wrong offset shows up as a
+// mismatch rather than as a call into the wrong object.
+std::uintptr_t node_for(std::uintptr_t def) {
+    if (g_nodes.First == 0) return 0;
+
+    std::uint32_t id = 0;
+    if (!peek(def + kNodeRef, &id) || id == 0 || id > g_nodes.Count) return 0;
+
+    std::uintptr_t node = 0;
+    if (!peek(g_nodes.First + (std::uintptr_t)(id - 1) * 8, &node)
+        || node < 0x1000) {
+        return 0;
+    }
+
+    std::uint32_t ownId = 0;
+    std::uintptr_t function = 0;
+    if (!peek(node + kNodeId, &ownId)
+        || !peek(node + kNodeFunction, &function)) {
+        return 0;
+    }
+    if (ownId != id || function != def) return 0;
+    return node;
+}
+
+// One fact from each of the first few databases that have any.
+//
+// Database, as this build lays it out: its own id in the low half of the
+// first eight bytes, the facts VMT, then a circular list of facts whose
+// header points at itself when empty, with the count at +0x20. A fact
+// node is {Next, Prev, TypedValue* Values, uint64 Width}, and a
+// TypedValue is {value, uint16 TypeId, int8 Index, uint8 Flags} at
+// sixteen bytes. Stored strings are interned: the value is a handle into
+// one of Osiris' string pools, not a pointer.
+void dump_database_facts() {
+    if (g_databases.First == 0) return;
+
+    int shown = 0;
+    for (std::uint32_t i = 0; i < g_databases.Count && shown < 3; ++i) {
+        std::uintptr_t db = 0;
+        if (!peek(g_databases.First + (std::uintptr_t)i * 8, &db)
+            || db < 0x1000) {
+            continue;
+        }
+
+        std::uintptr_t head = 0;
+        std::uint64_t count = 0;
+        if (!peek(db + kFactsHead, &head) || !peek(db + kFactsCount, &count)) {
+            continue;
+        }
+        if (count == 0 || count > (1u << 20) || head < 0x1000) continue;
+
+        logf("dbfacts: database %u at %#lx holds %llu facts", i + 1,
+             (unsigned long)db, (unsigned long long)count);
+
+        std::uintptr_t values = 0;
+        std::uint64_t width = 0;
+        if (!peek(head + 0x10, &values) || !peek(head + 0x18, &width)
+            || values < 0x1000 || width == 0 || width > 32) {
+            logf("dbfacts:   first node %#lx does not read as a tuple",
+                 (unsigned long)head);
+            ++shown;
+            continue;
+        }
+
+        for (std::uint64_t k = 0; k < width; ++k) {
+            const std::uintptr_t tv = values + k * 16;
+            std::uint64_t raw = 0;
+            std::uint16_t type = 0;
+            std::uint8_t flags = 0;
+            if (!peek(tv + 0x00, &raw) || !peek(tv + 0x08, &type)
+                || !peek(tv + 0x0b, &flags)) {
+                break;
+            }
+            logf("dbfacts:   [%llu] type=%u flags=%#x value=%#llx",
+                 (unsigned long long)k, type, flags,
+                 (unsigned long long)raw);
+        }
+        ++shown;
+    }
 }
 
 // Which offset holds FunctionType, decided once by agreement with the
@@ -532,9 +710,10 @@ std::size_t load_out_param_counts(std::vector<Function>* functions,
         return 0;
     }
 
-    // The node list is wanted either way, and finding it is a handful of
-    // reads rather than a walk.
+    // The node and database lists are wanted either way, and finding them
+    // is a handful of reads rather than a walk.
     find_node_db(base);
+    find_database_db(base);
 
     std::size_t fromStore = 0;
     if (load_cached_signatures(story, functions, &fromStore)) {
@@ -812,6 +991,26 @@ std::vector<Function> story_functions(std::vector<Function> const& known) {
     // inserting a tuple into their node. Reaching those needs the node
     // list, which bg3le does not have yet; until then they are counted
     // rather than bound, so nothing claims to call what it cannot.
+    // How many of the story's own functions can be reached through their
+    // node, which is what calling them will need. Checked by agreement:
+    // the node has to name the same id and point back at the same
+    // function.
+    std::size_t withNodes = 0;
+    if (type_offset() != 0) {
+        for (auto const& entry : database()) {
+            if (entry.second.Def == 0) continue;
+            if (seen.count(entry.first) != 0) continue;
+            if (node_for(entry.second.Def) != 0) ++withNodes;
+        }
+        logf("osiris: %zu of the story's functions resolve to a node that "
+             "agrees about its id and its function", withNodes);
+    }
+
+    // Databases that hold facts, with one fact each, under
+    // BG3LE_DUMP_DBFACTS=1. This is what established the layout below, and
+    // what will confirm it again after a game patch.
+    if (std::getenv("BG3LE_DUMP_DBFACTS") != nullptr) dump_database_facts();
+
     g_story_functions = noId;
     logf("osiris: database holds %zu entries: %zu the engine already maps, "
          "%zu callable through the dispatch, %zu story-defined (no "
