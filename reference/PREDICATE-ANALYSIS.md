@@ -1,12 +1,7 @@
 # Predicate analysis (2026-09-23)
 
-Raw dumps: `reference/ghidra_predicate_full.txt`. Addresses raw VMA unless
-marked `g` (Ghidra = raw + 0x100000). Tags: `[DISASM]` objdump, `[DECOMP]` Ghidra.
-
-## Ghidra hygiene (persisted in project bg3proj)
-- 1703 functions were flagged noreturn; cleared 274 (60 libc/thunk, 5 explicit, 209 `FUN_` with a RET in body), 1429 kept.
-- 300697 `CALL_RETURN` flow overrides removed at 301127 call sites of the cleared functions.
-- Bodies rebuilt for all targets: `FUN_038675f0` 102 -> 385 bytes, `FUN_063be100` 33 -> 1090, `FUN_051daf40` 97 -> 1315, `FUN_06ff8bd0` 459 -> 3360, etc. Scripts: `HygienePredicateFull.java`, `PredicateDecompile.java`, `PredicateClientSide.java`.
+Addresses are raw VMA unless marked `g` (`FUN_` labels = raw + 0x100000).
+Tags: `[DISASM]` objdump, `[DECOMP]` decompiler.
 
 ## Predicate `FUN_038675f0` (raw 0x37675f0) `[DECOMP][DISASM]`
 - `bool IsOfficialModule(Module* m)`: snprintf GUID at `m+8`, FixedString ctor (`FUN_02538520`, raw 0x2438520), compare index against 19 `.bss` globals (SSE x16, then 3 scalar), release FixedString, return.

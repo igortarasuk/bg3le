@@ -1,7 +1,7 @@
 # Achievements patch: live test runbook
 
-Copied from `~/Dev/bg3-modding/tools/gdb_scripts` (the Ghidra/JDK checkout
-lives there, outside this repo); paths below assume that layout.
+Also kept in `~/Dev/bg3-modding/tools/gdb_scripts`; paths below assume that
+layout.
 
 Tooling for validating the bg3se-style predicate patch
 (`FUN_038675f0` at raw VMA `0x37675f0` -> `mov eax,1; ret`) described in
