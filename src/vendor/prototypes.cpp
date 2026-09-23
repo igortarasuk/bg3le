@@ -41,6 +41,11 @@ extern "C" char const* bg3le_fixed_string(std::uint32_t index,
                                           std::uint32_t* length);
 extern "C" void* bg3le_stats_find(char const* name);
 extern "C" char const* bg3le_stats_type(void const* object);
+extern "C" void* bg3le_static_get(char const* key, std::size_t which);
+extern "C" std::size_t bg3le_static_count(char const* key);
+extern "C" void bg3le_static_confirm(char const* key, std::size_t which);
+extern "C" bool bg3le_static_record_path(char const* key, void const* target,
+                                         std::uint64_t first_window);
 
 namespace {
 
@@ -281,8 +286,99 @@ constexpr std::size_t kMaxCandidates = 64;
 // How many of them are actually classified, largest first.
 constexpr std::size_t kClassify = 6;
 
+// The key a path from a static to one kind's manager is recorded under.
+std::string static_key(std::size_t k) {
+    return std::string("prototypes.") + kKinds[k].Name;
+}
+
+// The map at `at`, validated as kind `k`'s manager and harvested. Shared
+// between the scan and a recorded static so neither adopts what the other
+// would reject.
+bool harvest_map(unsigned long long at, std::size_t k, Table* into) {
+    std::uint32_t capacity = 0;
+    std::uint32_t count = 0;
+    std::uint64_t keysWord = 0;
+    std::uint64_t valuesWord = 0;
+    auto const* head = (char const*)(std::uintptr_t)at;
+    if (!read_as(head + kKeysCapacity, &capacity)
+        || !read_as(head + kKeysSize, &count)
+        || !read_as(head + kKeysBuffer, &keysWord)
+        || !read_as(head + kValuesBuffer, &valuesWord)) {
+        return false;
+    }
+    if (count < kMinEntries || count > kMaxEntries || count > capacity) {
+        return false;
+    }
+
+    auto const* keys = (void const*)(std::uintptr_t)keysWord;
+    auto const* values = (void const*)(std::uintptr_t)valuesWord;
+
+    if (k >= kInterrupt) {
+        const std::size_t stride =
+            inline_stride(keys, values, count, kKinds[k].NameOffset);
+        if (stride == 0) return false;
+        return harvest_inline(keys, values, count, kKinds[k].NameOffset,
+                              stride, into) > 0;
+    }
+
+    if (!self_consistent(keys, values, count, kKinds[k].NameOffset)) {
+        return false;
+    }
+    // Which kind still has to be confirmed rather than taken from the key
+    // the path was recorded under: the spell and status managers look
+    // identical, and adopting one as the other would be silent.
+    if (kind_of(keys, count) != (int)k) return false;
+    return harvest(keys, values, count, kKinds[k].NameOffset, into) > 0;
+}
+
+// The managers a previous run recorded a path to, with no scanning.
+//
+// Only the kinds that run found are recorded, so this publishes the same
+// set the scan would -- but if a later game state would expose a manager
+// the recording run never saw, the cache has to be deleted for the scan
+// to look again.
+bool build_from_statics() {
+    struct { Table Kinds[std::size(kKinds)]; } found{};
+    std::size_t kinds = 0;
+
+    for (std::size_t k = 0; k < std::size(kKinds); ++k) {
+        const std::string key = static_key(k);
+        const std::size_t count = bg3le_static_count(key.c_str());
+        for (std::size_t i = 0; i < count; ++i) {
+            void* at = bg3le_static_get(key.c_str(), i);
+            if (at == nullptr) continue;
+            if (!harvest_map((unsigned long long)(std::uintptr_t)at, k,
+                             &found.Kinds[k])) {
+                found.Kinds[k].ByName.clear();
+                continue;
+            }
+            logf("prototypes: %zu %s prototypes at %p without scanning, "
+                 "from recorded static %zu of %zu",
+                 found.Kinds[k].ByName.size(), kKinds[k].Name, at, i, count);
+            bg3le_static_confirm(key.c_str(), i);
+            ++kinds;
+            break;
+        }
+    }
+
+    if (kinds == 0) return false;
+
+    Prototypes& live = state();
+    for (std::size_t k = 0; k < std::size(kKinds); ++k) {
+        Table& table = found.Kinds[k];
+        table.Order.reserve(table.ByName.size());
+        for (auto const& entry : table.ByName) {
+            table.Order.push_back(entry.first);
+        }
+        live.Kinds[k] = std::move(table);
+    }
+    live.Built.store(true, std::memory_order_release);
+    return true;
+}
+
 bool build() {
     struct { Table Kinds[std::size(kKinds)]; } found{};
+    unsigned long long at[std::size(kKinds)] = {};
     std::vector<Candidate> candidates;
 
     std::FILE* maps = std::fopen("/proc/self/maps", "r");
@@ -424,6 +520,7 @@ bool build() {
             harvest(candidate.Keys, candidate.Values, candidate.Count,
                     kKinds[kind].NameOffset, &found.Kinds[kind]);
         if (added > 0) {
+            at[kind] = candidate.At;
             logf("prototypes: %zu %s prototypes at %#llx", added,
                  kKinds[kind].Name, candidate.At);
         }
@@ -445,6 +542,7 @@ bool build() {
                 candidate.Keys, candidate.Values, candidate.Count,
                 kKinds[k].NameOffset, stride, &found.Kinds[k]);
             if (added > 0) {
+                at[k] = candidate.At;
                 logf("prototypes: %zu %s prototypes at %#llx, stride %zu",
                      added, kKinds[k].Name, candidate.At, stride);
             }
@@ -474,6 +572,18 @@ bool build() {
         live.Kinds[k] = std::move(found.Kinds[k]);
     }
     live.Built.store(true, std::memory_order_release);
+
+    // Recorded so the next run reads the engine's own pointer. The window
+    // is one map: the scan lands on the map itself, and whatever owns it
+    // points at the object the map is a member of.
+    constexpr std::uint64_t kOwnerWindow = 1u << 12;
+    for (std::size_t k = 0; k < std::size(kKinds); ++k) {
+        if (at[k] == 0) continue;
+        bg3le_static_record_path(static_key(k).c_str(),
+                                 (void const*)(std::uintptr_t)at[k],
+                                 kOwnerWindow);
+    }
+
     logf("prototypes: %zu spells and %zu statuses available",
          live.Kinds[kSpell].ByName.size(),
          live.Kinds[kStatus].ByName.size());
@@ -482,6 +592,10 @@ bool build() {
 
 bool ready() {
     if (state().Built.load(std::memory_order_acquire)) return true;
+
+    // Resolving a recorded pointer is not a scan, so any thread may do it.
+    if (build_from_statics()) return true;
+
     // Only the warming thread scans; see mem.h.
     if (!scan_allowed()) return false;
 

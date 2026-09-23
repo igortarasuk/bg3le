@@ -47,6 +47,11 @@ namespace bg3le {
 extern "C" char const* bg3le_fixed_string(std::uint32_t index,
                                           std::uint32_t* length);
 extern "C" bool bg3le_meta_parse_guid(char const* text, void* out);
+extern "C" void* bg3le_static_get(char const* key, std::size_t which);
+extern "C" std::size_t bg3le_static_count(char const* key);
+extern "C" void bg3le_static_confirm(char const* key, std::size_t which);
+extern "C" bool bg3le_static_record_path(char const* key, void const* target,
+                                         std::uint64_t first_window);
 
 namespace {
 
@@ -263,6 +268,58 @@ Modules available_after(unsigned long long header, std::size_t stride) {
     return Modules{mods, size, stride};
 }
 
+// The key the path from a static to this array header is recorded under.
+constexpr char const* kStaticKey = "mods.loadorder";
+
+// Builds the manager from an address claimed to be ModManager's
+// LoadOrderedModules array header. Shared between the scan and the
+// recorded static so neither can adopt something the other would reject.
+bool adopt(unsigned long long header) {
+    std::uint64_t buffer = 0;
+    std::uint32_t capacity = 0;
+    std::uint32_t size = 0;
+    auto const* at = (char const*)(std::uintptr_t)header;
+    if (!read_as(at, &buffer) || !read_as(at + 8, &capacity)
+        || !read_as(at + 12, &size)) {
+        return false;
+    }
+    if (size == 0 || size > 4096 || size > capacity) return false;
+
+    auto const* mods = (void const*)(std::uintptr_t)buffer;
+    const std::size_t stride = derive_stride(mods, size);
+    if (stride == 0) return false;
+
+    Manager m{};
+    m.LoadOrder = Modules{mods, size, stride};
+    m.BaseModule = base_module_before(header);
+    m.Available = available_after(header, stride);
+    if (m.BaseModule == nullptr || m.Available.Buffer == nullptr) return false;
+
+    state() = m;
+    return true;
+}
+
+// The manager from the pointer chain a previous run recorded, so nothing
+// is scanned. Each candidate is validated exactly as a scanned one is.
+bool search_from_statics() {
+    const std::size_t count = bg3le_static_count(kStaticKey);
+    for (std::size_t i = 0; i < count; ++i) {
+        void* header = bg3le_static_get(kStaticKey, i);
+        if (header == nullptr) continue;
+        if (!adopt((unsigned long long)(std::uintptr_t)header)) continue;
+        logf("mods: %zu modules at %p without scanning, from recorded "
+             "static %zu of %zu", state().LoadOrder.Count,
+             state().LoadOrder.Buffer, i, count);
+        bg3le_static_confirm(kStaticKey, i);
+        return true;
+    }
+    if (count != 0) {
+        logf("mods: none of the %zu recorded statics reaches the load "
+             "order; scanning", count);
+    }
+    return false;
+}
+
 bool search() {
     std::uint8_t needle[16] = {};
     if (!bg3le_meta_parse_guid(kSharedUuid, needle)) {
@@ -333,18 +390,11 @@ bool search() {
     // both are Array<Module> in the same object, GetLoadOrder means the
     // loaded ones, and picking whichever the scan reached first would
     // silently return the wrong list.
-    Manager found{};
     Header const* chosen = nullptr;
     for (Header const& h : headers) {
-        Manager m{};
-        m.LoadOrder = h.Array;
-        m.BaseModule = base_module_before(h.At);
-        m.Available = available_after(h.At, h.Array.Stride);
-        if (m.BaseModule != nullptr && m.Available.Buffer != nullptr) {
-            found = m;
-            chosen = &h;
-            break;
-        }
+        if (!adopt(h.At)) continue;
+        chosen = &h;
+        break;
     }
 
     // Nothing validated as a whole manager, so nothing is adopted. An
@@ -359,10 +409,17 @@ bool search() {
         return false;
     }
 
-    state() = found;
+    Manager const found = state();
     char const* baseUuid = found.BaseModule != nullptr
                                ? uuid_string_at(found.BaseModule)
                                : nullptr;
+
+    // Recorded so the next run reads the engine's own pointer. The window
+    // covers ModManager, since a static points at the object rather than
+    // at the array partway into it.
+    constexpr std::uint64_t kManagerWindow = 1u << 16;
+    bg3le_static_record_path(kStaticKey, (void const*)(std::uintptr_t)chosen->At,
+                             kManagerWindow);
     logf("mods: %zu modules at %p, stride %zu (header at %#llx, %zu candidate "
          "headers); base module %s, %zu available", chosen->Array.Count,
          chosen->Array.Buffer, chosen->Array.Stride, chosen->At,
@@ -389,11 +446,14 @@ bool search() {
 // built the load order yet. The warm thread calls this on a timer, so a cap
 // keeps a genuinely absent module list from rescanning memory forever.
 bool ready() {
-    // Only the warming thread scans; see mem.h.
-    if (state().LoadOrder.Buffer == nullptr && !scan_allowed()) return false;
-
     static int attempts = 0;
     if (state().LoadOrder.Buffer != nullptr) return true;
+
+    // Resolving a recorded pointer is not a scan, so any thread may do it.
+    if (search_from_statics()) return true;
+
+    // Only the warming thread scans; see mem.h.
+    if (!scan_allowed()) return false;
     if (attempts >= 40) return false;
     ++attempts;
     return search();

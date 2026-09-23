@@ -587,7 +587,8 @@ extern "C" bool bg3le_static_record_path(char const* key,
     constexpr std::uint64_t kMemberWindow = 1u << 13;
     constexpr std::size_t kMaxDepth = 4;
     constexpr std::size_t kFrontierLimit = 4096;
-    constexpr std::size_t kPathLimit = 64;
+    constexpr std::size_t kPerDepth = 64;
+    constexpr std::size_t kPathLimit = 256;
 
     struct Node {
         std::uint64_t Addr{0};
@@ -614,11 +615,12 @@ extern "C" bool bg3le_static_record_path(char const* key,
     std::unordered_set<std::uint64_t> seen;
     for (auto const& node : frontier) seen.insert(node.Addr);
 
+    std::vector<Entry> candidates;
     for (std::size_t depth = 0; depth < kMaxDepth && !frontier.empty();
          ++depth) {
         // Anything in the image's own writable data is a static, and a
         // static is the end of the search.
-        std::vector<Entry> candidates;
+        std::vector<Entry> atDepth;
         for (auto const& node : frontier) {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> hits;
             statics_pointing_near(node.Addr, kMemberWindow, base, &hits);
@@ -629,38 +631,29 @@ extern "C" bool bg3le_static_record_path(char const* key,
                 entry.Hops.insert(entry.Hops.end(), node.Hops.begin(),
                                   node.Hops.end());
                 entry.Delta = node.Delta;
-                candidates.push_back(std::move(entry));
+                atDepth.push_back(std::move(entry));
             }
         }
 
-        if (!candidates.empty()) {
-            // Shortest chains first, then the tightest offsets: a long
-            // path through wide windows is the likeliest coincidence.
-            std::sort(candidates.begin(), candidates.end(),
-                      [](Entry const& a, Entry const& b) {
-                          if (a.Hops.size() != b.Hops.size()) {
-                              return a.Hops.size() < b.Hops.size();
-                          }
-                          const auto reach = [](Entry const& e) {
-                              std::uint64_t sum = e.Delta;
-                              for (std::uint64_t hop : e.Hops) sum += hop;
-                              return sum;
-                          };
-                          return reach(a) < reach(b);
-                      });
-            if (candidates.size() > kPathLimit) {
-                candidates.resize(kPathLimit);
-            }
-            cache().Offsets[key] = candidates;
-            cache().Dirty = true;
-            save_cache();
-            logf("statics: %s reached through %zu hops from image+%#llx, "
-                 "%zu paths found",
-                 key, candidates[0].Hops.size(),
-                 (unsigned long long)candidates[0].Offset,
-                 candidates.size());
-            return true;
-        }
+        // The tightest offsets first, and only so many per depth. A
+        // shallow path is not necessarily the real one -- eight statics
+        // sit within a page of anything on the heap -- so the search does
+        // not stop at the first depth that produces one; it keeps a
+        // shortlist from every depth and lets the next run's validation
+        // decide.
+        const auto reach = [](Entry const& e) {
+            std::uint64_t sum = e.Delta;
+            for (std::uint64_t hop : e.Hops) sum += hop;
+            return sum;
+        };
+        std::sort(atDepth.begin(), atDepth.end(),
+                  [&](Entry const& a, Entry const& b) {
+                      return reach(a) < reach(b);
+                  });
+        if (atDepth.size() > kPerDepth) atDepth.resize(kPerDepth);
+        logf("statics: %s has %zu paths at depth %zu", key, atDepth.size(),
+             depth + 1);
+        candidates.insert(candidates.end(), atDepth.begin(), atDepth.end());
 
         if (depth + 1 == kMaxDepth) break;
 
@@ -696,8 +689,19 @@ extern "C" bool bg3le_static_record_path(char const* key,
         frontier = std::move(next);
     }
 
-    logf("statics: no chain from a static reaches %s", key);
-    return false;
+    if (candidates.empty()) {
+        logf("statics: no chain from a static reaches %s", key);
+        return false;
+    }
+
+    if (candidates.size() > kPathLimit) candidates.resize(kPathLimit);
+    cache().Offsets[key] = candidates;
+    cache().Dirty = true;
+    save_cache();
+    logf("statics: %s has %zu candidate paths, shortest %zu hops from "
+         "image+%#llx", key, candidates.size(), candidates[0].Hops.size(),
+         (unsigned long long)candidates[0].Offset);
+    return true;
 }
 
 extern "C" bool bg3le_static_record(char const* key, void const* object) {
