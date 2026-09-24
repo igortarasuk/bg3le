@@ -235,7 +235,9 @@ component's declared size with the size the engine recorded, and
   needing machinery bg3le does not have raise instead of returning a
   plausible wrong answer: stat writes, functor execution, `Ext.Level`'s
   physics and pathfinding, `Entity.Create`/`Destroy`, the atlas and resource
-  managers and `GlobalSwitches`.
+  managers, and `GlobalSwitches` — whose object is findable by its own
+  language string and whose declared layout is not this build's, measured in
+  [reference/GLOBAL-SWITCHES.md](reference/GLOBAL-SWITCHES.md).
   `reference/ext-api-surface.txt` lists them with their shapes
 - **One session per process, unless asked.** `Ext.Debug.Reset()` works —
   both contexts are torn down and built again and every mod reloads, which is
