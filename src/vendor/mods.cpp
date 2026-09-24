@@ -590,6 +590,67 @@ bool search() {
 // necessarily the one that now holds the mods.
 std::atomic<bool> g_rescan{false};
 
+// Every manager bg3le has a pointer to, and what each holds right now.
+//
+// There are two -- client and server -- and the load order is not fixed for
+// the run: the engine builds it as a level loads and rebuilds it. One reached
+// 69 modules during a load and 43 by the end of it, which is the whole reason
+// Ext.Mod.GetLoadOrder merges modsettings.lsx over the top. This says which
+// manager is which and what each one holds, so the question can be settled
+// from data rather than from the one bg3le happened to adopt.
+extern "C" std::size_t bg3le_mods_manager_dump(
+    void (*report)(void* ctx, char const* key, unsigned long long header,
+                   std::size_t count, void const* buffer, bool chosen),
+    void* ctx) {
+    if (report == nullptr) return 0;
+
+    std::size_t seen = 0;
+    for (char const* key : kStaticKeys) {
+        const std::size_t count = bg3le_static_count(key);
+        for (std::size_t i = 0; i < count; ++i) {
+            void* header = bg3le_static_get(key, i);
+            if (header == nullptr) continue;
+            const auto at = (unsigned long long)(std::uintptr_t)header;
+
+            std::uint64_t buffer = 0;
+            std::uint32_t capacity = 0;
+            std::uint32_t size = 0;
+            auto const* head = (char const*)(std::uintptr_t)at;
+            if (!read_as(head, &buffer) || !read_as(head + 8, &capacity)
+                || !read_as(head + 12, &size)) {
+                continue;
+            }
+            if (size > 4096 || size > capacity) continue;
+
+            ++seen;
+            report(ctx, key, at, size,
+                   (void const*)(std::uintptr_t)buffer,
+                   at == state().Header);
+        }
+    }
+    return seen;
+}
+
+// One module's uuid out of a manager named by its header, so the two can be
+// compared entry by entry without adopting either.
+extern "C" char const* bg3le_mods_manager_uuid_at(unsigned long long header,
+                                                  std::size_t index) {
+    std::uint64_t buffer = 0;
+    std::uint32_t capacity = 0;
+    std::uint32_t size = 0;
+    auto const* head = (char const*)(std::uintptr_t)header;
+    if (!read_as(head, &buffer) || !read_as(head + 8, &capacity)
+        || !read_as(head + 12, &size)) {
+        return nullptr;
+    }
+    if (index >= size || size > capacity) return nullptr;
+
+    const std::size_t stride = state().LoadOrder.Stride;
+    if (stride == 0) return nullptr;
+    return uuid_string_at((char const*)(std::uintptr_t)buffer
+                          + index * stride);
+}
+
 bool ready() {
     static int attempts = 0;
 

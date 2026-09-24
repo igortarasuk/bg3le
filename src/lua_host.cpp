@@ -1686,6 +1686,12 @@ extern "C" std::size_t bg3le_mods_count();
 extern "C" char const* bg3le_mods_uuid_at(std::size_t index);
 extern "C" void* bg3le_mods_at(std::size_t index);
 extern "C" void* bg3le_mods_find(char const* uuid);
+extern "C" std::size_t bg3le_mods_manager_dump(
+    void (*report)(void* ctx, char const* key, unsigned long long header,
+                   std::size_t count, void const* buffer, bool chosen),
+    void* ctx);
+extern "C" char const* bg3le_mods_manager_uuid_at(unsigned long long header,
+                                                  std::size_t index);
 extern "C" void* bg3le_mods_base();
 extern "C" std::size_t bg3le_mods_available_count();
 extern "C" bool bg3le_stat_origin(char const* name, char const** modId,
@@ -2341,6 +2347,55 @@ int l_mod_at(lua_State* L) {
     void* module = bg3le_mods_at(i);
     if (module == nullptr) return 0;
     lua_pushinteger(L, (lua_Integer)(std::uintptr_t)module);
+    return 1;
+}
+
+// Ext._Internal.ModManagers() -> { {Key, Header, Count, Buffer, Chosen}, ... }
+//
+// Both mod managers and what each holds right now. The load order is not
+// fixed for the run -- one reached 69 modules during a level load and 43 by
+// the end of it -- so which one bg3le adopted is a question with a different
+// answer at different moments, and this is how to see it rather than infer
+// it.
+struct ManagerRow {
+    lua_State* L;
+    int Index;
+};
+
+void manager_row(void* ctx, char const* key, unsigned long long header,
+                 std::size_t count, void const* buffer, bool chosen) {
+    auto* out = static_cast<ManagerRow*>(ctx);
+    lua_State* L = out->L;
+
+    lua_createtable(L, 0, 5);
+    lua_pushstring(L, key);
+    lua_setfield(L, -2, "Key");
+    lua_pushinteger(L, (lua_Integer)header);
+    lua_setfield(L, -2, "Header");
+    lua_pushinteger(L, (lua_Integer)count);
+    lua_setfield(L, -2, "Count");
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)buffer);
+    lua_setfield(L, -2, "Buffer");
+    lua_pushboolean(L, chosen ? 1 : 0);
+    lua_setfield(L, -2, "Chosen");
+    lua_rawseti(L, -2, out->Index++);
+}
+
+int l_mod_managers(lua_State* L) {
+    lua_newtable(L);
+    ManagerRow out{L, 1};
+    bg3le_mods_manager_dump(&manager_row, &out);
+    return 1;
+}
+
+// Ext._Internal.ModManagerUuidAt(header, index) -> uuid
+int l_mod_manager_uuid_at(lua_State* L) {
+    const auto header =
+        (unsigned long long)luaL_checkinteger(L, 1);
+    const auto index = (std::size_t)luaL_checkinteger(L, 2);
+    char const* uuid = bg3le_mods_manager_uuid_at(header, index);
+    if (uuid == nullptr) return 0;
+    lua_pushstring(L, uuid);
     return 1;
 }
 
@@ -3931,6 +3986,10 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "ModAt");
     lua_pushcfunction(g_lua, l_mod_find);
     lua_setfield(g_lua, -2, "ModFind");
+    lua_pushcfunction(g_lua, l_mod_managers);
+    lua_setfield(g_lua, -2, "ModManagers");
+    lua_pushcfunction(g_lua, l_mod_manager_uuid_at);
+    lua_setfield(g_lua, -2, "ModManagerUuidAt");
     lua_pushcfunction(g_lua, l_mod_base);
     lua_setfield(g_lua, -2, "ModBase");
     lua_pushcfunction(g_lua, l_mod_available_count);

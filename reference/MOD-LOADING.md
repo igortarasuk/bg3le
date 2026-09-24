@@ -88,27 +88,46 @@ server's bootstraps. Both contexts are real Lua states on the threads the
 engine gives them, which is why every cache bg3le derives is behind a lock
 -- see `src/vendor/cache_lock.h`.
 
-## The engine's load order holds 43 of the 70
+## The engine's load order holds 43 of the 70, and why
 
 Measured 2026-09-23 with the same 57-mod set. The engine reports 73
 available modules and `modsettings.lsx` enables 70 of them, and the
-engine's own load order holds 43. Twenty-seven are missing from it,
-including Mod Configuration Menu.
+engine's own load order holds 43 by the time a save is in. Twenty-seven are
+missing from it, including Mod Configuration Menu.
 
-They are not unloaded. Stats carry the UUID of the mod that defined them,
-and counting 23,998 stats by `OriginalModId` puts 37 of them under
-"Clerics", which is one of the twenty-seven. Most of the rest are
-cosmetic -- hairstyles, face presets, hotbar and tooltip replacements --
-and define no stats at all, so there is nothing to count either way.
+It is the savegame's list, not a rejection. There is one `ModManager`, and
+its `LoadOrderedModules` is rebuilt across the level load:
 
-So the engine's load order is narrower than "every mod whose content is
-mounted", the same way MCM mounts on content above. What it is exactly is
-not settled. Until it is:
+    [ 53207.033] mods: 69 modules at 0x3db39fa6008
+    [ 53225.469] COsiris::Load #1: story loaded in 0.27s
+    [ 53234.299] Level load took 8.5s after Osiris finished
+    [ 53234.380] mods: 43 modules at 0x3db632cd008
+    [ 53234.380] mods: load order now holds 43 modules
+
+Sixty-nine at the menu, which is `modsettings.lsx`; forty-three once the
+save is loaded, which is the mod list the save itself records. The
+twenty-seven are the ones installed since that save was made. A different
+array, at a different address, under the same header.
+
+Their content is still mounted. Stats carry the UUID of the mod that
+defined them, and counting 23,998 stats by `OriginalModId` puts 37 of them
+under "Clerics", which is one of the twenty-seven. Most of the rest are
+cosmetic -- hairstyles, face presets, hotbar and tooltip replacements -- and
+define no stats at all, so there is nothing to count either way.
+
+`Ext._Internal.ModManagers()` and `ModManagerUuidAt(header, i)` are how this
+was settled and how to settle it again: every manager bg3le holds a pointer
+to, what each one's array holds right now, and which one is adopted.
+
+So the engine's load order answers "what did the save bring", and bg3le's
+answers "what is enabled and loadable now", which is the question a mod is
+asking:
 
 - `Ext.Mod.GetLoadOrder` returns the engine's order and then anything else
   enabled in `modsettings.lsx`, which comes to 70.
 - `Ext.Mod.IsModLoaded` answers over that merged order. Asking the
-  engine's list alone reported MCM as absent, and 5eSpells reads every one
-  of its settings behind that call, so it silently disabled the whole mod.
+  engine's list alone reported MCM as absent -- true of the save, false of
+  the session -- and 5eSpells reads every one of its settings behind that
+  call, so it silently disabled the whole mod.
 - `Ext.Mod.GetMod` tries the engine's order, then every Module the engine
   holds, then the archives.
