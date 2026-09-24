@@ -5536,13 +5536,40 @@ local function make_mod(addr)
   }
 end
 
+-- The mods the player has enabled, in order.
+--
+-- The engine's own list is first, and then anything modsettings.lsx
+-- enables that the engine did not load -- which on this build is 14 of 57
+-- modules, because a savegame's module list replaces the file's and the
+-- engine mounts only what it needs where you are standing. See
+-- reference/MOD-LOADING.md.
+--
+-- Upstream's load order holds everything the player enabled, so returning
+-- the engine's partial list was not parity, and mods read this as "every
+-- mod that is on". Mod Configuration Menu loads a blueprint for each mod
+-- in it: the 14 it never saw had no settings registered, and every later
+-- lookup for one of them warned that the mod "was not found by MCM" and
+-- asked the player to contact its author.
 function Ext.Mod.GetLoadOrder()
   local out = {}
+  local seen = {}
+
   local n = Ext._Internal.ModCount()
   for i = 0, n - 1 do
     local uuid = Ext._Internal.ModUuidAt(i)
-    if uuid ~= nil then out[#out + 1] = uuid end
+    if uuid ~= nil and not seen[uuid] then
+      seen[uuid] = true
+      out[#out + 1] = uuid
+    end
   end
+
+  for _, uuid in ipairs(Ext._Internal.ModSettingsOrder() or {}) do
+    if not seen[uuid] then
+      seen[uuid] = true
+      out[#out + 1] = uuid
+    end
+  end
+
   return out
 end
 
