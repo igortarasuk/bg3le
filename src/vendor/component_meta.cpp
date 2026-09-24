@@ -35,6 +35,7 @@
 
 #include <Lua/Shared/Proxies/PropertyMapDependencies.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -164,6 +165,70 @@ std::size_t set_count_thunk(void const* container) {
 template <class S>
 void* set_data_thunk(void const* container) {
     return (void*)static_cast<S const*>(container)->keys().data();
+}
+
+// Replaces a set's contents, which is the only way to write one.
+//
+// Through the container's own clear() and insert(), so the hash table is
+// rebuilt as the engine would rebuild it -- and through bg3se's own
+// HashSet, whose growth goes to the engine's allocator because
+// bg3le_install_game_allocator pointed GameAllocRaw at the engine's
+// operator new. Writing the keys array directly would leave every hash
+// pointing at whatever used to be there.
+//
+// A spell list is one of these: HashSet<FixedString>, and editing one is
+// what a mod that adds or removes spells is doing.
+template <class S>
+bool set_assign_thunk(void* container, void const* values,
+                      std::size_t count) {
+    using Elem = typename SetTraits<S>::Elem;
+    auto* set = static_cast<S*>(container);
+    auto const* items = static_cast<Elem const*>(values);
+
+    // The set's own bookkeeping has to agree with itself before anything
+    // is written, because reading one proves less than it looks.
+    //
+    // Reading a set only ever touches Keys, so a spell list reads
+    // perfectly whether or not the two members in front of it are laid
+    // out the way bg3se describes. Writing touches all three: clear()
+    // fills HashKeys end to end, and insert() pushes onto NextIds. The
+    // first attempt at this did that on trust and took the game down.
+    //
+    // A hash set that is laid out as expected has one next-id per key and
+    // at least as many buckets as keys. One that is not says so here.
+    const std::size_t keys = set->keys().size();
+    const std::size_t nexts = set->next_ids().size();
+    const std::size_t buckets = set->hash_keys().size();
+    constexpr std::size_t kSane = 1u << 24;
+
+    if (keys > kSane || nexts > kSane || buckets > kSane) return false;
+    if (nexts != keys) return false;
+    if (buckets < keys) return false;
+
+    // BG3LE_SET_WRITES=1 to go ahead.
+    //
+    // Everything above this line holds and the write still takes the game
+    // down. Reading a set proves less than it looks: it only ever touches
+    // Keys, so the two members in front of it are never exercised, and
+    // clear() fills HashKeys end to end while insert() pushes onto
+    // NextIds. bg3se's HashSet is not laid out the way this build's is
+    // somewhere in that prefix, and the invariant check above is not
+    // enough to catch it -- the sizes agree and the mutation still
+    // faults.
+    //
+    // Left here, and off, because everything around it is done: the
+    // caller resolves each name to the id the engine already holds, the
+    // thunk is instantiated for the field's exact type, and
+    // Ext.Types.Unserialize routes a set view here. What is missing is the
+    // prefix layout, which wants the same treatment the string table's
+    // sub-tables got -- read one live set's three members and check them
+    // against the keys it demonstrably has.
+    char const* go = std::getenv("BG3LE_SET_WRITES");
+    if (go == nullptr || go[0] != '1') return false;
+
+    set->clear();
+    for (std::size_t i = 0; i < count; ++i) set->insert(items[i]);
+    return true;
 }
 
 // std::optional is a value that may or may not be there, which is a different
@@ -405,6 +470,7 @@ constexpr FieldDesc make_field(char const* name, std::size_t offset) {
         describe_elements.template operator()<E>();
         f.Count = &set_count_thunk<T>;
         f.Data = &set_data_thunk<T>;
+        f.Assign = &set_assign_thunk<T>;
         f.ReadOnly = true;
     } else if constexpr (OptionalTraits<T>::kIsOptional) {
         using E = typename OptionalTraits<T>::Elem;
@@ -1154,6 +1220,30 @@ extern "C" bool bg3le_meta_resolve(void const* handle, char const* path,
     *size = r.Field.Size;
     *readOnly = r.Field.ReadOnly;
     return true;
+}
+
+// Replaces a set's contents with the values given.
+//
+// elemSize is checked against the field's own, so a caller that has
+// misunderstood the element type is refused rather than reinterpreting its
+// bytes -- the difference between writing FixedStrings and writing
+// something else four bytes wide.
+extern "C" bool bg3le_meta_set_assign(void const* handle, char const* path,
+                                      void* component, void const* values,
+                                      std::size_t count,
+                                      std::size_t elemSize) {
+    if (handle == nullptr || path == nullptr || component == nullptr) {
+        return false;
+    }
+    if (values == nullptr && count > 0) return false;
+
+    const auto r = resolve_path(static_cast<ClassFields const*>(handle), path,
+                                component);
+    if (!r.Ok || r.Address == nullptr) return false;
+    if (r.Field.Assign == nullptr) return false;
+    if (elemSize != r.Field.ElemSize) return false;
+
+    return r.Field.Assign(r.Address, values, count);
 }
 
 // The current length of a dynamic array, and the element stride. Needs the

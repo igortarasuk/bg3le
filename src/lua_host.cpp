@@ -1414,6 +1414,13 @@ extern "C" void bg3le_fixed_string_dump();
 extern "C" int bg3le_stats_string_intern(char const* text);
 extern "C" bool bg3le_fixed_string_intern(char const* text,
                                           unsigned int* out);
+extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
+                                            unsigned int* out);
+extern "C" bool bg3le_meta_set_assign(void const* handle,
+                                      char const* path, void* component,
+                                      void const* values,
+                                      std::size_t count,
+                                      std::size_t elemSize);
 extern "C" std::size_t bg3le_loca_count();
 extern "C" char const* bg3le_loca_handle_at(std::size_t index);
 extern "C" std::size_t bg3le_templates_count();
@@ -1668,6 +1675,114 @@ int l_object_get_field(lua_State* L) {
                         path, field_kind_name((FieldKind)kind));
         return 2;
     }
+    return 1;
+}
+
+// Ext._Internal.ObjectSetSet(address, class, path, { name, ... }) -> true
+//
+// Replaces a hash set of FixedStrings, which is what a spell list is.
+// Elements of a set cannot be written one at a time -- the table's hashes
+// would still point at the old keys -- so the whole set is rebuilt through
+// the container's own insert().
+//
+// Each name has to become the id the engine already holds for that text: a
+// FixedString compares by id, so a fresh entry for the same characters is
+// a different string to everything that looks at it. Text the engine does
+// not have is interned, which is the case for a spell a mod has added.
+int l_object_set_set(lua_State* L) {
+    Subject subject;
+    const char* className = nullptr;
+    if (!subject_from_object(L, 1, 2, &subject, &className)) return 2;
+    const char* path = luaL_checkstring(L, 3);
+    luaL_checktype(L, 4, LUA_TTABLE);
+
+    std::vector<unsigned int> ids;
+    const lua_Integer count = luaL_len(L, 4);
+    ids.reserve((std::size_t)(count > 0 ? count : 0));
+
+    for (lua_Integer i = 1; i <= count; ++i) {
+        lua_rawgeti(L, 4, i);
+        char const* name = lua_tostring(L, -1);
+        if (name == nullptr) {
+            lua_pop(L, 1);
+            lua_pushnil(L);
+            lua_pushfstring(L, "%s.%s: entry %d is not a string", className,
+                            path, (int)i);
+            return 2;
+        }
+
+        unsigned int id = 0;
+        if (!bg3le_fixed_string_index_of(name, &id)
+            && !bg3le_fixed_string_intern(name, &id)) {
+            lua_pop(L, 1);
+            lua_pushnil(L);
+            lua_pushfstring(L, "%s.%s: no string-table entry for %s and one "
+                            "could not be made", className, path, name);
+            return 2;
+        }
+        ids.push_back(id);
+        lua_pop(L, 1);
+    }
+
+    if (!bg3le_meta_set_assign(subject.Meta, path, subject.Base,
+                               ids.empty() ? nullptr : ids.data(), ids.size(),
+                               sizeof(unsigned int))) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s is not a set of FixedStrings that bg3le can "
+                        "replace", className, path);
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+// Ext._Internal.ObjectSetField(address, class, path, value) -> true
+//
+// The same write SetField makes on a component, against an address that
+// arrived some other way -- a static data resource, for one. Reading one
+// of those has worked from the start; writing had no entry point at all,
+// which meant Ext.StaticData handed back a snapshot and a mod editing it
+// changed nothing. 5eSpells' whole job is editing spell lists.
+int l_object_set_field(lua_State* L) {
+    Subject subject;
+    const char* className = nullptr;
+    if (!subject_from_object(L, 1, 2, &subject, &className)) return 2;
+    const char* path = luaL_checkstring(L, 3);
+
+    void* address = nullptr;
+    std::uint8_t kind = 0;
+    std::uint16_t size = 0;
+    bool readOnly = false;
+    if (!bg3le_meta_resolve(subject.Meta, path, subject.Base, &address, &kind,
+                            &size, &readOnly)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s does not resolve", className, path);
+        return 2;
+    }
+    if (readOnly) {
+        lua_pushnil(L);
+        lua_pushfstring(L,
+            "%s.%s is read-only: it is a hash set, and writing a key in "
+            "place would leave the table's hashes stale", className, path);
+        return 2;
+    }
+
+    std::uint32_t fieldOffset = 0;
+    std::uint16_t fieldSize = 0;
+    std::uint8_t fieldKind = 0;
+    std::uint8_t elemKind = 0;
+    std::uint16_t elemCount = 0;
+    bg3le_meta_field(subject.Meta, path, &fieldOffset, &fieldSize, &fieldKind,
+                     &elemKind, &elemCount);
+
+    if (!write_field(L, 4, address, (FieldKind)kind, (FieldKind)elemKind,
+                     elemCount)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s is not writable (%s)", className, path,
+                        field_kind_name((FieldKind)kind));
+        return 2;
+    }
+    lua_pushboolean(L, 1);
     return 1;
 }
 
@@ -3370,6 +3485,10 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "FieldInfo");
     lua_pushcfunction(g_lua, l_array_info);
     lua_setfield(g_lua, -2, "ArrayInfo");
+    lua_pushcfunction(g_lua, l_object_set_field);
+    lua_setfield(g_lua, -2, "ObjectSetField");
+    lua_pushcfunction(g_lua, l_object_set_set);
+    lua_setfield(g_lua, -2, "ObjectSetSet");
     lua_pushcfunction(g_lua, l_map_key);
     lua_setfield(g_lua, -2, "MapKey");
     lua_pushcfunction(g_lua, l_variant_index);
@@ -4204,6 +4323,25 @@ function Ext.Types.Unserialize(object, values)
   if type(values) ~= "table" then
     error("Ext.Types.Unserialize expects a table", 2)
   end
+
+  -- A view that knows where it came from is written back to the engine.
+  -- Without this a mod editing a spell list filled in a copy and the game
+  -- never saw it, which is worse than refusing: 5eSpells' whole reason
+  -- for existing is adding and removing spells, and it reported success
+  -- every time.
+  local meta = getmetatable(object)
+  local source = meta and meta.__bg3leSource
+  if source ~= nil then
+    local ok, err = Ext._Internal.ObjectSetSet(source.addr, source.class,
+                                               source.path, values)
+    if ok then
+      for k in pairs(object) do object[k] = nil end
+      for k, v in pairs(values) do object[k] = v end
+      return object
+    end
+    error("bg3le: " .. tostring(err), 2)
+  end
+
   for k, v in pairs(values) do object[k] = v end
   return object
 end
@@ -5417,6 +5555,50 @@ end
 -- UUID. Built once, from each mod's own meta.lsx -- the same file the
 -- engine reads -- so a mod that is installed and enabled can still be
 -- described.
+-- Larian packs a version into one 64-bit number, and bg3se's Version
+-- spells out where each part sits: major above bit 55, minor in the eight
+-- bits below that, revision in sixteen more, build in the low
+-- thirty-one.
+--
+-- Worth doing rather than reporting zeros. Mod Configuration Menu prints
+-- its own version from this, and with {0,0,0,0} it announced itself as
+-- "version 0.0.0" on both sides.
+local function decode_version(packed)
+  local v = math.tointeger(tonumber(packed or 0) or 0)
+  if v == nil or v == 0 then return {0, 0, 0, 0} end
+  return {(v >> 55) & 0x1ff, (v >> 47) & 0xff, (v >> 31) & 0xffff,
+          v & 0x7fffffff}
+end
+
+-- Every mod the engine has a Module for, by uuid, whether or not it made
+-- the load order.
+--
+-- ModFind only searches the load order, and on this build that holds 43
+-- of the 57 installed modules -- so a mod asking about a neighbour got
+-- nil, and MCM said "Mod 755a8a72-... was not found by MCM" for each one.
+-- The available list is the engine's own and covers them.
+local available_by_uuid = nil
+
+local function available_mod(uuid)
+  if available_by_uuid == nil then
+    available_by_uuid = {}
+    local n = Ext._Internal.ModAvailableCount()
+    for i = 0, (n or 0) - 1 do
+      local addr = Ext._Internal.ModAvailableAt(i)
+      if addr ~= nil then
+        local info = Ext._Internal.ModInfo(addr)
+        local id = info and info.ModuleUUIDString
+        if id ~= nil and id ~= "" and available_by_uuid[id] == nil then
+          available_by_uuid[id] = addr
+        end
+      end
+    end
+  end
+
+  local addr = available_by_uuid[uuid]
+  return addr ~= nil and make_mod(addr) or nil
+end
+
 local installed_mods = nil
 
 local function installed_mod(uuid)
@@ -5437,8 +5619,8 @@ local function installed_mod(uuid)
             LobbyLevelName = "",
             CharacterCreationLevelName = "",
             PhotoBoothLevelName = "",
-            ModVersion = {0, 0, 0, 0},
-            PublishVersion = {0, 0, 0, 0},
+            ModVersion = decode_version(module.Version),
+            PublishVersion = decode_version(module.Version),
             NumPlayers = 0,
             FileSize = 0,
             PublishHandle = 0,
@@ -5458,10 +5640,15 @@ function Ext.Mod.GetMod(uuid)
   local addr = Ext._Internal.ModFind(uuid)
   if addr ~= nil then return make_mod(addr) end
 
-  -- Not in the engine's list. On this build that happens to mods that are
-  -- installed and enabled all the same -- see reference/MOD-LOADING.md --
-  -- and returning nil for them breaks any mod that looks its neighbours
-  -- up, Mod Configuration Menu included.
+  -- Not in the load order, which on this build holds 43 of the 57
+  -- installed modules -- see reference/MOD-LOADING.md. The engine still
+  -- has a Module for the rest, so ask it before falling back to reading
+  -- the archives, because what it has is the real thing.
+  local known = available_mod(uuid)
+  if known ~= nil then return known end
+
+  -- And last, what the archives say. Returning nil here breaks any mod
+  -- that looks its neighbours up, Mod Configuration Menu included.
   return installed_mod(uuid)
 end
 
@@ -6031,7 +6218,12 @@ local function read_object_path(addr, class, path, kind)
                                       Ext._Internal.ObjectFieldInfo(
                                         class, element))
     end
-    return items
+    -- Where it came from, so Ext.Types.Unserialize can write it back
+    -- rather than filling in a copy nothing reads. A hash set -- a spell
+    -- list, say -- is the case that matters: it reads as an array of its
+    -- keys and can only be written whole.
+    return setmetatable(items, {__bg3leSource = {addr = addr, class = class,
+                                                 path = path}})
   end
 
   local value, err = Ext._Internal.ObjectGetField(addr, class, path)

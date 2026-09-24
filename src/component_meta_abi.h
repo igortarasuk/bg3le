@@ -111,6 +111,16 @@ struct FieldDesc {
     // live one, or the largest size_t when the variant is valueless.
     FieldDesc const* const* Alternatives;
     std::size_t (*ActiveIndex)(void const* variant);
+    // Set only: replaces the whole set with the keys given, through the
+    // container's own insert(), which rehashes rather than leaving the
+    // table pointing at the old keys. This is what makes a set writable at
+    // all -- an element cannot be, for the reason above, but the set can.
+    //
+    // Last on purpose. Putting it next to ReadOnly, where it belongs by
+    // meaning, moved every member after it, and something initialises one
+    // of these by position: the first call through a shifted Assign was a
+    // jump to address zero.
+    bool (*Assign)(void* container, void const* values, std::size_t count);
 };
 
 }  // namespace bg3le

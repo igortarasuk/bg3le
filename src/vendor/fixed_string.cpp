@@ -32,6 +32,8 @@
 #include <CoreLib/Base/BaseString.h>
 
 #include <cstdio>
+#include <utility>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
@@ -321,18 +323,87 @@ extern "C" void* bg3le_string_table() {
 // Walks buckets rather than entries. Resolving an entry costs a
 // process_vm_readv each, and a table of this size has millions of them, so
 // each bucket is read whole and searched locally -- one syscall per bucket.
-extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
-                                            std::uint32_t* out) {
-    if (wanted == nullptr) return false;
-    void const* table = bg3le_string_table();
-    if (table == nullptr) return false;
+// Text to id, from an index built once.
+//
+// A FixedString compares by id, so anything that has to put a *named*
+// string where the engine will compare it -- a spell in a spell list --
+// needs the id the engine already has for that text. A second entry with
+// the same characters is a different string as far as the engine is
+// concerned.
+//
+// Finding it used to mean walking every bucket of every sub-table, about a
+// million and a half entries, at eighty milliseconds a call. So the walk
+// happens once and what it collects is kept: the hash of each string
+// against its id, sorted, which is twelve bytes an entry rather than the
+// text itself. A lookup hashes, binary-searches, and proves each candidate
+// by resolving it and comparing, so a hash collision costs a comparison
+// rather than a wrong answer.
+std::uint64_t text_hash(char const* text, std::size_t length) {
+    std::uint64_t h = 0xcbf29ce484222325ull;  // FNV-1a
+    for (std::size_t i = 0; i < length; ++i) {
+        h ^= (unsigned char)text[i];
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
 
-    const std::size_t wantLen = std::strlen(wanted);
-    std::vector<unsigned char> bucketBuf;
+extern "C" char const* bg3le_fixed_string(std::uint32_t index,
+                                          std::uint32_t* length);
 
+// How much of a bucket to ask for at a time. Small enough that one
+// unreadable page costs a piece rather than the rest of the bucket.
+constexpr std::size_t kReadChunk = 8192;
+
+using TextIndex = std::vector<std::pair<std::uint64_t, std::uint32_t>>;
+
+// How much table there is to index, which is what tells a stale index from
+// a current one.
+//
+// The engine allocates buckets as it interns, so the table grows all
+// through a session -- 262,425 entries while a level was loading, over a
+// million by the time it had. Building the index once was therefore
+// building it from whatever existed at the first lookup, and a string
+// interned afterwards could not be found: the intern path then made a
+// second entry for text the engine already had, which is the one outcome
+// that matters, because a FixedString compares by id.
+std::uint64_t table_extent(void const* table) {
+    std::uint64_t extent = 0;
     for (std::size_t sub = 0; sub < kSubTableCount; ++sub) {
         void const* st = sub_table(table, sub);
         if (!sub_table_plausible(st)) continue;
+        extent += (std::uint64_t)
+            read_at<std::uint32_t>(st, offsetof(SubTable, NumBuckets));
+        extent <<= 1;
+    }
+    return extent;
+}
+
+TextIndex const& text_index() {
+    static TextIndex index;
+    static std::uint64_t builtFor = 0;
+
+    void const* table = bg3le_string_table();
+    if (table == nullptr) return index;
+
+    const std::uint64_t extent = table_extent(table);
+    if (!index.empty() && extent == builtFor) return index;
+
+    index.clear();
+    builtFor = extent;
+
+    // What the walk rejects, and why. The first version of this index
+    // collected a fifth of the table and the lookups it was built for
+    // silently missed, so the reasons are counted rather than assumed.
+    std::size_t seen = 0, freed = 0, tooLong = 0, truncated = 0, unterm = 0;
+    std::size_t skippedTables = 0, skippedBuckets = 0;
+
+    std::vector<unsigned char> bucketBuf;
+    for (std::size_t sub = 0; sub < kSubTableCount; ++sub) {
+        void const* st = sub_table(table, sub);
+        if (!sub_table_plausible(st)) {
+            ++skippedTables;
+            continue;
+        }
 
         const auto entrySize =
             read_at<std::uint64_t>(st, offsetof(SubTable, EntrySize));
@@ -342,9 +413,10 @@ extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
             read_at<std::uint32_t>(st, offsetof(SubTable, EntriesPerBucket));
         auto** buckets =
             read_at<std::uint8_t**>(st, offsetof(SubTable, Buckets));
-        if (buckets == nullptr || entrySize == 0) continue;
+        if (buckets == nullptr || entrySize == 0 || perBucket == 0) continue;
 
-        const std::size_t span = (std::size_t)perBucket * (std::size_t)entrySize;
+        const std::size_t span =
+            (std::size_t)perBucket * (std::size_t)entrySize;
         if (span == 0 || span > (64u << 20)) continue;
         bucketBuf.resize(span);
 
@@ -352,29 +424,90 @@ extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
             std::uint8_t* bucket = nullptr;
             if (!safe_read(&buckets[b], &bucket, sizeof(bucket))
                 || bucket == nullptr) {
+                ++skippedBuckets;
                 continue;
             }
-            const std::size_t got =
-                safe_read_some(bucket, bucketBuf.data(), span);
-            if (got < sizeof(Header) + 1) continue;
+            // In pieces, and the buffer is cleared first so a piece
+            // that cannot be read leaves zeroes rather than the last
+            // bucket's bytes -- a zero header is skipped below as free.
+            //
+            // A single read of the whole bucket is what the first version
+            // did, and process_vm_readv returns a partial count when it
+            // reaches a page it cannot read, so the parse loop stopped
+            // there and abandoned the rest. The index came out with
+            // 262,425 of the table's 1,211,260 entries, just over a
+            // fifth, and a lookup for a string that was plainly there
+            // missed. Nothing said so: a short read is not an error.
+            std::fill(bucketBuf.begin(), bucketBuf.end(), (unsigned char)0);
+            for (std::size_t off = 0; off < span; off += kReadChunk) {
+                const std::size_t want = std::min(kReadChunk, span - off);
+                if (safe_read_some(bucket + off, bucketBuf.data() + off,
+                                   want) < want) {
+                    ++skippedBuckets;
+                }
+            }
 
             for (std::uint32_t e = 0; e < perBucket; ++e) {
                 const std::size_t at = (std::size_t)e * (std::size_t)entrySize;
-                if (at + sizeof(Header) + wantLen + 1 > got) break;
+                if (at + sizeof(Header) + 1 > span) break;
+                ++seen;
 
                 auto const* header = (Header const*)(bucketBuf.data() + at);
-                if (header->Length != wantLen) continue;
+                if (header->RefCount == 0 || header->Length == 0) {
+                    ++freed;
+                    continue;
+                }
+                if (header->Length > entrySize - sizeof(Header)) {
+                    ++tooLong;
+                    continue;
+                }
+                if (at + sizeof(Header) + header->Length + 1 > span) {
+                    ++truncated;
+                    continue;
+                }
 
                 char const* text = (char const*)(header + 1);
-                if (std::memcmp(text, wanted, wantLen) != 0) continue;
-                if (text[wantLen] != '\0') continue;
-
-                if (out != nullptr) {
-                    *out = (std::uint32_t)sub | (b << 4) | (e << 20);
+                if (text[header->Length] != '\0') {
+                    ++unterm;
+                    continue;
                 }
-                return true;
+
+                index.emplace_back(text_hash(text, header->Length),
+                                   (std::uint32_t)sub | (b << 4) | (e << 20));
             }
         }
+    }
+
+    std::sort(index.begin(), index.end());
+    logf("string table: %zu strings indexed by text, out of %zu entries "
+         "walked (%zu free, %zu over-long, %zu truncated, %zu unterminated; "
+         "%zu sub-tables and %zu buckets skipped)",
+         index.size(), seen, freed, tooLong, truncated, unterm,
+         skippedTables, skippedBuckets);
+    return index;
+}
+
+extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
+                                            std::uint32_t* out) {
+    if (wanted == nullptr) return false;
+    if (bg3le_string_table() == nullptr) return false;
+
+    const std::size_t wantLen = std::strlen(wanted);
+    const std::uint64_t hash = text_hash(wanted, wantLen);
+
+    TextIndex const& index = text_index();
+    auto at = std::lower_bound(
+        index.begin(), index.end(),
+        std::pair<std::uint64_t, std::uint32_t>{hash, 0});
+
+    for (; at != index.end() && at->first == hash; ++at) {
+        std::uint32_t length = 0;
+        char const* text = bg3le_fixed_string(at->second, &length);
+        if (text == nullptr || length != wantLen) continue;
+        if (std::memcmp(text, wanted, wantLen) != 0) continue;
+
+        if (out != nullptr) *out = at->second;
+        return true;
     }
     return false;
 }
@@ -492,7 +625,9 @@ extern "C" char const* bg3le_fixed_string(std::uint32_t index,
 // deliberate limitation: the map's layout is not established here, and the
 // only consequence is that the engine interning the same text later makes
 // its own second entry -- which is what the table looks like anyway when a
-// string arrives twice before either copy is released.
+// string arrives twice before either copy is released. Text the engine
+// already holds is found first and its own id handed back, so a duplicate
+// only ever happens for text that did not exist.
 constexpr std::uint32_t kInternRefCount = 0x100000;
 
 extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
@@ -503,14 +638,23 @@ extern "C" bool bg3le_fixed_string_intern(char const* text,
     if (text == nullptr || out == nullptr) return false;
 
     // What has already been interned here, so the same text asked for
-    // twice costs nothing. Deliberately not a search of the engine's
-    // table first: that reads every bucket of every sub-table, about a
-    // million and a half entries, and at eighty milliseconds a call it
-    // turned a mod's stat pass into minutes.
+    // twice costs nothing.
     static std::unordered_map<std::string, std::uint32_t> ours;
     auto known = ours.find(text);
     if (known != ours.end()) {
         *out = known->second;
+        return true;
+    }
+
+    // Then the engine's own table. This was skipped while the only way to
+    // search it was a walk of every bucket -- eighty milliseconds a call,
+    // which turned a mod's stats pass into minutes -- and the cost of
+    // skipping it was a second entry for text the engine already had. That
+    // matters more than it sounds: a FixedString compares by id, so a
+    // duplicate is a different string to everything that compares them.
+    // The index makes the search a binary search, so it happens again.
+    if (bg3le_fixed_string_index_of(text, out)) {
+        ours.emplace(text, *out);
         return true;
     }
 
