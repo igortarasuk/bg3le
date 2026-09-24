@@ -42,6 +42,7 @@
 #include <string>
 
 #include "../log.h"
+#include "cache_lock.h"
 #include "../mem.h"
 
 namespace bg3le {
@@ -312,6 +313,7 @@ void* search_for_table() {
 // Deliberately lazy: the engine builds the table during startup, so a search
 // at load time would find nothing and cache that.
 extern "C" void* bg3le_string_table() {
+    const CacheLock lock(string_cache_lock());
     if (!g_searched) {
         g_searched = true;
         g_table = search_for_table();
@@ -502,6 +504,7 @@ TextIndex const& text_index() {
 // that is read.
 extern "C" bool bg3le_fixed_string_hash(std::uint32_t id,
                                         std::uint32_t* out) {
+    const CacheLock lock(string_cache_lock());
     if (out == nullptr) return false;
 
     void* table = bg3le_string_table();
@@ -516,6 +519,7 @@ extern "C" bool bg3le_fixed_string_hash(std::uint32_t id,
 
 extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
                                             std::uint32_t* out) {
+    const CacheLock lock(string_cache_lock());
     if (wanted == nullptr) return false;
     if (bg3le_string_table() == nullptr) return false;
 
@@ -562,6 +566,7 @@ std::unordered_map<std::uint32_t, Known>& resolved_strings() {
 // made Ext.Stats.Get("PotentSpellcasting") return nil. An index builder
 // calls this first and resolves afresh.
 extern "C" void bg3le_fixed_string_forget_failures() {
+    const CacheLock lock(string_cache_lock());
     auto& known = resolved_strings();
     for (auto it = known.begin(); it != known.end();) {
         it = it->second.Text == nullptr ? known.erase(it) : std::next(it);
@@ -570,6 +575,7 @@ extern "C" void bg3le_fixed_string_forget_failures() {
 
 extern "C" char const* bg3le_fixed_string(std::uint32_t index,
                                           std::uint32_t* length) {
+    const CacheLock lock(string_cache_lock());
     void* table = bg3le_string_table();
     if (table == nullptr) return nullptr;
 
@@ -662,6 +668,7 @@ extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
 
 extern "C" bool bg3le_fixed_string_intern(char const* text,
                                           std::uint32_t* out) {
+    const CacheLock lock(string_cache_lock());
     if (text == nullptr || out == nullptr) return false;
 
     // What has already been interned here, so the same text asked for
@@ -821,6 +828,7 @@ extern "C" bool bg3le_fixed_string_intern(char const* text,
 // so a computed id can be proved against the entry it lands on before
 // anything is written.
 extern "C" void bg3le_fixed_string_dump() {
+    const CacheLock lock(string_cache_lock());
     void const* table = bg3le_string_table();
     if (table == nullptr) {
         logf("string table: not located, nothing to dump");

@@ -15,6 +15,7 @@
 
 #include "hook.h"
 #include "log.h"
+#include "vendor/cache_lock.h"
 #include "mem.h"
 
 extern "C" bool bg3le_scannable_region(char const* line,
@@ -1730,6 +1731,7 @@ void save_cached_signatures(char const* story) {
 
 std::size_t load_out_param_counts(std::vector<Function>* functions,
                                   char const* story, bool* cached) {
+    const CacheLock lock(osiris_cache_lock());
     if (cached != nullptr) *cached = false;
     std::uintptr_t base = 0;
     ::dl_iterate_phdr(find_osiris, &base);
@@ -1987,6 +1989,7 @@ std::size_t load_out_param_counts(std::vector<Function>* functions,
 }
 
 std::vector<Function> story_functions(std::vector<Function> const& known) {
+    const CacheLock lock(osiris_cache_lock());
     std::unordered_set<std::string> seen;
     for (Function const& fn : known) {
         seen.insert(fn.name + "/" + std::to_string(fn.params.size()));
@@ -2184,6 +2187,7 @@ std::string class_of(std::uintptr_t vtable) {
     // answer is kept: asking once per function cost four reads each and
     // showed up in the level load.
     static std::unordered_map<std::uintptr_t, std::string> known;
+    const CacheLock lock(osiris_cache_lock());
     auto cached = known.find(vtable);
     if (cached != known.end()) return cached->second;
 
@@ -2519,30 +2523,35 @@ std::vector<Value> tuple_values(void* tuple) {
     return out;
 }
 
-// What the node stands for, as "name/arity".
-std::string const* node_name(void* node) {
+// What the node stands for, as "name/arity", or empty if it is not one
+// bg3le named.
+//
+// By value, not by pointer into the map: this runs on whichever engine thread
+// inserted the tuple, and the map is built on the server thread.
+std::string node_name(void* node) {
     std::uintptr_t def = 0;
     if (!peek(reinterpret_cast<std::uintptr_t>(node) + 0x10, &def)
         || def == 0) {
-        return nullptr;
+        return {};
     }
 
+    const CacheLock lock(osiris_cache_lock());
     auto found = def_names().find(def);
-    return found == def_names().end() ? nullptr : &found->second;
+    return found == def_names().end() ? std::string{} : found->second;
 }
 
 void fire(void* node, void* tuple, char const* before, char const* after,
           NodeTupleProc original) {
-    std::string const* key = node_name(node);
-    if (key == nullptr || g_trigger == nullptr) {
+    const std::string key = node_name(node);
+    if (key.empty() || g_trigger == nullptr) {
         if (original != nullptr) original(node, tuple);
         return;
     }
 
-    const std::size_t slash = key->rfind('/');
-    const std::string name = key->substr(0, slash);
+    const std::size_t slash = key.rfind('/');
+    const std::string name = key.substr(0, slash);
     const std::size_t arity =
-        (std::size_t)std::strtoul(key->c_str() + slash + 1, nullptr, 10);
+        (std::size_t)std::strtoul(key.c_str() + slash + 1, nullptr, 10);
 
     const std::vector<Value> values = tuple_values(tuple);
     g_trigger(name.c_str(), arity, before, values);
@@ -2550,23 +2559,23 @@ void fire(void* node, void* tuple, char const* before, char const* after,
     g_trigger(name.c_str(), arity, after, values);
 }
 
-Hooked const* hooked_for(void* node) {
+// Two function pointers, copied out rather than pointed at, for the reason
+// node_name is.
+Hooked hooked_for(void* node) {
     std::uintptr_t vtable = 0;
-    if (!peek(reinterpret_cast<std::uintptr_t>(node), &vtable)) return nullptr;
+    if (!peek(reinterpret_cast<std::uintptr_t>(node), &vtable)) return {};
+
+    const CacheLock lock(osiris_cache_lock());
     auto found = g_hooked.find(vtable);
-    return found == g_hooked.end() ? nullptr : &found->second;
+    return found == g_hooked.end() ? Hooked{} : found->second;
 }
 
 void watched_insert(void* node, void* tuple) {
-    Hooked const* hooked = hooked_for(node);
-    fire(node, tuple, "before", "after",
-         hooked != nullptr ? hooked->Insert : nullptr);
+    fire(node, tuple, "before", "after", hooked_for(node).Insert);
 }
 
 void watched_delete(void* node, void* tuple) {
-    Hooked const* hooked = hooked_for(node);
-    fire(node, tuple, "beforeDelete", "afterDelete",
-         hooked != nullptr ? hooked->Delete : nullptr);
+    fire(node, tuple, "beforeDelete", "afterDelete", hooked_for(node).Delete);
 }
 
 bool install_node_hooks() {
@@ -2634,21 +2643,29 @@ std::size_t story_function_count() { return g_story_functions; }
 
 std::size_t node_count() { return g_nodes.Count; }
 
-void probe_strings(char const* text) { probe_string_pool(text); }
+void probe_strings(char const* text) {
+    const CacheLock lock(osiris_cache_lock());
+    probe_string_pool(text);
+}
 
 Status insert(char const* key, std::vector<Value> const& args,
               std::string* why) {
+    const CacheLock lock(osiris_cache_lock());
     return insert_tuple(key, args, kInsertTuple, why);
 }
 
 Status remove(char const* key, std::vector<Value> const& args,
               std::string* why) {
+    const CacheLock lock(osiris_cache_lock());
     return insert_tuple(key, args, kDeleteTuple, why);
 }
 
 void set_trigger_sink(TriggerFn fn) { g_trigger = fn; }
 
-bool watch_story_triggers() { return install_node_hooks(); }
+bool watch_story_triggers() {
+    const CacheLock lock(osiris_cache_lock());
+    return install_node_hooks();
+}
 
 // Does the story define a function by this name, and is it a database?
 //
@@ -2658,6 +2675,7 @@ bool watch_story_triggers() { return install_node_hooks(); }
 // costs half a second that a session which never calls one should not
 // pay. bg3se resolves its Osi.* the same way, through a metatable.
 bool story_function(char const* name, bool* is_database, std::string* real) {
+    const CacheLock lock(osiris_cache_lock());
     if (name == nullptr || !bind_defs()) return false;
 
     std::string prefix = std::string(name) + "/";
@@ -2713,6 +2731,7 @@ bool story_function(char const* name, bool* is_database, std::string* real) {
 // type. Reading these is the other half of what a database is for: a mod
 // asks DB_Foo:Get(...) far more often than it inserts.
 bool facts(char const* key, std::vector<std::vector<Value>>* rows) {
+    const CacheLock lock(osiris_cache_lock());
     if (rows == nullptr || !bind_defs()) return false;
     if (g_databases.First == 0) return false;
 
@@ -2805,6 +2824,7 @@ bool ready() { return g_call != nullptr && g_query != nullptr && accessors().ok(
 
 Status invoke(const Function& fn, const std::vector<Value>& inputs,
               std::vector<Value>* outputs) {
+    const CacheLock lock(osiris_cache_lock());
     if (!ready()) return Status::kUnavailable;
     if (fn.kind() == kEvent) return Status::kUnavailable;  // the game raises these
     if (fn.params.size() > kMaxParams) return Status::kUnavailable;

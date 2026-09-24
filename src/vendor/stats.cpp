@@ -51,6 +51,7 @@
 #include "ls_string.h"
 
 #include "../log.h"
+#include "cache_lock.h"
 #include "../mem.h"
 
 extern "C" bool bg3le_scannable_region(char const* line,
@@ -1092,18 +1093,22 @@ int hash_map_slot(void const* map, char const* name) {
 // ---- the C surface Ext.Stats is built on ----
 
 extern "C" void* bg3le_stats_manager() {
+    const CacheLock lock(stats_cache_lock());
     return ready() ? (void*)state().Objects.Buffer : nullptr;
 }
 
 extern "C" std::size_t bg3le_stats_count() {
+    const CacheLock lock(stats_cache_lock());
     return ready() ? state().Objects.Size : 0;
 }
 
 extern "C" void* bg3le_stats_at(std::size_t index) {
+    const CacheLock lock(stats_cache_lock());
     return (void*)object_at(index);
 }
 
 extern "C" char const* bg3le_stats_name(void const* object) {
+    const CacheLock lock(stats_cache_lock());
     if (object == nullptr || !ready()) return nullptr;
     bg3se::FixedString name{};
     if (!read_as((char const*)object + state().NameOffset, &name)) {
@@ -1230,6 +1235,7 @@ stats_names_by_list() {
 }
 
 extern "C" std::size_t bg3le_stats_names_count(char const* list) {
+    const CacheLock lock(stats_cache_lock());
     if (!ready()) return 0;
     auto const& byList = stats_names_by_list();
     auto found = byList.find(list == nullptr ? "" : list);
@@ -1238,6 +1244,7 @@ extern "C" std::size_t bg3le_stats_names_count(char const* list) {
 
 extern "C" char const* bg3le_stats_names_at(char const* list,
                                             std::size_t index) {
+    const CacheLock lock(stats_cache_lock());
     if (!ready()) return nullptr;
     auto const& byList = stats_names_by_list();
     auto found = byList.find(list == nullptr ? "" : list);
@@ -1246,6 +1253,7 @@ extern "C" char const* bg3le_stats_names_at(char const* list,
 }
 
 extern "C" void* bg3le_stats_find(char const* wanted) {
+    const CacheLock lock(stats_cache_lock());
     if (wanted == nullptr || !ready()) return nullptr;
 
     auto const& byName = stats_by_name();
@@ -1480,6 +1488,7 @@ int property_type(void const* enumeration) {
 // offset was derived, so this one comes for free: the value is an index into
 // the same stats array, or -1.
 extern "C" char const* bg3le_stats_using(void const* object) {
+    const CacheLock lock(stats_cache_lock());
     Found const& f = state();
     if (!f.Attributes || object == nullptr || f.ListIndexOffset < 4) {
         return nullptr;
@@ -1531,6 +1540,7 @@ bg3se::LegacyMap<bg3se::FixedString, std::int32_t> const* value_map(
 // Ext.Stats.EnumIndexToLabel(enumeration, index)
 extern "C" char const* bg3le_stats_enum_label(char const* enumeration,
                                               int index) {
+    const CacheLock lock(stats_cache_lock());
     void const* list = value_list_named(enumeration);
     if (list == nullptr) return nullptr;
 
@@ -1543,6 +1553,7 @@ extern "C" char const* bg3le_stats_enum_label(char const* enumeration,
 // Ext.Stats.EnumLabelToIndex(enumeration, label)
 extern "C" bool bg3le_stats_enum_index(char const* enumeration,
                                        char const* label, int* out) {
+    const CacheLock lock(stats_cache_lock());
     void const* list = value_list_named(enumeration);
     if (list == nullptr || label == nullptr) return false;
 
@@ -1559,6 +1570,7 @@ extern "C" bool bg3le_stats_enum_index(char const* enumeration,
 // The attribute names a modifier list declares, which is what
 // Ext.Stats.GetModifierAttributes reports.
 extern "C" std::size_t bg3le_stats_list_attr_count(char const* listName) {
+    const CacheLock lock(stats_cache_lock());
     Found const& f = state();
     if (!f.Attributes || listName == nullptr) return 0;
 
@@ -1586,6 +1598,7 @@ extern "C" bool bg3le_stats_list_attr_at(char const* listName,
                                          std::size_t index,
                                          char const** nameOut,
                                          char const** typeOut) {
+    const CacheLock lock(stats_cache_lock());
     Found const& f = state();
     if (!f.Attributes || listName == nullptr) return false;
 
@@ -1638,12 +1651,14 @@ extern "C" bool bg3le_stats_list_attr_at(char const* listName,
 // counts. stats_functors.cpp checks this against the property maps before
 // trusting the rest of the member walk.
 extern "C" std::size_t bg3le_stats_list_index_offset() {
+    const CacheLock lock(stats_cache_lock());
     Found const& f = state();
     return f.Attributes ? f.ListIndexOffset : 0;
 }
 
 // The index of the modifier list this stat uses, or -1.
 extern "C" int bg3le_stats_list_index(void const* object) {
+    const CacheLock lock(stats_cache_lock());
     Found const& f = state();
     if (!f.Attributes || object == nullptr) return -1;
     std::uint32_t index = 0;
@@ -1652,6 +1667,7 @@ extern "C" int bg3le_stats_list_index(void const* object) {
 }
 
 extern "C" char const* bg3le_stats_type(void const* object) {
+    const CacheLock lock(stats_cache_lock());
     void const* list = list_for(object);
     if (list == nullptr) return nullptr;
     bg3se::FixedString name{};
@@ -1662,6 +1678,7 @@ extern "C" char const* bg3le_stats_type(void const* object) {
 }
 
 extern "C" std::size_t bg3le_stats_attr_count(void const* object) {
+    const CacheLock lock(stats_cache_lock());
     void const* list = list_for(object);
     if (list == nullptr) return 0;
     ArrayRef attrs{};
@@ -1680,6 +1697,7 @@ extern "C" std::size_t bg3le_stats_attr_count(void const* object) {
 // made reading a stat lazily no cheaper than reading all of it.
 extern "C" int bg3le_stats_attr_index(void const* object,
                                       char const* wanted) {
+    const CacheLock lock(stats_cache_lock());
     if (object == nullptr || wanted == nullptr) return -1;
 
     void const* list = list_for(object);
@@ -1720,6 +1738,7 @@ extern "C" bool bg3le_stats_attr_at(void const* object, std::size_t index,
                                     char const** nameOut,
                                     char const** typeNameOut, int* kindOut,
                                     int* rawOut) {
+    const CacheLock lock(stats_cache_lock());
     Found const& f = state();
     if (!f.Attributes || object == nullptr) return false;
 
@@ -1744,6 +1763,7 @@ extern "C" bool bg3le_stats_attr_at(void const* object, std::size_t index,
 // enumeration maps label to value, so this is a reverse lookup over it.
 extern "C" char const* bg3le_stats_attr_label(void const* object,
                                               std::size_t index, int raw) {
+    const CacheLock lock(stats_cache_lock());
     void const* mod = modifier_at(object, index);
     void const* en = enumeration_for(mod);
     if (en == nullptr) return nullptr;
@@ -1768,6 +1788,7 @@ extern "C" char const* bg3le_stats_attr_label(void const* object,
 extern "C" bool bg3le_stats_attr_flags(void const* object, std::size_t index,
                                        int raw, char* out,
                                        std::size_t capacity) {
+    const CacheLock lock(stats_cache_lock());
     Found const& f = state();
     if (out == nullptr || capacity == 0) return false;
     out[0] = '\0';
@@ -1813,6 +1834,7 @@ extern "C" bool bg3le_stats_attr_flags(void const* object, std::size_t index,
 
 // A Float attribute's value, from the float pool.
 extern "C" bool bg3le_stats_attr_float(int raw, double* out) {
+    const CacheLock lock(stats_cache_lock());
     Found const& f = state();
     // Slot zero is the unset slot, not a value: RPGStats::GetFloat and every
     // other pool accessor tests `attributeId > 0`. Accepting it here is what
@@ -1831,6 +1853,7 @@ extern "C" bool bg3le_stats_attr_float(int raw, double* out) {
 // A GUID attribute's value, formatted the way the engine writes one.
 extern "C" bool bg3le_stats_attr_guid(int raw, char* out,
                                       std::size_t capacity) {
+    const CacheLock lock(stats_cache_lock());
     Found const& f = state();
     if (raw <= 0 || f.Guids.Buffer == nullptr) return false;
     if ((std::size_t)raw >= f.Guids.Size) return false;
@@ -1845,6 +1868,7 @@ extern "C" bool bg3le_stats_attr_guid(int raw, char* out,
 // A FixedString attribute's text: the raw value indexes RPGStats' own pool,
 // not the global string table.
 extern "C" char const* bg3le_stats_attr_string(int raw) {
+    const CacheLock lock(stats_cache_lock());
     Found const& f = state();
     if (raw <= 0 || f.Strings.Buffer == nullptr) return nullptr;
     if ((std::size_t)raw >= f.Strings.Size) return nullptr;
@@ -1867,6 +1891,7 @@ extern "C" char const* bg3le_stats_attr_string(int raw) {
 // A TranslatedString attribute's loca handle, e.g.
 // "h5fafec24g30d5g425cg952cga9c53752059c".
 extern "C" char const* bg3le_stats_attr_translated(int raw) {
+    const CacheLock lock(stats_cache_lock());
     Found const& f = state();
     if (raw <= 0 || f.TranslatedStrings.Buffer == nullptr) return nullptr;
     if ((std::size_t)raw >= f.TranslatedStrings.Size) return nullptr;
@@ -1968,6 +1993,7 @@ bool build_ls_string(void* at, char const* text) {
 // The pool index for a condition expression: the one it already has, or a
 // slack slot, or -1.
 extern "C" int bg3le_stats_condition_intern(char const* text) {
+    const CacheLock lock(stats_cache_lock());
     Found const& f = state();
     if (text == nullptr || f.Conditions.Buffer == nullptr
         || f.ConditionsHeader == nullptr) {
@@ -2026,6 +2052,7 @@ extern "C" int bg3le_stats_condition_intern(char const* text) {
 // pool already has is free; otherwise one comes out of the array's spare
 // capacity, on the same terms as a condition.
 extern "C" int bg3le_stats_string_intern(char const* text) {
+    const CacheLock lock(stats_cache_lock());
     Found const& f = state();
     if (text == nullptr || f.Strings.Buffer == nullptr
         || f.StringsHeader == nullptr) {
@@ -2094,6 +2121,7 @@ extern "C" int bg3le_stats_string_intern(char const* text) {
 // attribute is.
 extern "C" bool bg3le_stats_attr_set(void const* object, std::size_t index,
                                      int raw) {
+    const CacheLock lock(stats_cache_lock());
     Found const& f = state();
     if (!f.Attributes || object == nullptr) return false;
 
@@ -2120,6 +2148,7 @@ extern "C" bool bg3le_stats_attr_set(void const* object, std::size_t index,
 }
 
 extern "C" char const* bg3le_stats_attr_condition(int raw) {
+    const CacheLock lock(stats_cache_lock());
     Found const& f = state();
     if (raw <= 0 || f.Conditions.Buffer == nullptr) return nullptr;
     if ((std::size_t)raw >= f.Conditions.Size) return nullptr;
@@ -2147,6 +2176,7 @@ extern "C" char const* bg3le_stats_attr_condition(int raw) {
 // Reading the pool instead reported "CanNotUse" on a spell whose AIFlags is
 // empty.
 extern "C" char const* bg3le_stats_ai_flags(void const* object) {
+    const CacheLock lock(stats_cache_lock());
     if (object == nullptr || !state().Attributes) return nullptr;
     std::uint32_t index = 0;
     if (!read_as((char const*)object + kObjectAIFlags, &index)) return nullptr;
@@ -2159,6 +2189,7 @@ extern "C" char const* bg3le_stats_ai_flags(void const* object) {
 // the roll condition's name.
 extern "C" int bg3le_stats_roll_condition_count(void const* object,
                                                 char const* attribute) {
+    const CacheLock lock(stats_cache_lock());
     if (object == nullptr || !state().Attributes) return -1;
     auto const* map = (char const*)object + kObjectRollConditions;
     const int slot = hash_map_slot(map, attribute);
@@ -2181,6 +2212,7 @@ extern "C" bool bg3le_stats_roll_condition_at(void const* object,
                                               int index,
                                               char const** nameOut,
                                               char const** textOut) {
+    const CacheLock lock(stats_cache_lock());
     const int count = bg3le_stats_roll_condition_count(object, attribute);
     if (count < 0 || index < 0 || index >= count) return false;
 

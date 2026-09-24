@@ -31,6 +31,7 @@
 
 #include "../ecs_types.h"
 #include "../log.h"
+#include "cache_lock.h"
 #include "../mem.h"
 
 extern "C" bool bg3le_scannable_region(char const* line,
@@ -255,6 +256,7 @@ void* find_resource(void* bank, void const* guid, std::size_t resourceSize) {
 // Found on first use and cached, for the same reason as the string table: the
 // engine builds it during startup.
 extern "C" void* bg3le_resource_manager() {
+    const CacheLock lock(resource_cache_lock());
     if (!g_searched) {
         g_searched = true;
         g_manager = search_for_manager();
@@ -264,6 +266,7 @@ extern "C" void* bg3le_resource_manager() {
 
 // The bank for a static data type index, or null.
 extern "C" void* bg3le_resource_bank(std::int32_t typeIndex) {
+    const CacheLock lock(resource_cache_lock());
     void* manager = bg3le_resource_manager();
     if (manager == nullptr || typeIndex < 0) return nullptr;
 
@@ -276,6 +279,7 @@ extern "C" void* bg3le_resource_bank(std::int32_t typeIndex) {
 // How many banks the manager holds, and the index of the i'th, so the set can
 // be listed and checked against the registry from script.
 extern "C" std::size_t bg3le_resource_bank_count() {
+    const CacheLock lock(resource_cache_lock());
     void* manager = bg3le_resource_manager();
     if (manager == nullptr) return 0;
     return reinterpret_cast<GuidResourceManager*>(manager)
@@ -286,12 +290,14 @@ extern "C" std::size_t bg3le_resource_bank_count() {
 // resource of that type, which the caller takes from the field metadata.
 extern "C" void* bg3le_resource_get(std::int32_t typeIndex, void const* guid,
                                     std::size_t resourceSize) {
+    const CacheLock lock(resource_cache_lock());
     return find_resource(bg3le_resource_bank(typeIndex), guid, resourceSize);
 }
 
 // How many resources a bank holds, so a caller can tell an empty bank from a
 // missing GUID.
 extern "C" std::size_t bg3le_resource_count(std::int32_t typeIndex) {
+    const CacheLock lock(resource_cache_lock());
     void* bank = bg3le_resource_bank(typeIndex);
     if (bank == nullptr) return 0;
 
@@ -306,6 +312,7 @@ extern "C" std::size_t bg3le_resource_count(std::int32_t typeIndex) {
 // The GUID of the i'th resource in a bank, for listing one.
 extern "C" bool bg3le_resource_guid_at(std::int32_t typeIndex, std::size_t i,
                                        void* guidOut) {
+    const CacheLock lock(resource_cache_lock());
     void* bank = bg3le_resource_bank(typeIndex);
     if (bank == nullptr || guidOut == nullptr) return false;
 
@@ -322,6 +329,7 @@ extern "C" bool bg3le_resource_guid_at(std::int32_t typeIndex, std::size_t i,
 
 extern "C" bool bg3le_resource_bank_at(std::size_t i, std::int32_t* typeIndex,
                                        void** bank) {
+    const CacheLock lock(resource_cache_lock());
     void* manager = bg3le_resource_manager();
     if (manager == nullptr) return false;
 
