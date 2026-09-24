@@ -2120,6 +2120,75 @@ extern "C" int bg3le_stats_string_intern(char const* text) {
 // One int32 into the object's indexed properties, which is what an
 // attribute is.
 extern "C" bool bg3le_stats_attr_set(void const* object, std::size_t index,
+                                     int raw);
+
+// Copies one stat object's attributes onto another, the way upstream's
+// Object::CopyFrom does: it refuses across modifier lists, then assigns
+// AIFlags and every IndexedProperties entry.
+//
+// The indexed properties are the whole of a stat's scalar surface -- every
+// integer, enumeration, condition, GUID and string attribute is one raw
+// int32 in that array -- so copying them element-wise is the same assignment
+// upstream makes, not an approximation of it.
+//
+// A functor-typed attribute is an indexed property too -- its raw int is a
+// handle into the engine's compiled table -- so copying the array carries the
+// same reference upstream's property loop carries.
+//
+// What is not carried is Object::Functors and Object::RollConditions, the two
+// hash maps of compiled objects upstream copies entry by entry after the
+// property loop, with a "TODO - is reusing property list objects allowed?"
+// against both. Writing those needs a HashMap writer bg3le does not have, so
+// the caller says once that they were left, rather than this claiming a
+// complete copy.
+extern "C" bool bg3le_stats_copy_from(void const* dest, void const* source,
+                                      std::size_t* carried,
+                                      std::size_t* total) {
+    const CacheLock lock(stats_cache_lock());
+    if (carried != nullptr) *carried = 0;
+    if (total != nullptr) *total = 0;
+    if (dest == nullptr || source == nullptr) return false;
+
+    // Upstream's first check, and for its reason: two objects of different
+    // modifier lists index their properties differently, so a copy across
+    // them would assign every attribute to the wrong name.
+    const int destList = bg3le_stats_list_index(dest);
+    const int sourceList = bg3le_stats_list_index(source);
+    if (destList < 0 || sourceList < 0 || destList != sourceList) {
+        logf("stats: refusing to copy across modifier lists (%d into %d)",
+             sourceList, destList);
+        return false;
+    }
+
+    std::vector<std::int32_t> const* from = properties_of(source);
+    if (from == nullptr) return false;
+    // Copied out before writing: properties_of keeps one object's values, and
+    // the write below invalidates that cache.
+    const std::vector<std::int32_t> values = *from;
+
+    std::vector<std::int32_t> const* to = properties_of(dest);
+    if (to == nullptr) return false;
+    const std::size_t n = std::min(values.size(), to->size());
+
+    std::size_t written = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (bg3le_stats_attr_set(dest, i, values[i])) ++written;
+    }
+    if (carried != nullptr) *carried = written;
+
+    // AIFlags is a FixedString on the object rather than an indexed
+    // property, which is why upstream assigns it separately.
+    std::uint32_t flags = 0;
+    if (read_as((char const*)source + kObjectAIFlags, &flags)) {
+        std::memcpy((char*)dest + kObjectAIFlags, &flags, sizeof(flags));
+    }
+
+    if (total != nullptr) *total = n;
+    logf("stats: copied %zu of %zu indexed properties", written, n);
+    return written == n;
+}
+
+extern "C" bool bg3le_stats_attr_set(void const* object, std::size_t index,
                                      int raw) {
     const CacheLock lock(stats_cache_lock());
     Found const& f = state();

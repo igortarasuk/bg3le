@@ -160,6 +160,21 @@ the spell and status prototypes, needs
 would be worse than saying so, because a mod that writes an attribute and
 then syncs would lose the write it had already made.
 
+## Copying a stat
+
+`stat:CopyFrom(name)` works. Upstream's `Object::CopyFrom` refuses across
+modifier lists and then assigns `AIFlags` and every `IndexedProperties`
+entry, and those properties are the whole of a stat's scalar surface, so this
+copies the same array element by element rather than approximating it.
+Measured between two spells: 204 of 204 properties carried, and afterwards
+198 of 199 scalar attributes agree with the source -- the exception being
+`Name`, which is a separate member and must not be copied.
+
+`Object::Functors` and `Object::RollConditions` are not carried. Those are
+two hash maps of compiled objects upstream copies after the property loop,
+and writing them needs a HashMap writer bg3le does not have. The log says so
+once per stat rather than leaving it implied.
+
 ## The prototypes are writable directly
 
 The rebuild has no symbol, but the thing it would rebuild is reachable.

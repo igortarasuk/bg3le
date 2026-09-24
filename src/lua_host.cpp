@@ -1008,6 +1008,9 @@ extern "C" char const* bg3le_meta_class_name(void const* handle);
 extern "C" bool bg3le_meta_type_name_at(void const* handle, char const* path,
                                         char const** name,
                                         std::uint16_t* length);
+extern "C" bool bg3le_stats_copy_from(void const* dest, void const* source,
+                                      std::size_t* carried,
+                                      std::size_t* total);
 extern "C" bool bg3le_meta_lsstring_assign(void* address, char const* text,
                                            std::size_t length);
 
@@ -2532,6 +2535,34 @@ int l_mod_settings(lua_State* L) {
     return 1;
 }
 
+// Ext._Internal.StatsCopyFrom(destAddr, sourceName) -> carried, total
+int l_stats_copy_from(lua_State* L) {
+    auto const* dest = (void const*)(std::uintptr_t)luaL_checkinteger(L, 1);
+    const char* from = luaL_checkstring(L, 2);
+
+    void* source = bg3le_stats_find(from);
+    if (source == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "no stat named %s", from);
+        return 2;
+    }
+
+    std::size_t carried = 0;
+    std::size_t total = 0;
+    if (!bg3le_stats_copy_from(dest, source, &carried, &total)) {
+        lua_pushnil(L);
+        lua_pushfstring(L,
+            "copied %d of %d properties; the two stats are probably of "
+            "different modifier lists, which upstream refuses too",
+            (int)carried, (int)total);
+        return 2;
+    }
+
+    lua_pushinteger(L, (lua_Integer)carried);
+    lua_pushinteger(L, (lua_Integer)total);
+    return 2;
+}
+
 // Ext._Internal.StatsAttrTranslated(raw) -> loca handle
 int l_stats_attr_translated(lua_State* L) {
     char const* text =
@@ -4024,6 +4055,8 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "ModInfo");
     lua_pushcfunction(g_lua, l_mod_list);
     lua_setfield(g_lua, -2, "ModList");
+    lua_pushcfunction(g_lua, l_stats_copy_from);
+    lua_setfield(g_lua, -2, "StatsCopyFrom");
     lua_pushcfunction(g_lua, l_stats_attr_translated);
     lua_setfield(g_lua, -2, "StatsAttrTranslated");
     lua_pushcfunction(g_lua, l_stats_attr_condition);
@@ -6959,7 +6992,44 @@ end
 
 local STAT_METHODS = {
   SetPersistence = stat_method("SetPersistence"),
-  CopyFrom = stat_method("CopyFrom"),
+
+  -- Upstream's Object::CopyFrom: it refuses across modifier lists, then
+  -- assigns AIFlags and every IndexedProperties entry. Those properties are
+  -- the whole of a stat's scalar surface, so this is the same assignment
+  -- rather than an approximation of it.
+  --
+  -- What it does not carry is Object::Functors and Object::RollConditions,
+  -- the two hash maps of compiled objects upstream copies after the property
+  -- loop -- with a "TODO - is reusing property list objects allowed?" against
+  -- both. Said once rather than left implied, because a caller expecting a
+  -- complete copy should hear about it.
+  CopyFrom = function(self, from)
+    if type(from) ~= "string" then
+      error("stat:CopyFrom(name) takes a stat name", 2)
+    end
+
+    local carried, total = Ext._Internal.StatsCopyFrom(
+      rawget(self, "__addr"), from)
+    if carried == nil then
+      error("bg3le: " .. tostring(total), 2)
+    end
+
+    -- The proxy's cache holds what it read before the copy.
+    for k in pairs(rawget(self, "__cache")) do
+      rawget(self, "__cache")[k] = nil
+    end
+
+    if not rawget(self, "__copySaid") then
+      rawset(self, "__copySaid", true)
+      Ext.Log.Print(string.format(
+        "bg3le: stat:CopyFrom copied %d of %d indexed properties and "
+        .. "AIFlags. Object::Functors and Object::RollConditions are not "
+        .. "carried -- writing those needs a HashMap writer bg3le does not "
+        .. "have -- so a functor a stat defines by name rather than by "
+        .. "attribute stays with the original", carried, total))
+    end
+    return true
+  end,
 
   SetRawAttribute = function(self, name, value)
     return stat_write(self, name, value)
