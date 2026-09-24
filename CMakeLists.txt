@@ -151,7 +151,8 @@ list(APPEND VENDOR_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/templates.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/prototypes.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/version_text.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/statics.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/statics.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/imgui_overlay.cpp)
 
 # Kept in step with tools/vendor-exclude.txt.
 set(VENDOR_EXCLUDE
@@ -263,6 +264,8 @@ add_library(bg3le SHARED
     src/win_compat.cpp
     src/affinity.cpp
     src/vulkan_memory.cpp
+    src/vulkan_forward.cpp
+    src/detour_interpose.cpp
     src/inflate.cpp
     src/pak.cpp
     src/math.cpp

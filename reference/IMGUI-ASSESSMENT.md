@@ -64,13 +64,70 @@ for anything bg3le is willing to export a forwarder for, which is the thing
 `vendor/compat/detours.h` says to do when something genuinely needs it:
 "implement these over bg3le's own primitives rather than widening this shim."
 
-## What is left after that
+## The hooks install now
 
-`Ext.IMGUI` itself, in bg3le's Lua. Upstream's binding is
-`Lua/Libs/ClientIMGUI.inl`, which is 70 lines, over a widget surface
-described in `GameDefinitions/PropertyMaps/IMGUI.inl` — and bg3le already
-re-expands those property maps into its own field tables, so the widgets are
-describable by the machinery `Ext.Entity` and `Ext.StaticData` already use.
+Done, behind `BG3LE_IMGUI=1`. `src/detour_interpose.cpp` records instead of
+patching, `src/vulkan_forward.cpp` exports the seven forwarders, and
+`src/vendor/imgui_overlay.cpp` constructs the manager and turns it on. From a
+run on 2026-09-23:
+
+    imgui: waiting for the engine heap before building the overlay
+    imgui: registered 7 Vulkan forwarders
+    detour: hooked 0x7f2fbdbb6090 -> ... (asked for the forwarder at 0x7f2fbf42af60)
+    imgui: overlay hooks installed; waiting for the swapchain
+    detour: hooked 0x7f2fbdbb5930 -> ...
+    detour: hooked 0x7f2fbdbb59d0 -> ...
+    detour: hooked 0x7f2fbdbb18d0 -> ...
+    detour: hooked 0x7f2fbdbbe170 -> ...
+    detour: hooked 0x7f2fbdbb9fd0 -> ...
+    detour: hooked 0x7f2fbdbba0f0 -> ...
+
+All seven, in bg3se's own order: the instance hook fires and wraps the device
+calls, those wrap the pipeline cache and the swapchain, and the last is
+`vkQueuePresentKHR`. bg3se's own chain, driven by interposition.
+
+Two things had to be learnt to get there, both recorded in the source:
+
+**Build it at the first `vkCreateInstance`, not in the library
+constructor.** `IMGUIManager`'s containers allocate through the engine's heap,
+which bg3le installs 0.4s after the library loads, so constructing early threw
+`bad_array_new_length` every time. The first `vkCreateInstance` is after the
+allocator and before the instance exists, which is the only window that
+satisfies both.
+
+**A forwarder must say what it stands in for.** bg3se asks the loader for
+`vkCreateInstance`, is handed a forwarder because the proc-address hook
+diverts that name, and registers its replacement against it. The first version
+handed that same pointer back as "the original to call through", so the
+post-hook called the forwarder, which found the hook, which called the
+post-hook — a stack overflow under two hundred frames of `StaticPostHook`.
+`detour_register_forwarder` records the pair up front, eagerly, because bg3se
+wraps the later entry points from inside the earlier ones' hooks.
+
+## Where it stops
+
+`IMGUIManager::InitializeUI()`, from inside the present hook. It reaches for
+bg3se's extender globals:
+
+    io.ConfigDebugHighlightIdConflicts = gExtender->GetConfig().DeveloperMode;
+    auto configPath = GetStaticSymbols().ToPath("imgui.ini", UserProfile);
+    auto const& language = GetStaticSymbols().GetGlobalSwitches()->Language;
+
+`gExtender` is bg3se's whole extender object and is unresolved here — the link
+allows that deliberately, so it is null and the first line faults.
+`GetGlobalSwitches()` is null too, and that one is not a small gap: it is the
+same object `Ext.Utils.GetGlobalSwitches` refuses over, with no symbol and no
+anchor to fingerprint.
+
+So the question this leaves is a real one, and it is a decision rather than a
+puzzle: **how much of bg3se's extender globals should bg3le stand up in order
+to reuse its UI, against writing bg3le's own overlay over the same imgui?**
+Standing up `gExtender` enough to answer `GetConfig()` is small. `Language`
+needs an object nobody has located. A bg3le overlay would need the widget
+surface written against bg3le's own Lua -- upstream's binding is 70 lines over
+440 lines of widget property maps, and bg3le already re-expands those maps
+into its own field tables, so the widgets are describable by the machinery
+`Ext.Entity` and `Ext.StaticData` already use.
 
 ## What depends on it
 

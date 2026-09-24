@@ -283,12 +283,15 @@ component's declared size with the size the engine recorded, and
   in a 57-mod set known to need it — everything else of MCM's works, and
   5eSpells reads all of its settings through it today. Upstream's
   implementation is already compiled and linked into `libbg3le.so`, imgui and
-  the Vulkan backend with it; what it cannot do is install its hooks, because
-  it wraps seven Vulkan entry points through Detours and
-  `vendor/compat/detours.h` reports failure. bg3le interposes Vulkan calls
-  already, so the fix is to record rather than patch — see
-  [reference/IMGUI-ASSESSMENT.md](reference/IMGUI-ASSESSMENT.md), which also
-  says how the first reading of this got it badly wrong
+  the Vulkan backend with it, and its hooks install now: `BG3LE_IMGUI=1`
+  brings up all seven in bg3se's own order, by interposition rather than by
+  Detours. It stops at `IMGUIManager::InitializeUI`, which reaches for
+  bg3se's extender globals — `gExtender->GetConfig()` and
+  `GetGlobalSwitches()->Language`, the second being the object
+  `Ext.Utils.GetGlobalSwitches` refuses over. Off by default until that is
+  settled; the mechanism, the two mistakes it took to get right and the
+  decision it leaves are in
+  [reference/IMGUI-ASSESSMENT.md](reference/IMGUI-ASSESSMENT.md)
 - **Launching.** See [Running](#running)
 
 ## Building

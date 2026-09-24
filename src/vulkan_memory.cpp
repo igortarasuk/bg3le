@@ -328,8 +328,25 @@ extern "C" PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice dev,
 
 namespace {
 
+// Provided by src/vulkan_forward.cpp in libbg3le.so, for the entry points
+// bg3se's ImGui overlay wraps. Weak because this file is also built into
+// memsteer.so, which has no overlay.
+extern "C" void* bg3le_vulkan_forwarder(char const* name)
+    __attribute__((weak));
+
 PFN_vkVoidFunction diverted(const char* name) {
-    if (name == nullptr || mode() == Mode::Off) return nullptr;
+    if (name == nullptr) return nullptr;
+
+    // The overlay's forwarders first, and not gated on the steering mode:
+    // the two features are independent, and BG3LE_VKMEM=off must not turn
+    // the overlay off with it.
+    if (bg3le_vulkan_forwarder != nullptr) {
+        if (void* fn = bg3le_vulkan_forwarder(name)) {
+            return (PFN_vkVoidFunction)fn;
+        }
+    }
+
+    if (mode() == Mode::Off) return nullptr;
     if (std::strcmp(name, "vkGetPhysicalDeviceMemoryProperties") == 0) {
         return (PFN_vkVoidFunction)vkGetPhysicalDeviceMemoryProperties;
     }
@@ -354,7 +371,13 @@ extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance inst,
                                                     const char* name) {
     static const auto next =
         real<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
-    if (name != nullptr && mode() != Mode::Off
+    // Ours whenever either feature is on: the device-level lookup is how both
+    // the steering and the overlay's forwarders are reached.
+    const bool wanted =
+        mode() != Mode::Off
+        || (bg3le_vulkan_forwarder != nullptr
+            && bg3le_vulkan_forwarder("vkQueuePresentKHR") != nullptr);
+    if (name != nullptr && wanted
         && std::strcmp(name, "vkGetDeviceProcAddr") == 0) {
         return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
     }

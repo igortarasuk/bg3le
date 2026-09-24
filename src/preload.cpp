@@ -39,6 +39,12 @@
 #include "console.h"
 
 namespace bg3le {
+
+// Defined in src/vendor/imgui_overlay.cpp, which needs bg3se headers this
+// file does not include.
+void imgui_overlay_start();
+void imgui_overlay_tick();
+
 namespace {
 
 SymbolTable g_symbols;
@@ -416,6 +422,7 @@ void update_messages_hook(void* self) {
     debug_server_note_story_thread();
     debug_server_pump();
     lua_tick();
+    bg3le::imgui_overlay_tick();
     ensure_achievement_gate_patch();
     if (g_orig_update_messages != nullptr) g_orig_update_messages(self);
 }
@@ -1355,6 +1362,10 @@ __attribute__((constructor)) static void bg3le_init() {
     cleanup_sanity_check();
     // Before main and the fork, so load caches see it.
     bg3le::ensure_achievement_gate_patch();
+
+    // Before the game creates its Vulkan instance, which is what the
+    // overlay's first hook is on. Does nothing unless BG3LE_IMGUI=1.
+    bg3le::imgui_overlay_start();
 
     // Symbol loading is deferred to the first Osiris callback: allocating
     // here runs before the game's allocator exists.
