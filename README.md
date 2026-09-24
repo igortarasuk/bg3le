@@ -79,6 +79,14 @@ component's declared size with the size the engine recorded, and
   same — and only once a mod subscribes, so until then every node keeps the
   engine's own pointers. Engine-side activity reaches it too: a listener on a
   database sees the fact a procedure's own rule inserts
+- **`Ext.Net` crosses between the two contexts.** Upstream's messages ride
+  the game's connection as protobuf because on Windows the two sides may be
+  two machines; single-player is one process either way, and bg3le has both
+  Lua states in it, so a message is queued in the other state and drained on
+  its next tick — which is when a real one would have arrived.
+  `BroadcastMessage`, `PostMessageToClient`, `PostMessageToUser`,
+  `PostMessageToServer` and a `NetChannel`'s `Send`/`Request` all reach the
+  other side, and a request's reply comes back to the caller's callback
 - **`Ext.Debug.GenerateIdeHelpers`** writes the LuaLS annotations upstream
   writes, to the path upstream writes them to: 20,361 `Osi.*` stubs with
   `@param` and `@return` from the story's own signatures, plus the bare global
@@ -210,7 +218,7 @@ component's declared size with the size the engine recorded, and
   needing machinery bg3le does not have raise instead of returning a
   plausible wrong answer: stat writes, functor execution, `Ext.Level`'s
   physics and pathfinding, `Entity.Create`/`Destroy`, the atlas and resource
-  managers, `GlobalSwitches`, and anything that sends over the network.
+  managers and `GlobalSwitches`.
   `reference/ext-api-surface.txt` lists them with their shapes
 - **One session per process.** The story-load work runs once, so loading a
   second save without restarting leaves Osiris bound to the first story's

@@ -70,6 +70,24 @@ std::vector<osi::Function> g_functions;
 // handed them as they are built.
 std::deque<std::vector<const osi::Function*>> g_overloads;
 
+// Runs something in one context and puts the previous one back.
+//
+// Nested use is fine and happens: a client script can be loaded while the
+// server context is the current one.
+class InContext {
+public:
+    explicit InContext(lua_State* want) : was_(g_lua) {
+        if (want != nullptr) g_lua = want;
+    }
+    ~InContext() { g_lua = was_; }
+
+    InContext(InContext const&) = delete;
+    InContext& operator=(InContext const&) = delete;
+
+private:
+    lua_State* was_;
+};
+
 bool to_value(lua_State* L, int idx, osi::Value* out) {
     switch (lua_type(L, idx)) {
         case LUA_TSTRING:
@@ -357,6 +375,89 @@ void osi_helpers_for(osi::Function const& fn, std::string* out) {
         *out += comment;
         *out += defn;
     }
+}
+
+// Ext._Internal.PostToOtherContext(channel, payload, userId) -> true
+//
+// The two Lua contexts are two states in one process, and the tick drives
+// both from the same thread, so a message crosses by being queued in the
+// other state rather than by riding the game's connection. Upstream's
+// messages go over the extender's protobuf channel because on Windows the
+// two contexts may be two machines; single-player is one process either way,
+// and this is the same delivery a mod sees.
+//
+// Queued rather than delivered here. A send happens inside the sender's own
+// tick, and calling the other side's handler from that point would let a
+// reply re-enter the sender mid-call; the other context drains its queue on
+// its next tick, which is when a real message would have arrived.
+// Ext._Internal.HasOtherContext() -> whether there is a second Lua state.
+//
+// A client context only exists once the client side has started, and a mod
+// that sends before then should reach its own listeners rather than nothing.
+int l_has_other_context(lua_State* L) {
+    lua_State* other = (L == g_client_lua) ? g_server_lua : g_client_lua;
+    lua_pushboolean(L, other != nullptr ? 1 : 0);
+    return 1;
+}
+
+int l_post_to_other_context(lua_State* L) {
+    const char* channel = luaL_checkstring(L, 1);
+    std::size_t length = 0;
+    const char* payload = lua_tolstring(L, 2, &length);
+    const auto user = (lua_Integer)luaL_optinteger(L, 3, 1);
+    // Whether this is a NetChannel's own traffic rather than a loose
+    // message. Carried as a flag rather than as a reserved channel name: a
+    // channel name is the mod's to choose and nothing here should claim one.
+    const bool isChannel = lua_toboolean(L, 4) != 0;
+
+    lua_State* other = (L == g_client_lua) ? g_server_lua : g_client_lua;
+    if (other == nullptr) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    InContext there(other);
+
+    lua_getglobal(other, "Ext");
+    if (!lua_istable(other, -1)) {
+        lua_pop(other, 1);
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    lua_getfield(other, -1, "_Internal");
+    lua_remove(other, -2);
+    if (!lua_istable(other, -1)) {
+        lua_pop(other, 1);
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    lua_getfield(other, -1, "QueueNetMessage");
+    lua_remove(other, -2);
+    if (!lua_isfunction(other, -1)) {
+        lua_pop(other, 1);
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    lua_pushstring(other, channel);
+    if (payload != nullptr) {
+        lua_pushlstring(other, payload, length);
+    } else {
+        lua_pushnil(other);
+    }
+    lua_pushinteger(other, user);
+    lua_pushboolean(other, isChannel ? 1 : 0);
+
+    if (lua_pcall(other, 4, 0, 0) != LUA_OK) {
+        logf("lua: queueing a net message on the other context failed: %s",
+             lua_tostring(other, -1));
+        lua_pop(other, 1);
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    lua_pushboolean(L, 1);
+    return 1;
 }
 
 int osi_ide_helpers(lua_State* L) {
@@ -3723,6 +3824,10 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "WorldProbe");
     lua_pushcfunction(g_lua, osi_ide_helpers);
     lua_setfield(g_lua, -2, "OsiIdeHelpers");
+    lua_pushcfunction(g_lua, l_post_to_other_context);
+    lua_setfield(g_lua, -2, "PostToOtherContext");
+    lua_pushcfunction(g_lua, l_has_other_context);
+    lua_setfield(g_lua, -2, "HasOtherContext");
     lua_pushcfunction(g_lua, osi_story_lookup);
     lua_setfield(g_lua, -2, "StoryFunction");
     lua_pushcfunction(g_lua, l_is_client_state);
@@ -4062,6 +4167,26 @@ void build_state(bool client) {
 -- _D(GetHostCharacter()) yields "<uuid>" while _P yields <uuid>.
 Ext.Json = Ext.Json or {}
 
+-- A JSON string literal.
+--
+-- string.format("%q") escapes for Lua, not for JSON: a control character
+-- comes out as \1 rather than \u0001, which no JSON parser accepts -- ours
+-- included, which is how this was found. A payload carrying one round-tripped
+-- as a parse failure and the message was dropped.
+local JSON_ESCAPES = {
+  ['"'] = '\\"', ['\\'] = '\\\\', ['\b'] = '\\b', ['\f'] = '\\f',
+  ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t',
+}
+
+local function json_string(v)
+  local escaped = v:gsub('[%z\1-\31"\\]', function(c)
+    local simple = JSON_ESCAPES[c]
+    if simple ~= nil then return simple end
+    return string.format('\\u%04x', c:byte())
+  end)
+  return '"' .. escaped .. '"'
+end
+
 local function encode(v, indent, depth, opts, seen, out)
   local t = type(v)
   if v == nil then out[#out+1] = "null"
@@ -4086,7 +4211,7 @@ local function encode(v, indent, depth, opts, seen, out)
       out[#out+1] = text
     end
   elseif t == "string" then
-    out[#out+1] = string.format("%q", v):gsub("\\\n", "\\n")
+    out[#out+1] = json_string(v)
   elseif t ~= "table" then
     out[#out+1] = string.format("%q", tostring(v))
   else
@@ -4854,14 +4979,23 @@ end
 
 -- ---- Ext.Net ----
 --
--- bg3le runs server-side and is always the host; there is no second
--- process to talk to. The extender's own network channel is a protobuf
--- message riding the game's connection, which bg3le does not implement, so
--- the sending half refuses rather than dropping messages silently.
+-- Upstream's messages ride the game's connection as protobuf, because on
+-- Windows the two contexts may be two machines. Single-player is one
+-- process either way, and bg3le runs both Lua states in it, so a message
+-- crosses by being queued in the other state -- see
+-- Ext._Internal.PostToOtherContext. What a mod sees is the same: it sends
+-- from one side and the handler runs on the other, a tick later.
+--
+-- bg3le is always the host, so there is exactly one peer and it is user 1.
 Ext.Net = {}
 
 local net_listeners = {}
 local warned_net_listener = {}
+
+-- Messages that arrived from the other context, drained on the next tick.
+local net_inbox = {}
+
+local kHostUserId = 1
 
 function Ext.Net.IsHost() return true end
 
@@ -4872,14 +5006,79 @@ function Ext.Net.PlayerHasExtender(_)
   return true
 end
 
-local function no_network(name)
-  error("bg3le: Ext.Net." .. name .. " needs the extender's network "
-        .. "channel, which is not implemented; nothing was sent", 2)
+-- Called in the *receiving* context, from the sender's C++ side.
+function Ext._Internal.QueueNetMessage(channel, payload, userId, isChannel)
+  net_inbox[#net_inbox + 1] = {channel, payload, userId or kHostUserId,
+                               isChannel == true}
 end
 
-function Ext.Net.BroadcastMessage() no_network("BroadcastMessage") end
-function Ext.Net.PostMessageToClient() no_network("PostMessageToClient") end
-function Ext.Net.PostMessageToUser() no_network("PostMessageToUser") end
+-- Drained by the tick, before timers, so a message posted on one tick is
+-- handled on the next rather than whenever a handler happens to run.
+function Ext._Internal.DrainNetMessages()
+  if #net_inbox == 0 then return end
+
+  -- Taken whole first: a handler may send, and that must land on the next
+  -- drain rather than extend this one.
+  local batch = net_inbox
+  net_inbox = {}
+
+  for _, message in ipairs(batch) do
+    local channel, payload, user = message[1], message[2], message[3]
+    if message[4] then
+      local ok, wrapper = pcall(Ext.Json.Parse, payload)
+      if ok and type(wrapper) == "table" then
+        Ext._Internal.DeliverChannel(wrapper.Key, wrapper.Payload, user,
+                                     wrapper.RequestId, wrapper.IsResponse)
+      else
+        Ext.Log.PrintError("bg3le: a net channel message did not parse: "
+                           .. tostring(wrapper))
+      end
+    else
+      Ext._Internal.FireNetMessage(channel, payload, user)
+      local event = Ext.Events.NetMessage
+      if event ~= nil and event.Throw ~= nil then
+        event:Throw({Channel = channel, Payload = payload, UserID = user,
+                     RequestId = nil})
+      end
+    end
+  end
+end
+
+local function post_across(name, channel, payload, userId)
+  if type(channel) ~= "string" then
+    error("Ext.Net." .. name .. " takes a channel name", 3)
+  end
+  -- Upstream serialises a table; a string goes as it is.
+  if type(payload) == "table" then payload = Ext.Json.Stringify(payload) end
+  if payload ~= nil and type(payload) ~= "string" then
+    payload = tostring(payload)
+  end
+
+  if not Ext._Internal.PostToOtherContext(channel, payload,
+                                          userId or kHostUserId) then
+    -- One context and nowhere to send is not an error: a mod that talks to
+    -- itself over a channel still works, which is what the local listeners
+    -- are for.
+    Ext._Internal.FireNetMessage(channel, payload, userId or kHostUserId)
+  end
+  return true
+end
+
+function Ext.Net.BroadcastMessage(channel, payload)
+  return post_across("BroadcastMessage", channel, payload, kHostUserId)
+end
+
+function Ext.Net.PostMessageToClient(_, channel, payload)
+  return post_across("PostMessageToClient", channel, payload, kHostUserId)
+end
+
+function Ext.Net.PostMessageToUser(userId, channel, payload)
+  return post_across("PostMessageToUser", channel, payload, userId)
+end
+
+function Ext.Net.PostMessageToServer(channel, payload)
+  return post_across("PostMessageToServer", channel, payload, kHostUserId)
+end
 
 -- ---- net channels ----
 --
@@ -4900,24 +5099,81 @@ NetChannel.__index = NetChannel
 -- The host is user 1, the only peer there is.
 local kHostUser = 1
 
-local function channel_deliver(self, payload, user)
+-- A channel's traffic rides the same crossing the loose messages do, marked
+-- as a channel message rather than under a reserved channel name, and
+-- carrying the module, the channel and -- for a request -- the id the reply
+-- comes back under.
+local next_request_id = 0
+local pending_requests = {}
+
+local function channel_key(self)
+  return self.Module .. "/" .. self.Channel
+end
+
+local function channel_post(self, payload, user, requestId, response)
+  Ext._Internal.PostToOtherContext(
+    self.Channel,
+    Ext.Json.Stringify({
+      Key = channel_key(self),
+      Payload = payload,
+      RequestId = requestId,
+      IsResponse = response == true,
+    }),
+    user or kHostUser, true)
+end
+
+-- One context and nowhere to send: a mod that talks to itself over a
+-- channel still works, which is what this falls back to.
+local function channel_local(self, payload, user, requestId, response)
   Ext.OnNextTick(function()
-    if self.Handler == nil then return end
-    local ok, err = pcall(self.Handler, payload, user or kHostUser)
-    if not ok then
-      Ext.Log.PrintError(string.format(
-        "bg3le: handler for net channel %s failed: %s", self.Channel,
-        tostring(err)))
-    end
+    Ext._Internal.DeliverChannel(channel_key(self), payload,
+                                 user or kHostUser, requestId, response)
   end)
 end
 
+local function channel_send(self, payload, user)
+  if not Ext._Internal.HasOtherContext() then
+    return channel_local(self, payload, user, nil, false)
+  end
+  channel_post(self, payload, user, nil, false)
+end
+
 local function channel_request(self, payload, user, callback)
-  Ext.OnNextTick(function()
+  next_request_id = next_request_id + 1
+  local id = next_request_id
+  if callback ~= nil then pending_requests[id] = callback end
+
+  if not Ext._Internal.HasOtherContext() then
+    return channel_local(self, payload, user, id, false)
+  end
+  channel_post(self, payload, user, id, false)
+end
+
+-- Delivered in the receiving context: a message runs the handler, a request
+-- runs the request handler and posts the answer back under the same id, and
+-- a response completes the caller's callback.
+function Ext._Internal.DeliverChannel(key, payload, user, requestId,
+                                      isResponse)
+  if isResponse then
+    local callback = pending_requests[requestId]
+    pending_requests[requestId] = nil
+    if callback ~= nil then
+      local ok, err = pcall(callback, payload)
+      if not ok then
+        Ext.Log.PrintError("bg3le: net channel reply failed: "
+                           .. tostring(err))
+      end
+    end
+    return
+  end
+
+  local self = net_channels[key]
+  if self == nil then return end
+
+  if requestId ~= nil then
     local response = nil
     if self.RequestHandler ~= nil then
-      local ok, result = pcall(self.RequestHandler, payload,
-                               user or kHostUser)
+      local ok, result = pcall(self.RequestHandler, payload, user)
       if ok then
         response = result
       else
@@ -4926,22 +5182,37 @@ local function channel_request(self, payload, user, callback)
           self.Channel, tostring(result)))
       end
     end
-    if callback ~= nil then callback(response) end
-  end)
+    if Ext._Internal.HasOtherContext() then
+      channel_post(self, response, user, requestId, true)
+    else
+      Ext.OnNextTick(function()
+        Ext._Internal.DeliverChannel(key, response, user, requestId, true)
+      end)
+    end
+    return
+  end
+
+  if self.Handler == nil then return end
+  local ok, err = pcall(self.Handler, payload, user)
+  if not ok then
+    Ext.Log.PrintError(string.format(
+      "bg3le: handler for net channel %s failed: %s", self.Channel,
+      tostring(err)))
+  end
 end
 
 function NetChannel:SetHandler(handler) self.Handler = handler end
 function NetChannel:SetRequestHandler(handler) self.RequestHandler = handler end
 
-function NetChannel:Broadcast(payload) channel_deliver(self, payload, nil) end
-function NetChannel:SendToServer(payload) channel_deliver(self, payload, nil) end
+function NetChannel:Broadcast(payload) channel_send(self, payload, nil) end
+function NetChannel:SendToServer(payload) channel_send(self, payload, nil) end
 
 function NetChannel:SendToClient(payload, user)
-  channel_deliver(self, payload, user)
+  channel_send(self, payload, user)
 end
 
 function NetChannel:SendToUser(payload, user)
-  channel_deliver(self, payload, user)
+  channel_send(self, payload, user)
 end
 
 function NetChannel:RequestToServer(payload, callback)
@@ -5498,6 +5769,10 @@ end
 local last_tick = nil
 
 function Ext._Internal.RunTimers()
+  -- Anything the other context sent since the last tick, first: a message is
+  -- what a timer or a handler this tick may be waiting on.
+  Ext._Internal.DrainNetMessages()
+
   local now = Ext.Utils.MonotonicTime() / 1000.0
   local delta = last_tick ~= nil and (now - last_tick) or 0.0
   last_tick = now
@@ -7880,23 +8155,6 @@ void call_internal(const char* name) {
 
 void lua_set_symbols(const SymbolTable* symbols) { g_symbols = symbols; }
 
-// Runs something in one context and puts the previous one back.
-//
-// Nested use is fine and happens: a client script can be loaded while the
-// server context is the current one.
-class InContext {
-public:
-    explicit InContext(lua_State* want) : was_(g_lua) {
-        if (want != nullptr) g_lua = want;
-    }
-    ~InContext() { g_lua = was_; }
-
-    InContext(InContext const&) = delete;
-    InContext& operator=(InContext const&) = delete;
-
-private:
-    lua_State* was_;
-};
 
 void lua_tick() {
     {
