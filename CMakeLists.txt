@@ -291,6 +291,26 @@ add_executable(symdump tools/symdump.cpp src/elf_symbols.cpp src/log.cpp)
 # reader rather than reimplementing LSPK in a script.
 # Greps another process memory, for questions that have to be answered
 # with the shim absent.
+# ---------------------------------------------------------------------------
+# memsteer: the Vulkan memory steering on its own, for other native games.
+#
+# The same src/vulkan_memory.cpp bg3le links, against a stderr log instead of
+# the extender's. One implementation deliberately: the reason to extract it was
+# to point the same steering at another game, not to keep a second copy of it.
+#
+#     env MEMSTEER=on LD_PRELOAD=/path/to/memsteer.so ./the-game
+#
+# See MEMSTEER.md.
+# ---------------------------------------------------------------------------
+add_library(memsteer SHARED src/vulkan_memory.cpp src/memsteer_log.cpp)
+set_target_properties(memsteer PROPERTIES PREFIX "" POSITION_INDEPENDENT_CODE ON)
+target_include_directories(memsteer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# The loader is linked, not only dlopen'd: without it nothing has pulled
+# libvulkan in when the engine asks for its first proc address, dlsym's
+# RTLD_NEXT misses, and every pointer handed back is null. The game then
+# crashes in its own code with nothing of ours on the stack.
+target_link_libraries(memsteer PRIVATE dl vulkan)
+
 add_executable(memgrep tools/memgrep.c)
 # A C program, so the global -stdlib=libc++ has nothing to act on and clang
 # says so. The flag is added for every target above; dropping it here is

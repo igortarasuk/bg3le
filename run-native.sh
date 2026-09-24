@@ -90,7 +90,11 @@ fi
 # while the same game under Proton runs with every thread on 0-15 because
 # Wine does not pass the affinity requests through -- and that build keeps the
 # gpu at 80% busy where the native one manages 38%.
-preload="$HERE/build/libbg3le.so"
+# BG3LE_PRELOAD replaces the extender in the preload list rather than adding
+# to it, which is how memsteer.so is tested against a real game: it is built
+# from the same src/vulkan_memory.cpp, so running both would have two copies
+# of the same interposition in one process.
+preload="${BG3LE_PRELOAD:-$HERE/build/libbg3le.so}"
 if [ -n "${BG3LE_EXTRA_PRELOAD:-}" ]; then
     preload="$preload:$BG3LE_EXTRA_PRELOAD"
 fi

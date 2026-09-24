@@ -22,8 +22,11 @@
 // This is conditional on purpose. On a desktop with a real x16 link, writes
 // into that heap are fast and steering away from it would throw away a
 // genuine optimisation, so the decision is made by measuring the hardware
-// rather than by assuming. BG3LE_VKMEM=off disables it, =on forces it, and
-// the default measures.
+// rather than by assuming. MEMSTEER=off disables it, =on forces it, and the
+// default measures; BG3LE_VKMEM is accepted under bg3le for the same three.
+//
+// Built twice from this one file: into libbg3le.so, and into memsteer.so for
+// any other native Vulkan game on the same hardware. See MEMSTEER.md.
 //
 // The hook is on vkGetInstanceProcAddr and vkGetDeviceProcAddr rather than on
 // the entry points themselves: a Vulkan application asks the loader for
@@ -46,20 +49,62 @@ using bg3le::logf;
 
 enum class Mode { Measure, Force, Off };
 
+// Two names for one switch. MEMSTEER is what the standalone tool reads --
+// this file is built twice, once into libbg3le.so and once into memsteer.so
+// for other native Vulkan games -- and BG3LE_VKMEM is the name bg3le's own
+// documentation uses. Whichever is set wins; MEMSTEER first, so a launcher
+// wrapping several games can set one variable.
+char const* const kSwitchNames[] = {"MEMSTEER", "BG3LE_VKMEM"};
+
 Mode mode() {
     static const Mode m = [] {
-        const char* opt = std::getenv("BG3LE_VKMEM");
-        if (opt == nullptr) return Mode::Measure;
-        if (std::strcmp(opt, "off") == 0) return Mode::Off;
-        if (std::strcmp(opt, "on") == 0) return Mode::Force;
+        for (char const* name : kSwitchNames) {
+            const char* opt = std::getenv(name);
+            if (opt == nullptr) continue;
+            if (std::strcmp(opt, "off") == 0) return Mode::Off;
+            if (std::strcmp(opt, "on") == 0) return Mode::Force;
+            return Mode::Measure;
+        }
         return Mode::Measure;
     }();
     return m;
 }
 
+// The loader's own function, past ours.
+//
+// RTLD_NEXT alone is not enough, and the failure is silent and expensive:
+// if the Vulkan loader is not loaded yet when the first proc address is
+// asked for, dlsym returns null, and then *every* proc address this hands
+// back is null -- the application takes the crash in its own code with no
+// frame of ours on the stack. Exactly that happened to memsteer.so, which
+// unlike libbg3le.so does not link the loader, so nothing had pulled it in
+// when the engine made its first call.
+//
+// So the loader is asked for directly when RTLD_NEXT misses. NOLOAD first,
+// because if it is already mapped that is the copy the application is using;
+// a plain dlopen only as a last resort.
+void* loader() {
+    static void* handle = [] () -> void* {
+        void* h = ::dlopen("libvulkan.so.1", RTLD_LAZY | RTLD_NOLOAD);
+        if (h == nullptr) h = ::dlopen("libvulkan.so.1", RTLD_LAZY);
+        if (h == nullptr) h = ::dlopen("libvulkan.so", RTLD_LAZY);
+        return h;
+    }();
+    return handle;
+}
+
 template <typename Fn>
 Fn real(const char* name) {
-    return reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, name));
+    if (void* next = ::dlsym(RTLD_NEXT, name)) {
+        return reinterpret_cast<Fn>(next);
+    }
+    if (void* h = loader()) {
+        if (void* found = ::dlsym(h, name)) {
+            return reinterpret_cast<Fn>(found);
+        }
+    }
+    logf("could not find %s in the Vulkan loader; leaving memory alone", name);
+    return nullptr;
 }
 
 double now_s() {
@@ -198,11 +243,11 @@ bool should_steer(VkPhysicalDevice phys,
 
     switch (mode()) {
         case Mode::Off:
-            logf("vkmem: disabled by BG3LE_VKMEM=off");
+            logf("disabled by MEMSTEER=off");
             steering = false;
             break;
         case Mode::Force:
-            logf("vkmem: forced on by BG3LE_VKMEM=on");
+            logf("forced on by MEMSTEER=on");
             steering = true;
             break;
         case Mode::Measure:
