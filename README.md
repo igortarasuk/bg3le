@@ -126,6 +126,21 @@ component's declared size with the size the engine recorded, and
   search runs backwards: what points at the manager, what points at that,
   until something in the executable's own writable data does. Story-load
   work went from 30.3s to 0.07s
+- **`Ext.IMGUI` draws and its callbacks fire**, which is Mod Configuration
+  Menu's menu and the only thing in a 57-mod set known to need it. Upstream's
+  own widget tree is compiled into `libbg3le.so`, imgui and its Vulkan
+  backend with it, and `BG3LE_IMGUI=1` brings up the seven Vulkan hooks by
+  interposition rather than by Detours. All thirty `Add*` kinds, the window
+  setters, the style and colour accessors and the per-type methods are bound;
+  properties read and write through the same field machinery a component
+  does; and `OnClick`, `OnChange` and the rest arrive in Lua with their
+  arguments, delivered on the tick of the context that registered them
+  because a widget fires on a thread that must not touch a Lua state. Fonts
+  come out of the game's own archives, since the engine's file reader cannot
+  be called by name here. Off by default: the present hook does real Vulkan
+  work every frame, and the default is to leave the engine's rendering
+  exactly as it was. See
+  [reference/IMGUI-ASSESSMENT.md](reference/IMGUI-ASSESSMENT.md)
 - **A line on the main menu**, as upstream has: the localisation string is
   patched from the game's own heap the moment it appears, before the
   interface resolves it into its own copy
@@ -282,7 +297,8 @@ component's declared size with the size the engine recorded, and
   kind the field machinery reaches last. See
   [reference/REFERENCE-DIFFS.md](reference/REFERENCE-DIFFS.md)
 - **The last 4% of the field kinds.** 3,426 of 3,558 fields convert
-  (96.3%, from `tools/meta-check.c`; it was 94.0% before `STDString` was
+  (96.3%, from `tools/meta-check.c`; `std::optional` became writable as well
+  as readable when `Ext.IMGUI` needed it, and it was 94.0% before `STDString` was
   given this build's sixteen-byte layout): scalars, enums and bitmasks, nested
   structs, fixed and dynamic arrays, hash sets, hash maps, glm vectors,
   `std::optional`, `std::variant` and `FixedString`. What is left is mostly
@@ -294,19 +310,6 @@ component's declared size with the size the engine recorded, and
   so `src/vendor/noesis_rtti_linux.cpp` aliases 19 of them to one real
   placeholder type. That is safe only while no Noesis `dynamic_cast` runs. The
   real fix is keeping Noesis types out of the generated property maps
-- **`Ext.IMGUI`**, which is Mod Configuration Menu's menu and the only thing
-  in a 57-mod set known to need it — everything else of MCM's works, and
-  5eSpells reads all of its settings through it today. Upstream's
-  implementation is already compiled and linked into `libbg3le.so`, imgui and
-  the Vulkan backend with it, and its hooks install now: `BG3LE_IMGUI=1`
-  brings up all seven in bg3se's own order, by interposition rather than by
-  Detours. It stops at `IMGUIManager::InitializeUI`, which reaches for
-  bg3se's extender globals — `gExtender->GetConfig()` and
-  `GetGlobalSwitches()->Language`, the second being the object
-  `Ext.Utils.GetGlobalSwitches` refuses over. Off by default until that is
-  settled; the mechanism, the two mistakes it took to get right and the
-  decision it leaves are in
-  [reference/IMGUI-ASSESSMENT.md](reference/IMGUI-ASSESSMENT.md)
 - **Launching.** See [Running](#running)
 
 ## Building
