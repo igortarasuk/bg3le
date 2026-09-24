@@ -6621,16 +6621,16 @@ local function read_functor(address, class)
     if value == "<unsupported>" then
       local condition = Ext._Internal.ObjectCondition(address, class, field)
       if condition ~= nil then
-        out[field] = condition
+        Ext._Internal.AmendObject(out, field, condition)
       else
         local pooled, code, refCount =
           Ext._Internal.ObjectExpression(address, class, field)
         if pooled ~= nil then
           local expression = Ext._Internal.ReadObject(
             pooled, "StatsExpressionPooled", "", {})
-          expression.Code = code
-          expression.RefCount = refCount
-          out[field] = expression
+          Ext._Internal.AmendObject(expression, "Code", code)
+          Ext._Internal.AmendObject(expression, "RefCount", refCount)
+          Ext._Internal.AmendObject(out, field, expression)
         end
       end
     end
@@ -6888,8 +6888,10 @@ local STAT_METHODS = {
         .. "to the object the engine reads. What upstream's Sync also does, "
         .. "rebuilding the spell and status prototypes from the stats, needs "
         .. "RPGStats::SyncWithPrototypeManager, which has no symbol on this "
-        .. "build; an attribute the engine has already compiled into a "
-        .. "prototype will not change until it rebuilds one")
+        .. "build. An attribute the engine has already compiled into a "
+        .. "prototype can still be changed: Ext.Stats.GetCachedSpell and its "
+        .. "siblings resolve the compiled form and its fields are writable, "
+        .. "so name the prototype field rather than waiting for a rebuild")
     end
     return true
   end,
@@ -7225,12 +7227,36 @@ function read_object(addr, class, prefix, out)
     -- which marks an array that may be a set: a field view is not one, and
     -- Ext.Types.Unserialize has to be able to tell the two apart.
     __bg3leObject = {addr = addr, class = class, path = prefix},
+    -- The snapshot itself, so bg3le's own decoding can amend it. Assigning
+    -- a field writes to the engine now, which is right for a mod and wrong
+    -- for the code that fills in what a raw read could not decode: a
+    -- StatsExpressionRef's Code and RefCount are not fields of anything.
+    __bg3leValues = values,
   })
+end
+
+-- Amends a snapshot without writing to the engine.
+--
+-- Assigning a field on a view goes to the engine, which is what a mod wants
+-- and the opposite of what bg3le's own decoding wants: read_functor fills in
+-- a condition and a pooled expression's Code and RefCount, none of which are
+-- fields of the object they are filed under, and read_template adds the
+-- engine's own name for a template. Those belong in the snapshot only.
+local function amend_object(view, key, value)
+  local meta = getmetatable(view)
+  local values = meta ~= nil and meta.__bg3leValues or nil
+  if values == nil then
+    view[key] = value
+    return view
+  end
+  values[key] = value
+  return view
 end
 
 -- Published so the stats code can reach it. The prelude is compiled in more
 -- than one chunk, so a local here is not in scope there.
 Ext._Internal.ReadObject = read_object
+Ext._Internal.AmendObject = amend_object
 
 Ext.StaticData = {}
 
@@ -8079,8 +8105,9 @@ local function read_template(id)
 
   local class = TEMPLATE_CLASS[engineType] or "GameObjectTemplate"
   local out = Ext._Internal.ReadObject(address, class, "", {})
-  -- What the engine calls it, which is not a field on the object.
-  out.TemplateType = engineType
+  -- What the engine calls it, which is not a field on the object, so it goes
+  -- into the snapshot rather than at the engine.
+  Ext._Internal.AmendObject(out, "TemplateType", engineType)
   return out
 end
 

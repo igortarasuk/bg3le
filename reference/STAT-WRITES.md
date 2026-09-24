@@ -159,3 +159,25 @@ the spell and status prototypes, needs
 `RPGStats::SyncWithPrototypeManager`, which also has no symbol. Raising
 would be worse than saying so, because a mod that writes an attribute and
 then syncs would lose the write it had already made.
+
+## The prototypes are writable directly
+
+The rebuild has no symbol, but the thing it would rebuild is reachable.
+`Ext.Stats.GetCachedSpell(name)` and its three siblings resolve the engine's
+*compiled* form of a stat, and since a reflected object writes through, a
+field of one can be assigned:
+
+    local p = Ext.Stats.GetCachedSpell("Projectile_MagicMissile")
+    p.Level = 4        -- reads back as 4 through a fresh GetCachedSpell
+
+Verified on a live prototype: 57 fields, `Level` written and read back and
+put back. So an attribute the engine has already compiled can be changed
+after all — not by syncing the stat, but by writing the prototype the stat
+was compiled into.
+
+What is *not* offered is a Sync that does that for you. The correspondence
+between a stat's attribute names and a prototype's fields is not
+one-for-one — a spell stat carries names the prototype does not have and the
+prototype holds parsed forms of several at once — and guessing at it would
+write plausible values into the wrong fields. Naming the prototype field is
+the honest interface until the mapping is established from data.
