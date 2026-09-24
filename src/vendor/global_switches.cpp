@@ -40,6 +40,7 @@
 #include <cstdio>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "../component_meta_abi.h"
@@ -96,6 +97,7 @@ struct Offsets {
     std::uint32_t Language{0};
     std::vector<BoolField> Bools;
     std::vector<BoolField> Floats;
+    std::vector<BoolField> Strings;
 };
 
 // Where `Language` sits and where every boolean does, from bg3le's own field
@@ -123,7 +125,8 @@ Offsets declared() {
     for (std::size_t i = 0; i < count; ++i) {
         const bool isBool = kinds[i] == (std::uint8_t)FieldKind::Bool;
         const bool isFloat = kinds[i] == (std::uint8_t)FieldKind::Float;
-        if (!isBool && !isFloat) continue;
+        const bool isString = kinds[i] == (std::uint8_t)FieldKind::LSString;
+        if (!isBool && !isFloat && !isString) continue;
 
         std::uint32_t offset = 0;
         if (!bg3le_meta_field(meta, names[i], &offset, &size, &kind, &elemKind,
@@ -132,19 +135,109 @@ Offsets declared() {
         }
         if (isBool) {
             out.Bools.push_back(BoolField{names[i], offset});
-        } else {
+        } else if (isFloat) {
             out.Floats.push_back(BoolField{names[i], offset});
+        } else if (offset != out.Language) {
+            // Language is the anchor; it agrees by construction and would
+            // only inflate the score.
+            out.Strings.push_back(BoolField{names[i], offset});
         }
     }
 
     // Enough of each for the test to mean something.
-    out.Ok = out.Bools.size() >= 20 && out.Floats.size() >= 10;
+    out.Ok = out.Bools.size() >= 20 && out.Floats.size() >= 10
+             && out.Strings.size() >= 3;
     if (!out.Ok) {
-        logf("global switches: %zu boolean and %zu float members found; not "
-             "enough to identify the object safely", out.Bools.size(),
-             out.Floats.size());
+        logf("global switches: %zu boolean, %zu float and %zu string members "
+             "found; not enough to identify the object safely",
+             out.Bools.size(), out.Floats.size(), out.Strings.size());
     }
     return out;
+}
+
+// Whether sixteen bytes are one of Larian's strings.
+//
+// This is the test with real weight, and it took the four-break "solution"
+// below to see why. A boolean is one bit: ninety-one of them leave a search
+// enough freedom to fit almost anything, and adding shifts to the fit makes
+// that worse rather than better. A float is thirty-two bits, of which most
+// patterns are NaN or astronomical. A string is a hundred and twenty-eight
+// bits with a length that has to agree with its own contents, and
+// GlobalSwitches declares seven of them within a few hundred bytes of the
+// anchor.
+//
+// Inline: the top bit of the last byte is clear, that byte is the length,
+// and everything from the length to the terminator is zero. On the heap: the
+// top bit is set, and there is a readable pointer with a size no larger than
+// its capacity and a terminator where the size says.
+//
+// See vendor/bg3se/CoreLib/Base/LSString.h for the layout itself.
+bool looks_like_string(void const* at, bool requireContent = false) {
+    unsigned char bytes[16] = {};
+    if (!safe_read(at, bytes, sizeof(bytes))) return false;
+
+    if ((bytes[15] & 0x80) == 0) {
+        const unsigned length = bytes[15];
+        if (length > 15) return false;
+
+        // An empty string is sixteen zero bytes, and a settings object is
+        // full of those -- the first version of this counted 77 "strings"
+        // in a kilobyte for exactly that reason. Valid, but not evidence.
+        if (requireContent && length == 0) return false;
+        for (unsigned i = length; i < 15; ++i) {
+            if (bytes[i] != 0) return false;
+        }
+        // These are all ASCII settings -- a language, a path, a URL, a
+        // secret -- so a byte outside it says this is not one of them.
+        for (unsigned i = 0; i < length; ++i) {
+            if (bytes[i] < 0x20 || bytes[i] > 0x7e) return false;
+        }
+        return true;
+    }
+
+    void const* buffer = nullptr;
+    std::uint32_t size = 0;
+    std::uint32_t capacity = 0;
+    std::memcpy(&buffer, bytes, sizeof(buffer));
+    std::memcpy(&size, bytes + 8, sizeof(size));
+    std::memcpy(&capacity, bytes + 12, sizeof(capacity));
+    capacity &= 0x7fffffffu;
+
+    if (buffer == nullptr) return false;
+    if (((std::uintptr_t)buffer & 0x7) != 0) return false;
+    if (size > capacity || capacity == 0 || capacity > (1u << 24)) return false;
+
+    // The terminator has to be where the size says it is, which is what
+    // makes this hard to pass by accident.
+    char terminator = 1;
+    if (!safe_read((char const*)buffer + size, &terminator, 1)) return false;
+    return terminator == '\0';
+}
+
+// Whether every declared string member reads as one, and how many of them
+// carry content.
+//
+// The count matters because an empty string is sixteen zero bytes and passes
+// for free: bg3se's property map exposes only four of GlobalSwitches'
+// strings, so if three of them are empty on this install the test is worth
+// one string, not four.
+bool strings_agree(void const* base, Offsets const& at,
+                   std::vector<BoolField>* disagreed = nullptr,
+                   std::size_t* withContent = nullptr) {
+    bool all = true;
+    if (withContent != nullptr) *withContent = 0;
+    for (BoolField const& field : at.Strings) {
+        void const* address = (char const*)base + field.Offset;
+        if (!looks_like_string(address)) {
+            all = false;
+            if (disagreed != nullptr) disagreed->push_back(field);
+            continue;
+        }
+        if (withContent != nullptr && looks_like_string(address, true)) {
+            ++*withContent;
+        }
+    }
+    return all;
 }
 
 // Whether every declared float reads as a settings value.
@@ -261,6 +354,12 @@ std::vector<BoolField> disagreements(void const* base, Offsets const& at,
             bad.push_back(field);
         }
     }
+    for (BoolField const& field : at.Strings) {
+        if (!looks_like_string((char const*)base
+                               + adjusted(field.Offset, breaks))) {
+            bad.push_back(field);
+        }
+    }
     std::sort(bad.begin(), bad.end(),
               [](BoolField const& a, BoolField const& b) {
                   return a.Offset < b.Offset;
@@ -281,6 +380,15 @@ std::size_t agreeing_from(void const* base, Offsets const& at,
         if (field.Offset < pivot) continue;
         if (float_agrees(base, adjusted(field.Offset, breaks))) ++agreed;
     }
+    // A string is worth far more than a boolean, and counting it as one
+    // vote among ninety-one is what let the six-break fit win.
+    for (BoolField const& field : at.Strings) {
+        if (field.Offset < pivot) continue;
+        if (looks_like_string((char const*)base
+                              + adjusted(field.Offset, breaks))) {
+            agreed += 16;
+        }
+    }
     return agreed;
 }
 
@@ -291,6 +399,9 @@ std::size_t members_from(Offsets const& at, std::uint32_t pivot) {
     }
     for (BoolField const& field : at.Floats) {
         if (field.Offset >= pivot) ++total;
+    }
+    for (BoolField const& field : at.Strings) {
+        if (field.Offset >= pivot) total += 16;
     }
     return total;
 }
@@ -304,7 +415,19 @@ bool solve_layout(void const* base, Offsets const& at,
                   std::vector<Break>* breaks) {
     constexpr int kRange = 128;
     constexpr int kStep = 4;
-    constexpr std::size_t kMaxBreaks = 6;
+
+    // One break, not six.
+    //
+    // Six was tried and it "solved" -- four breaks of +36, +4, -116 and -84,
+    // after which all ninety-one booleans and all ten floats agreed. That is
+    // a curve fit, not a struct: each break gives the search sixty-four free
+    // values, and a boolean check is one bit. Two negative shifts of eighty
+    // bytes and more are not what a member changing size looks like.
+    //
+    // One break is a claim that can be wrong: a single member before the
+    // pivot has a different size on this build, everything after it moved by
+    // that much, and nothing else changed.
+    constexpr std::size_t kMaxBreaks = 1;
 
     breaks->clear();
     for (std::size_t round = 0; round < kMaxBreaks; ++round) {
@@ -359,6 +482,8 @@ void* search() {
     void const* bestAt = nullptr;
     char const* bestLanguage = nullptr;
 
+
+
     char line[512];
     while (std::fgets(line, sizeof(line), maps) != nullptr) {
         unsigned long long from = 0;
@@ -411,7 +536,12 @@ void* search() {
     //
     // Every candidate is scored and the best one wins rather than the first to
     // pass, so a near miss cannot beat the real object.
-    if (best == at.Bools.size() && best > 0) {
+    // Every other declared string has to read as one before anything is
+    // accepted. Scoring is left to the booleans so that a near miss is still
+    // reported -- gating the score on the strings left nothing to diagnose.
+    const bool stringsOk = bestAt != nullptr && strings_agree(bestAt, at);
+
+    if (best == at.Bools.size() && best > 0 && stringsOk) {
         found = const_cast<void*>(bestAt);
         logf("global switches: at %p, language \"%s\" -- %zu of %zu declared "
              "booleans read 0 or 1 (%zu language strings seen)",
@@ -435,6 +565,32 @@ void* search() {
              "0 or 1",
              hits, bestAt, bestLanguage != nullptr ? bestLanguage : "?", best,
              at.Bools.size());
+
+        if (bestAt != nullptr) {
+            std::vector<BoolField> badStrings;
+            std::size_t withContent = 0;
+            const bool ok =
+                strings_agree(bestAt, at, &badStrings, &withContent);
+            logf("global switches: %zu of %zu declared strings read as one "
+                 "(%zu of them non-empty, which is what counts)%s",
+                 at.Strings.size() - badStrings.size(), at.Strings.size(),
+                 withContent, ok ? "" : " --");
+
+            std::string declared;
+            for (BoolField const& field : at.Strings) {
+                char piece[24] = {};
+                std::snprintf(piece, sizeof(piece), "%s+%d",
+                              declared.empty() ? "" : " ",
+                              (int)field.Offset - (int)at.Language);
+                declared += piece;
+            }
+            logf("global switches:   bg3se puts them at %s from Language",
+                 declared.c_str());
+            for (BoolField const& field : badStrings) {
+                logf("global switches:   +%-5u %s is not a string here",
+                     field.Offset, field.Name != nullptr ? field.Name : "?");
+            }
+        }
 
         // Which ones disagreed, and where. A run of failures above one
         // offset says a member before it has a different size on this build

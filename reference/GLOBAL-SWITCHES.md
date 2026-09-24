@@ -75,6 +75,77 @@ noise. Establishing what, the way `STDString` and `Module` were established,
 is the way in — and it would want a live dump of the bytes around a confirmed
 base, which needs a confirmed base first.
 
+## Solving for the drift, and why the answer was rejected
+
+Written 2026-09-24. The disagreements starting consistently at +208 looked
+like a member before that point having a different size on this build, with
+everything after it shifted by a constant. That is a solvable shape, so
+`solve_layout` was written to solve it: take the lowest offset that
+disagrees, try shifting every offset from there up by a constant, keep the
+shift that agrees best, and repeat on what is left.
+
+With six breaks allowed it solved. All ninety-one booleans and all ten floats
+agreed, at:
+
+    everything from +212  shifts by  +36
+    everything from +4828 shifts by   +4
+    everything from +4988 shifts by -116
+    everything from +5033 shifts by  -84
+
+That is not a struct. It is a curve fit, and recording it is the point: each
+break gives the search sixty-four free values, a boolean check is one bit,
+and two negative shifts of eighty bytes and more are not what a member
+changing size looks like. The solver is capped at one break now, which is a
+claim that can be wrong -- one member before the pivot differs in size,
+everything after it moved by that much, nothing else changed. One break does
+not solve it.
+
+## Strings are a better test than booleans, and there are not enough of them
+
+A boolean is one bit. A float is thirty-two, most of whose patterns are NaN
+or astronomical. One of Larian's strings is a hundred and twenty-eight bits
+with a length that has to agree with its own contents: inline, the top bit of
+the last byte is clear, that byte is the length, and everything from the
+length to the terminator is zero; on the heap, the top bit is set and there
+is a readable pointer with a size no larger than its capacity and a
+terminator where the size says. `looks_like_string` in
+`src/vendor/global_switches.cpp` tests exactly that.
+
+`GlobalSwitches` declares seven strings -- `Language`, `ScreenshotDir`,
+`EBSUrl`, `TwitchExtSecret`, `TwitchExtSecret2_M`, `field_158`,
+`LongRestDefaultTimeline` -- but bg3se's property map exposes only four of
+them, at +0, +48, +168 and +4816 from `Language`. And an empty string is
+sixteen zero bytes, which passes for free: the first version of this counted
+seventy-seven "strings" in a kilobyte of a settings object for that reason.
+So the test is worth one or two real checks rather than four.
+
+**No candidate in the process passes it.** Across 162 hits on the language
+needle, not one has the other three declared strings where bg3se says they
+are. That is the firmest evidence so far, and it is worse news than the
+boolean count was: `ScreenshotDir` is only +48 from the anchor, so the drift
+begins within a few members of `Language` rather than thousands of bytes
+away.
+
+## What was tried and does not work
+
+- **Boolean density.** Recorded above; 82 of 91 at a base whose `UIScaling`
+  read 1060.
+- **Shifting the offsets to fit.** Solves with four arbitrary breaks. Any
+  test with that much freedom will solve.
+- **Finding the object by its string cluster.** Searching forward from each
+  language hit for the densest run of non-empty strings finds arrays of
+  strings -- runs at a clean sixteen-byte stride -- not a settings object
+  with strings scattered through it. Density is the wrong signal.
+
+## What would work
+
+A different anchor. Everything above starts from the language string and
+tests bg3se's offsets against it, and bg3se's offsets are wrong near the
+anchor. The way in is a pointer to the object from something already located,
+the way `ModManager.Settings` was found at +112 -- the engine reaches
+`GlobalSwitches` from somewhere, and that somewhere is a better starting
+point than a string in the middle of it.
+
 ## What the code does now
 
 `bg3le_global_switches()` runs the search once, requires every float to be
