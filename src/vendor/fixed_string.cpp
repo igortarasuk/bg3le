@@ -106,7 +106,13 @@ bool sub_table_plausible(void const* st) {
 }
 
 // The address of a string, or null. The index arithmetic is bg3se's.
-char const* resolve(void const* table, std::uint32_t id, std::uint32_t* length) {
+//
+// The entry's own hash comes back too, for the caller that wants it: it is
+// what the engine hashes a FixedString by, and bg3se's FixedString::GetHash
+// reaches it through an engine function bg3le has no pointer for. The bytes
+// are right here.
+char const* resolve(void const* table, std::uint32_t id, std::uint32_t* length,
+                    std::uint32_t* hash = nullptr) {
     if (table == nullptr || id == FixedString::NullIndex) return nullptr;
 
     const std::size_t subTableIdx = id & 0x0F;
@@ -136,6 +142,7 @@ char const* resolve(void const* table, std::uint32_t id, std::uint32_t* length) 
     if (copy.Length > entrySize) return nullptr;
 
     if (length != nullptr) *length = copy.Length;
+    if (hash != nullptr) *hash = copy.Hash;
     return (char const*)(header + 1);
 }
 
@@ -485,6 +492,26 @@ TextIndex const& text_index() {
          index.size(), seen, freed, tooLong, truncated, unterm,
          skippedTables, skippedBuckets);
     return index;
+}
+
+// The hash the engine stores with a string, by id.
+//
+// A FixedString in a hash set is bucketed by this rather than by its id, and
+// nothing else can stand in for it: the hash is FNV-1a over the text, but it
+// is the engine's copy that the engine's own lookups use, so it is the copy
+// that is read.
+extern "C" bool bg3le_fixed_string_hash(std::uint32_t id,
+                                        std::uint32_t* out) {
+    if (out == nullptr) return false;
+
+    void* table = bg3le_string_table();
+    if (table == nullptr) return false;
+
+    std::uint32_t hash = 0;
+    if (resolve(table, id, nullptr, &hash) == nullptr) return false;
+
+    *out = hash;
+    return true;
 }
 
 extern "C" bool bg3le_fixed_string_index_of(char const* wanted,

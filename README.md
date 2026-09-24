@@ -118,7 +118,14 @@ component's declared size with the size the engine recorded, and
   It has no symbol, so it is found by fingerprint: the manager is one
   `HashMap<StaticDataTypeIndex, GuidResourceBankBase*>`, and a table whose
   keys are all drawn from the 121 static data type indices the symbol table
-  already names is that manager rather than a coincidence
+  already names is that manager rather than a coincidence. Resources are
+  writable, which is what a mod that edits spell lists needs: a resource's
+  fields write through, a `HashSet<FixedString>` is replaced whole by
+  `Ext.Types.Unserialize` or by plain assignment, and both string kinds can
+  be assigned. Replacing a set means rebuilding its hash table, and doing
+  that through bg3se's own container methods took the game down twice — the
+  offsets, the hash rule and the two things not to call are in
+  `reference/STATIC-DATA-WRITES.md`
 - `Ext.Stats`: 15,754 stats, enumerable and readable by name, through a
   proxy that reads an attribute when it is asked for, as upstream's does.
   Snapshotting all two hundred of them per fetch made a mod's stats pass

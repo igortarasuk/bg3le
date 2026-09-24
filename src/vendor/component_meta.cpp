@@ -37,6 +37,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -49,6 +50,7 @@
 // From platform_linux.cpp; the self-test below needs an allocator to build an
 // array with.
 extern "C" bool bg3le_game_allocator_ready();
+extern "C" bool bg3le_fixed_string_hash(std::uint32_t id, std::uint32_t* out);
 
 namespace bg3le {
 
@@ -157,6 +159,68 @@ struct SetTraits<HashSet<T>> {
     using Elem = T;
 };
 
+// What a key is bucketed by.
+//
+// bg3se's HashMapHash for a FixedString is FixedString::GetHash(), which
+// reads the string table entry's own hash -- through an engine function
+// pointer bg3le does not have, so calling it jumps to zero. bg3le reads that
+// table itself, so the hash comes from there instead; every other key type
+// goes through bg3se's own hash unchanged.
+//
+// A failure here has to be a refusal rather than a substitute value. A wrong
+// bucket does not fault, it makes the key unfindable, and a spell list that
+// silently holds nothing is worse than one that refused to change.
+template <class T>
+bool hash_of(T const& key, std::uint64_t* out) {
+    if constexpr (std::is_base_of_v<FixedStringBase, T>) {
+        std::uint32_t hash = 0;
+        if (!bg3le_fixed_string_hash(key.Index, &hash)) return false;
+        *out = hash;
+        return true;
+    } else {
+        *out = HashMapHash(key);
+        return true;
+    }
+}
+
+// Whether the set's existing table is the one our hash rule would have built.
+//
+// Not that the chains are identical -- insertion order decides those -- but
+// that a lookup finds every key the set already holds, which is what the
+// engine's own find_index does. If the engine buckets a key by something
+// other than hash_of, this fails and the write is refused; nothing else in
+// reach would catch that, because a wrong bucket reads as an absent spell
+// rather than as a fault.
+template <class S>
+bool table_reproduces(S const* set) {
+    using Elem = typename SetTraits<S>::Elem;
+
+    auto const& keys = set->keys();
+    auto const& nextIds = set->next_ids();
+    auto const& hashKeys = set->hash_keys();
+    const std::size_t buckets = hashKeys.size();
+    if (buckets == 0) return keys.size() == 0;
+
+    for (std::uint32_t k = 0; k < keys.size(); ++k) {
+        std::uint64_t hash = 0;
+        if (!hash_of<Elem>(keys[k], &hash)) return false;
+
+        bool found = false;
+        std::int32_t at = hashKeys[(std::uint32_t)(hash % buckets)];
+        // Bounded by the key count: a chain longer than that is a cycle.
+        for (std::uint32_t step = 0; at >= 0 && step <= keys.size(); ++step) {
+            if ((std::uint32_t)at == k) {
+                found = true;
+                break;
+            }
+            if ((std::uint32_t)at >= nextIds.size()) return false;
+            at = nextIds[at];
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
 template <class S>
 std::size_t set_count_thunk(void const* container) {
     return (std::size_t)static_cast<S const*>(container)->keys().size();
@@ -169,15 +233,21 @@ void* set_data_thunk(void const* container) {
 
 // Replaces a set's contents, which is the only way to write one.
 //
-// Through the container's own clear() and insert(), so the hash table is
-// rebuilt as the engine would rebuild it -- and through bg3se's own
-// HashSet, whose growth goes to the engine's allocator because
-// bg3le_install_game_allocator pointed GameAllocRaw at the engine's
-// operator new. Writing the keys array directly would leave every hash
-// pointing at whatever used to be there.
+// A spell list is one of these -- HashSet<FixedString> -- so this is what a
+// mod that adds or removes spells is doing.
 //
-// A spell list is one of these: HashSet<FixedString>, and editing one is
-// what a mod that adds or removes spells is doing.
+// The algorithm is bg3se's ResizeHashMap and InsertToHashMap; only the stores
+// are ours. Going through the container's own clear() and insert() took the
+// game down, and there are two reasons it would. clear() fills the engine's
+// HashKeys buffer in place, and clearing an Array hands the engine's buffer to
+// operator delete -- and static data comes out of a .pak, so neither the
+// buffer being writable nor its having come from the engine heap is something
+// to assume. Fresh buffers plus a 48-byte header write touch nothing the
+// engine allocated.
+//
+// The old buffers are deliberately left alone, for that second reason: bg3le
+// did not allocate them and cannot know what did. Three small allocations per
+// spell-list edit is a fair price for not passing a foreign pointer to free.
 template <class S>
 bool set_assign_thunk(void* container, void const* values,
                       std::size_t count) {
@@ -185,49 +255,126 @@ bool set_assign_thunk(void* container, void const* values,
     auto* set = static_cast<S*>(container);
     auto const* items = static_cast<Elem const*>(values);
 
-    // The set's own bookkeeping has to agree with itself before anything
-    // is written, because reading one proves less than it looks.
-    //
-    // Reading a set only ever touches Keys, so a spell list reads
-    // perfectly whether or not the two members in front of it are laid
-    // out the way bg3se describes. Writing touches all three: clear()
-    // fills HashKeys end to end, and insert() pushes onto NextIds. The
-    // first attempt at this did that on trust and took the game down.
-    //
-    // A hash set that is laid out as expected has one next-id per key and
-    // at least as many buckets as keys. One that is not says so here.
-    const std::size_t keys = set->keys().size();
-    const std::size_t nexts = set->next_ids().size();
-    const std::size_t buckets = set->hash_keys().size();
+    if (!bg3le_game_allocator_ready()) return false;
+
+    // Where the three members sit, from the compiler's own layout of bg3se's
+    // HashSet, each checked against the offset a live SpellList.Spells dump
+    // showed. A mismatch refuses rather than writing into the wrong member.
+    auto* base = reinterpret_cast<char*>(set);
+    const std::size_t hashAt =
+        reinterpret_cast<char const*>(&set->hash_keys()) - base;
+    const std::size_t nextAt =
+        reinterpret_cast<char const*>(&set->next_ids()) - base;
+    const std::size_t keysAt =
+        reinterpret_cast<char const*>(&set->keys()) - base;
+    if (hashAt != 0x00 || nextAt != 0x10 || keysAt != 0x20) return false;
+    if (sizeof(S) != 0x30) return false;
+
+    // And the set's bookkeeping has to agree with itself, because reading one
+    // proves less than it looks: a lookup only ever touches Keys, so a spell
+    // list reads perfectly whether or not the two members in front of it hold
+    // what they should. One next-id per key, and at least as many buckets as
+    // keys.
     constexpr std::size_t kSane = 1u << 24;
+    const std::size_t keysNow = set->keys().size();
+    const std::size_t nextsNow = set->next_ids().size();
+    const std::size_t bucketsNow = set->hash_keys().size();
 
-    if (keys > kSane || nexts > kSane || buckets > kSane) return false;
-    if (nexts != keys) return false;
-    if (buckets < keys) return false;
+    if (keysNow > kSane || nextsNow > kSane || bucketsNow > kSane
+        || nextsNow != keysNow || bucketsNow < keysNow || count > kSane) {
+        logf("set write: refused: %zu keys, %zu next-ids, %zu buckets, %zu "
+             "wanted", keysNow, nextsNow, bucketsNow, count);
+        return false;
+    }
 
-    // BG3LE_SET_WRITES=1 to go ahead.
-    //
-    // Everything above this line holds and the write still takes the game
-    // down. Reading a set proves less than it looks: it only ever touches
-    // Keys, so the two members in front of it are never exercised, and
-    // clear() fills HashKeys end to end while insert() pushes onto
-    // NextIds. bg3se's HashSet is not laid out the way this build's is
-    // somewhere in that prefix, and the invariant check above is not
-    // enough to catch it -- the sizes agree and the mutation still
-    // faults.
-    //
-    // Left here, and off, because everything around it is done: the
-    // caller resolves each name to the id the engine already holds, the
-    // thunk is instantiated for the field's exact type, and
-    // Ext.Types.Unserialize routes a set view here. What is missing is the
-    // prefix layout, which wants the same treatment the string table's
-    // sub-tables got -- read one live set's three members and check them
-    // against the keys it demonstrably has.
-    char const* go = std::getenv("BG3LE_SET_WRITES");
-    if (go == nullptr || go[0] != '1') return false;
+    // And the table the engine built has to be the table our rule builds.
+    if (!table_reproduces(set)) {
+        logf("set write: refused: the engine's %zu buckets do not find its "
+             "own %zu keys under the hash bg3le would use",
+             bucketsNow, keysNow);
+        return false;
+    }
 
-    set->clear();
-    for (std::size_t i = 0; i < count; ++i) set->insert(items[i]);
+    // Every hash up front, so a key whose string the table cannot resolve
+    // stops this before anything is written.
+    std::vector<std::uint64_t> hashes(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!hash_of<Elem>(items[i], &hashes[i])) {
+            logf("set write: refused: no string-table hash for key %zu of %zu",
+                 i, count);
+            return false;
+        }
+    }
+
+    const auto total = (std::uint32_t)count;
+    const std::uint32_t buckets = GetNearestSmallMultiHashMapPrime(total + 2);
+    const std::uint32_t slots = total > 0 ? total : 1;
+
+    auto* keysBuf = (Elem*)GameAllocRaw(sizeof(Elem) * slots);
+    auto* nextBuf = (std::int32_t*)GameAllocRaw(sizeof(std::int32_t) * slots);
+    auto* hashBuf = (std::int32_t*)GameAllocRaw(sizeof(std::int32_t) * buckets);
+    if (keysBuf == nullptr || nextBuf == nullptr || hashBuf == nullptr) {
+        return false;
+    }
+
+    for (std::uint32_t i = 0; i < buckets; ++i) hashBuf[i] = -1;
+
+    // bg3se's InsertToHashMap, key by key. A bucket holding no key encodes
+    // the bucket it belongs to as -2 - bucket, which is how a chain ends.
+    for (std::uint32_t i = 0; i < total; ++i) {
+        new (keysBuf + i) Elem(items[i]);
+        const auto bucket = (std::uint32_t)(hashes[i] % buckets);
+        std::int32_t prev = hashBuf[bucket];
+        if (prev < 0) prev = -2 - (std::int32_t)bucket;
+        nextBuf[i] = prev;
+        hashBuf[bucket] = (std::int32_t)i;
+    }
+
+    auto store32 = [base](std::size_t off, std::uint32_t value) {
+        std::memcpy(base + off, &value, sizeof(value));
+    };
+    auto store64 = [base](std::size_t off, std::uint64_t value) {
+        std::memcpy(base + off, &value, sizeof(value));
+    };
+
+    // Empty first, then filled: a reader that catches this mid-write sees a
+    // set with no keys rather than one whose count outruns its buffer.
+    store32(0x2c, 0);
+    store64(0x00, (std::uint64_t)(std::uintptr_t)hashBuf);
+    store32(0x08, buckets);
+    store64(0x10, (std::uint64_t)(std::uintptr_t)nextBuf);
+    store32(0x18, slots);
+    store32(0x1c, total);
+    store64(0x20, (std::uint64_t)(std::uintptr_t)keysBuf);
+    store32(0x28, slots);
+    store32(0x2c, total);
+    return true;
+}
+
+// Replaces one of Larian's sixteen-byte strings.
+//
+// Through LSStringBase's own assign, so the inline and heap forms and the
+// capacity flag are its business rather than restated here -- see
+// vendor/bg3se/CoreLib/Base/LSString.h.
+//
+// The storage is zeroed first, which abandons the old heap buffer instead of
+// freeing it. Deliberate, and for the same reason the hash-set rebuild leaves
+// its old buffers alone: a string in static data was allocated by whatever
+// loaded the .pak, and bg3le cannot know that operator delete is the right
+// way to release it. A string's worth of memory per write is a fair price.
+extern "C" bool bg3le_meta_lsstring_assign(void* address, char const* text,
+                                           std::size_t length) {
+    if (address == nullptr || text == nullptr) return false;
+    // Only an allocation can fail, and only a long string needs one.
+    if (length > STDString::InlineCapacity && !bg3le_game_allocator_ready()) {
+        logf("string write: refused: %zu characters needs the engine heap and "
+             "the allocator was not found", length);
+        return false;
+    }
+
+    auto* str = static_cast<STDString*>(address);
+    std::memset(str, 0, sizeof(STDString));
+    str->assign(text, length);
     return true;
 }
 
@@ -1220,6 +1367,45 @@ extern "C" bool bg3le_meta_resolve(void const* handle, char const* path,
     *size = r.Field.Size;
     *readOnly = r.Field.ReadOnly;
     return true;
+}
+
+// What a live hash set actually looks like, against what is known about
+// it independently: the keys pointer and the key count both come from the
+// container's own accessors, which reading a set has always used and which
+// are therefore trustworthy. Everything else is read off the bytes.
+//
+// This is how the three members get located without taking a vendored
+// header's word for their offsets.
+extern "C" void bg3le_meta_set_dump(void const* handle, char const* path,
+                                   void* component) {
+    if (handle == nullptr || path == nullptr || component == nullptr) return;
+
+    const auto r = resolve_path(static_cast<ClassFields const*>(handle), path,
+                               component);
+    if (!r.Ok || r.Address == nullptr) {
+        logf("set dump: %s does not resolve", path);
+        return;
+    }
+    if (r.Field.Count == nullptr || r.Field.Data == nullptr) {
+        logf("set dump: %s is not a container", path);
+        return;
+    }
+
+    void const* keys = r.Field.Data(r.Address);
+    const std::size_t count = r.Field.Count(r.Address);
+    logf("set dump: %s at %p, keys %p, %zu of them, element %u bytes", path,
+         r.Address, keys, count, r.Field.ElemSize);
+
+    for (std::size_t off = 0; off < 64; off += 8) {
+        std::uint64_t word = 0;
+        std::uint32_t lo = 0, hi = 0;
+        std::memcpy(&word, (char const*)r.Address + off, sizeof(word));
+        std::memcpy(&lo, (char const*)&word, sizeof(lo));
+        std::memcpy(&hi, (char const*)&word + 4, sizeof(hi));
+        logf("set dump:   +%02zx = %#018llx  (u32 %u, %u)%s", off,
+             (unsigned long long)word, lo, hi,
+             (void const*)word == keys ? "  <- keys buffer" : "");
+    }
 }
 
 // Replaces a set's contents with the values given.

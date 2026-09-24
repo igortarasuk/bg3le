@@ -722,6 +722,12 @@ extern "C" std::int32_t bg3le_replicate_component(void* container,
 
 extern "C" bool bg3le_container_is_server(void* container);
 extern "C" bool bg3le_game_allocator_ready();
+extern "C" bool bg3le_fixed_string_intern(char const* text,
+                                          unsigned int* out);
+extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
+                                            unsigned int* out);
+extern "C" bool bg3le_meta_lsstring_assign(void* address, char const* text,
+                                           std::size_t length);
 
 // The component field tables, from src/vendor/component_meta.cpp.
 extern "C" void const* bg3le_meta_component(const char* engineName);
@@ -1098,6 +1104,30 @@ bool write_field(lua_State* L, int index, void* address, FieldKind kind,
             std::memcpy(address, &v, 8);
             return true;
         }
+        case FieldKind::FixedString: {
+            // The id the engine already holds for that text, or a new entry
+            // for text it does not. The old id's reference is not released:
+            // bg3le did not take it and the engine may still be holding it
+            // elsewhere, and an over-count keeps a string alive where an
+            // under-count frees one out from under a reader.
+            std::size_t length = 0;
+            const char* text = lua_tolstring(L, index, &length);
+            if (text == nullptr) return false;
+
+            std::uint32_t id = 0;
+            if (!bg3le_fixed_string_index_of(text, &id)
+                && !bg3le_fixed_string_intern(text, &id)) {
+                return false;
+            }
+            std::memcpy(address, &id, sizeof(id));
+            return true;
+        }
+        case FieldKind::LSString: {
+            std::size_t length = 0;
+            const char* text = lua_tolstring(L, index, &length);
+            if (text == nullptr) return false;
+            return bg3le_meta_lsstring_assign(address, text, length);
+        }
         default:
             return false;
     }
@@ -1413,10 +1443,8 @@ extern "C" char const* bg3le_stats_names_at(char const* list,
                                             std::size_t index);
 extern "C" void bg3le_fixed_string_dump();
 extern "C" int bg3le_stats_string_intern(char const* text);
-extern "C" bool bg3le_fixed_string_intern(char const* text,
-                                          unsigned int* out);
-extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
-                                            unsigned int* out);
+extern "C" void bg3le_meta_set_dump(void const* handle, char const* path,
+                                   void* component);
 extern "C" bool bg3le_meta_set_assign(void const* handle,
                                       char const* path, void* component,
                                       void const* values,
@@ -1679,30 +1707,41 @@ int l_object_get_field(lua_State* L) {
     return 1;
 }
 
-// Ext._Internal.ObjectSetSet(address, class, path, { name, ... }) -> true
-//
-// Replaces a hash set of FixedStrings, which is what a spell list is.
-// Elements of a set cannot be written one at a time -- the table's hashes
-// would still point at the old keys -- so the whole set is rebuilt through
-// the container's own insert().
-//
-// Each name has to become the id the engine already holds for that text: a
-// FixedString compares by id, so a fresh entry for the same characters is
-// a different string to everything that looks at it. Text the engine does
-// not have is interned, which is the case for a spell a mod has added.
-int l_object_set_set(lua_State* L) {
+// Ext._Internal.SetDump(address, class, path) -- the container's bytes
+// beside what its own accessors say, to the log. How the three members of
+// a hash set were located.
+int l_set_dump(lua_State* L) {
     Subject subject;
     const char* className = nullptr;
     if (!subject_from_object(L, 1, 2, &subject, &className)) return 2;
-    const char* path = luaL_checkstring(L, 3);
-    luaL_checktype(L, 4, LUA_TTABLE);
+    bg3le_meta_set_dump(subject.Meta, luaL_checkstring(L, 3), subject.Base);
+    return 0;
+}
+
+// Replaces a hash set of FixedStrings, which is what a spell list is.
+// Elements cannot be written one at a time -- the table's hashes would
+// still point at the old keys -- so the set is rebuilt whole.
+//
+// Each name has to become the id the engine already holds for that text: a
+// FixedString compares by id, so a fresh entry for the same characters is a
+// different string to everything that looks at it. Text the engine does not
+// have is interned, which is the case for a spell a mod has added. That
+// happens here rather than in the thunk, because interning is the part that
+// can fail and failing before anything is written is what keeps a
+// half-replaced set from existing.
+//
+// Shared by the component and the static-data routes, which differ only in
+// how the base address is found.
+int assign_set(lua_State* L, Subject const& subject, const char* className,
+               const char* path, int tableIdx) {
+    luaL_checktype(L, tableIdx, LUA_TTABLE);
 
     std::vector<unsigned int> ids;
-    const lua_Integer count = luaL_len(L, 4);
+    const lua_Integer count = luaL_len(L, tableIdx);
     ids.reserve((std::size_t)(count > 0 ? count : 0));
 
     for (lua_Integer i = 1; i <= count; ++i) {
-        lua_rawgeti(L, 4, i);
+        lua_rawgeti(L, tableIdx, i);
         char const* name = lua_tostring(L, -1);
         if (name == nullptr) {
             lua_pop(L, 1);
@@ -1735,6 +1774,34 @@ int l_object_set_set(lua_State* L) {
     }
     lua_pushboolean(L, 1);
     return 1;
+}
+
+// Ext._Internal.ObjectSetSet(address, class, path, { name, ... }) -> true
+int l_object_set_set(lua_State* L) {
+    Subject subject;
+    const char* className = nullptr;
+    if (!subject_from_object(L, 1, 2, &subject, &className)) return 2;
+    return assign_set(L, subject, className, luaL_checkstring(L, 3), 4);
+}
+
+// Ext._Internal.SetSet(handle, component, path, { name, ... }) -> true
+//
+// The same replacement against a component rather than a resource. A
+// component holds hash sets too -- a tag list, for one -- and without this
+// they were readable and not writable.
+int l_set_set(lua_State* L) {
+    const auto handle = static_cast<std::uint64_t>(luaL_checkinteger(L, 1));
+    const char* name = luaL_checkstring(L, 2);
+    const char* path = luaL_checkstring(L, 3);
+
+    Subject subject;
+    subject.Base = component_pointer(handle, name, &subject.Meta);
+    if (subject.Meta == nullptr || subject.Base == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s is not available on this entity", name);
+        return 2;
+    }
+    return assign_set(L, subject, name, path, 4);
 }
 
 // Ext._Internal.ObjectSetField(address, class, path, value) -> true
@@ -3513,6 +3580,10 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "ObjectSetField");
     lua_pushcfunction(g_lua, l_object_set_set);
     lua_setfield(g_lua, -2, "ObjectSetSet");
+    lua_pushcfunction(g_lua, l_set_set);
+    lua_setfield(g_lua, -2, "SetSet");
+    lua_pushcfunction(g_lua, l_set_dump);
+    lua_setfield(g_lua, -2, "SetDump");
     lua_pushcfunction(g_lua, l_map_key);
     lua_setfield(g_lua, -2, "MapKey");
     lua_pushcfunction(g_lua, l_variant_index);
@@ -4353,6 +4424,14 @@ function Ext.Types.Unserialize(object, values)
   -- never saw it, which is worse than refusing: 5eSpells' whole reason
   -- for existing is adding and removing spells, and it reported success
   -- every time.
+  -- An array view -- which is how a hash set reads -- can only be written
+  -- whole, and a failure there is reported rather than fallen back on: the
+  -- per-key loop would fill the Lua copy and return success, which is the
+  -- silent no-op this exists to stop.
+  --
+  -- A view over a struct's fields is not a set and carries its source under
+  -- __bg3leObject instead. That one takes the loop, and the loop reaches the
+  -- engine because assigning a field on it writes through.
   local meta = getmetatable(object)
   local source = meta and meta.__bg3leSource
   if source ~= nil then
@@ -5458,7 +5537,13 @@ make_fields = function(handle, comp, prefix, fields)
       return read_path(handle, comp, path_to(key))
     end,
     __newindex = function(_, key, value)
-      local ok, err = Ext._Internal.SetField(handle, comp, path_to(key), value)
+      local path = path_to(key)
+      local ok, err = Ext._Internal.SetField(handle, comp, path, value)
+      -- A hash set is the one field a plain write refuses on purpose: its
+      -- keys cannot be written in place. A table is the whole set.
+      if not ok and type(value) == "table" then
+        ok, err = Ext._Internal.SetSet(handle, comp, path, value)
+      end
       if not ok then error("bg3le: " .. tostring(err), 0) end
     end,
     -- Iterating yields field names and their values, so dumping a component
@@ -6282,15 +6367,68 @@ local function read_object_path(addr, class, path, kind)
   return value
 end
 
+-- Reading is a snapshot; writing goes to the engine.
+--
+-- The values are read once into a table behind the metatable rather than
+-- into the object itself, which is what lets a write be noticed at all:
+-- __newindex does not fire for a key the table already has, so filling the
+-- object directly made every assignment a silent no-op. A mod editing a
+-- spell list reported success and changed nothing.
+--
+-- Upstream hands back a live proxy. A snapshot still differs in that a
+-- field changing under you is not seen until the object is fetched again,
+-- which for a resource definition it does not -- but a write landing is not
+-- optional, and that is what this is.
 function read_object(addr, class, prefix, out)
   local fields, err = Ext._Internal.ObjectFields(class, prefix)
   if fields == nil then error("bg3le: " .. tostring(err), 0) end
 
+  local values = {}
   for name, kind in pairs(fields) do
     local path = (prefix == "") and name or (prefix .. "." .. name)
-    out[name] = read_object_path(addr, class, path, kind)
+    values[name] = read_object_path(addr, class, path, kind)
   end
-  return out
+
+  local function where()
+    if prefix == "" then return class end
+    return class .. "." .. prefix
+  end
+
+  return setmetatable(out, {
+    __index = values,
+    __newindex = function(_, key, value)
+      local kind = fields[key]
+      if kind == nil then
+        error("bg3le: " .. where() .. " has no field " .. tostring(key), 0)
+      end
+
+      local path = (prefix == "") and key or (prefix .. "." .. key)
+      local ok, err2 = Ext._Internal.ObjectSetField(addr, class, path, value)
+      -- As on a component: a hash set refuses a plain write, and a table is
+      -- the whole set.
+      if not ok and type(value) == "table" then
+        ok, err2 = Ext._Internal.ObjectSetSet(addr, class, path, value)
+      end
+      if not ok then error("bg3le: " .. tostring(err2), 0) end
+
+      -- Read back rather than storing what was asked for, so the snapshot
+      -- shows what the engine now holds.
+      values[key] = read_object_path(addr, class, path, kind)
+    end,
+    __pairs = function(self)
+      local key
+      return function()
+        local value
+        key, value = next(values, key)
+        if key == nil then return nil end
+        return key, value
+      end, self, nil
+    end,
+    -- Where it came from. Under its own name rather than __bg3leSource,
+    -- which marks an array that may be a set: a field view is not one, and
+    -- Ext.Types.Unserialize has to be able to tell the two apart.
+    __bg3leObject = {addr = addr, class = class, path = prefix},
+  })
 end
 
 -- Published so the stats code can reach it. The prelude is compiled in more
