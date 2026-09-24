@@ -279,6 +279,17 @@ component's declared size with the size the engine recorded, and
   so `src/vendor/noesis_rtti_linux.cpp` aliases 19 of them to one real
   placeholder type. That is safe only while no Noesis `dynamic_cast` runs. The
   real fix is keeping Noesis types out of the generated property maps
+- **`Ext.IMGUI`**, which is Mod Configuration Menu's menu and the only thing
+  in a 57-mod set known to need it — everything else of MCM's works, and
+  5eSpells reads all of its settings through it today. Upstream's
+  implementation compiles here unchanged, Vulkan backend and all, but it
+  cannot be linked: it is written against bg3se's Lua binding framework —
+  `lua::ImguiHandle`, `lua::RegistryEntry`, `lua::gStructRegistry`,
+  `ecl::ExtensionState` — and bg3le's Lua layer is its own. Borrowing it
+  means replacing bg3le's foundation with bg3se's rather than adding a
+  feature. What bg3le's own would take, step by step and with the one design
+  question named, is in
+  [reference/IMGUI-ASSESSMENT.md](reference/IMGUI-ASSESSMENT.md)
 - **Launching.** See [Running](#running)
 
 ## Building

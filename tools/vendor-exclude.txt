@@ -7,6 +7,10 @@
 # interposition, vtable slot patching and call-site patching.
 # dllmain/CrashReporter/DWriteWrapper are Windows process plumbing.
 # CoreLib/Console.cpp is a Windows console, down to font and colour tables.
+# IMGUI.cpp compiles here unchanged; what it cannot do is link, because it is
+# written against bg3se Lua binding framework rather than against Lua. See
+# reference/IMGUI-ASSESSMENT.md for the symbol list and what bg3le own
+# implementation would take.
 BG3Extender/Extender/Shared/dllmain.cpp
 BG3Extender/Extender/Shared/CrashReporter.cpp
 BG3Extender/Extender/Shared/DWriteWrapper.cpp
