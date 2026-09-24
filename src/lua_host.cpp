@@ -1030,6 +1030,16 @@ extern "C" bool bg3le_imgui_destroy(std::uint64_t handle);
 extern "C" void bg3le_imgui_enable_demo(bool enabled);
 extern "C" void bg3le_imgui_frame_stats(std::uint64_t* frames, int* vertices,
                                         int* lists, int* drawnFrames);
+extern "C" void bg3le_imgui_watch(char const* window, char const* item);
+extern "C" bool bg3le_imgui_window_geometry(float* out, std::size_t count);
+extern "C" bool bg3le_imgui_hovered(char* name, std::size_t size,
+                                    unsigned* hoveredId, unsigned* activeId,
+                                    unsigned* navId, unsigned* watchedId);
+extern "C" bool bg3le_imgui_load_font(char const* name, char const* path,
+                                      float size);
+extern "C" void bg3le_imgui_set_ui_scale(float scale);
+extern "C" void bg3le_imgui_set_font_scale(float scale);
+extern "C" bool bg3le_imgui_viewport_size(int* width, int* height);
 extern "C" void bg3le_imgui_hold_mouse(float x, float y, bool holding);
 extern "C" void bg3le_imgui_click_at(float x, float y, int button);
 extern "C" void bg3le_imgui_input_state(float* mouseX, float* mouseY,
@@ -1520,6 +1530,40 @@ bool push_enum(lua_State* L, void const* meta, const char* path,
     return true;
 }
 
+extern "C" bool bg3le_meta_optional_get(void const* handle, char const* path,
+                                        void* component, bool* engaged,
+                                        void** payload, std::uint8_t* kind,
+                                        std::uint8_t* elemKind,
+                                        std::uint16_t* elemCount);
+
+// Reading an optional field: its value, or nil if it holds none.
+//
+// Like the write, this needs the field's descriptor rather than an address,
+// because has_value() belongs to the type. Returns false if the path is not
+// an optional, so the caller can fall through to the ordinary read.
+bool read_optional(lua_State* L, void const* meta, char const* path,
+                   void* base) {
+    bool engaged = false;
+    void* payload = nullptr;
+    std::uint8_t kind = 0;
+    std::uint8_t elemKind = 0;
+    std::uint16_t elemCount = 0;
+    if (!bg3le_meta_optional_get(meta, path, base, &engaged, &payload, &kind,
+                                 &elemKind, &elemCount)) {
+        return false;
+    }
+
+    if (!engaged || payload == nullptr) {
+        lua_pushnil(L);
+        return true;
+    }
+    if (!push_field(L, payload, (FieldKind)kind, (FieldKind)elemKind,
+                    elemCount)) {
+        lua_pushnil(L);
+    }
+    return true;
+}
+
 // Ext._Internal.GetField(handle, component, path)
 //
 // path may name a field, a field of a nested struct, or an element of an
@@ -1575,6 +1619,11 @@ int l_get_field(lua_State* L) {
         }
     }
 
+    if ((FieldKind)kind == FieldKind::Optional
+        && read_optional(L, meta, path, component)) {
+        return 1;
+    }
+
     if (!push_field(L, address, (FieldKind)kind, (FieldKind)elemKind,
                     elemCount)) {
         lua_pushnil(L);
@@ -1583,6 +1632,40 @@ int l_get_field(lua_State* L) {
         return 2;
     }
     return 1;
+}
+
+extern "C" bool bg3le_meta_optional_set(void const* handle, char const* path,
+                                        void* component, bool engaged,
+                                        void** payload, std::uint8_t* kind,
+                                        std::uint8_t* elemKind,
+                                        std::uint16_t* elemCount);
+
+// Writing an optional field: engage it and write the payload, or clear it.
+//
+// Separate from write_field because engaging one needs the field's own
+// descriptor -- only the type knows where libc++ keeps the flag -- and
+// write_field has an address and a kind, not a descriptor.
+//
+// Returns false with a message pushed if it did not work.
+bool write_optional(lua_State* L, int index, void const* meta,
+                    char const* path, void* base) {
+    if (lua_isnoneornil(L, index)) {
+        return bg3le_meta_optional_set(meta, path, base, false, nullptr,
+                                       nullptr, nullptr, nullptr);
+    }
+
+    void* payload = nullptr;
+    std::uint8_t kind = 0;
+    std::uint8_t elemKind = 0;
+    std::uint16_t elemCount = 0;
+    if (!bg3le_meta_optional_set(meta, path, base, true, &payload, &kind,
+                                 &elemKind, &elemCount)) {
+        return false;
+    }
+    if (payload == nullptr) return false;
+
+    return write_field(L, index, payload, (FieldKind)kind,
+                       (FieldKind)elemKind, elemCount);
 }
 
 // Ext._Internal.SetField(handle, component, path, value)
@@ -1624,6 +1707,17 @@ int l_set_field(lua_State* L) {
     std::uint16_t elemCount = 0;
     bg3le_meta_field(meta, path, &fieldOffset, &fieldSize, &fieldKind,
                      &elemKind, &elemCount);
+
+    if ((FieldKind)kind == FieldKind::Optional) {
+        if (!write_optional(L, 4, meta, path, component)) {
+            lua_pushnil(L);
+            lua_pushfstring(L, "%s.%s is an optional bg3le cannot write",
+                            name, path);
+            return 2;
+        }
+        lua_pushboolean(L, 1);
+        return 1;
+    }
 
     if (!write_field(L, 4, address, (FieldKind)kind, (FieldKind)elemKind,
                      elemCount)) {
@@ -2036,6 +2130,11 @@ int l_object_get_field(lua_State* L) {
         }
     }
 
+    if ((FieldKind)kind == FieldKind::Optional
+        && read_optional(L, subject.Meta, path, subject.Base)) {
+        return 1;
+    }
+
     if (!push_field(L, address, (FieldKind)kind, (FieldKind)elemKind,
                     elemCount)) {
         lua_pushnil(L);
@@ -2181,6 +2280,17 @@ int l_object_set_field(lua_State* L) {
     std::uint16_t elemCount = 0;
     bg3le_meta_field(subject.Meta, path, &fieldOffset, &fieldSize, &fieldKind,
                      &elemKind, &elemCount);
+
+    if ((FieldKind)kind == FieldKind::Optional) {
+        if (!write_optional(L, 4, subject.Meta, path, subject.Base)) {
+            lua_pushnil(L);
+            lua_pushfstring(L, "%s.%s is an optional bg3le cannot write",
+                            className, path);
+            return 2;
+        }
+        lua_pushboolean(L, 1);
+        return 1;
+    }
 
     if (!write_field(L, 4, address, (FieldKind)kind, (FieldKind)elemKind,
                      elemCount)) {
@@ -2951,6 +3061,84 @@ int l_imgui_input_state(lua_State* L) {
 // The position is held rather than sent once, because the SDL backend sets
 // it from the real mouse every frame and would otherwise put it straight
 // back.
+// Ext._Internal.ImguiWindowGeometry(name)
+//   -> x, y, w, h, contentMinX, contentMinY, contentMaxX, contentMaxY,
+//      fontSize, firstItemX, firstItemY, contentReachX, contentReachY
+int l_imgui_window_geometry(lua_State* L) {
+    float out[33] = {};
+    if (!bg3le_imgui_window_geometry(out, 33)) return 0;
+
+    // Lua guarantees a C function only twenty free stack slots, and this
+    // returns more than that; pushing past them corrupts the stack, which
+    // took down the game rather than raising anything.
+    luaL_checkstack(L, (int)std::size(out), "Ext._Internal.ImguiWindowGeometry");
+    for (float value : out) lua_pushnumber(L, value);
+    return (int)std::size(out);
+}
+
+// Ext.IMGUI.LoadFont(name, path, size) -> bool
+int l_imgui_load_font(lua_State* L) {
+    lua_pushboolean(L, bg3le_imgui_load_font(luaL_checkstring(L, 1),
+                                             luaL_optstring(L, 2, ""),
+                                             (float)luaL_checknumber(L, 3))
+                           ? 1
+                           : 0);
+    return 1;
+}
+
+int l_imgui_set_ui_scale(lua_State* L) {
+    bg3le_imgui_set_ui_scale((float)luaL_checknumber(L, 1));
+    return 0;
+}
+
+int l_imgui_set_font_scale(lua_State* L) {
+    bg3le_imgui_set_font_scale((float)luaL_checknumber(L, 1));
+    return 0;
+}
+
+// Ext.IMGUI.GetViewportSize() -> {width, height}
+int l_imgui_viewport_size(lua_State* L) {
+    int width = 0;
+    int height = 0;
+    if (!bg3le_imgui_viewport_size(&width, &height)) return 0;
+    lua_createtable(L, 2, 0);
+    lua_pushinteger(L, width);
+    lua_rawseti(L, -2, 1);
+    lua_pushinteger(L, height);
+    lua_rawseti(L, -2, 2);
+    return 1;
+}
+
+// Ext._Internal.ImguiWatch(window[, item])
+//
+// Which window's layout the next drawn frame should record, and which item
+// within it to compute an id for. Read back with ImguiWindowGeometry and
+// ImguiHovered; nothing reads imgui live, because the console asks from one
+// thread and the frame is drawn on another.
+int l_imgui_watch(lua_State* L) {
+    bg3le_imgui_watch(luaL_optstring(L, 1, ""), luaL_optstring(L, 2, ""));
+    return 0;
+}
+
+// Ext._Internal.ImguiHovered() -> window, hoveredId, activeId, navId, itemId
+int l_imgui_hovered(lua_State* L) {
+    char name[128] = {};
+    unsigned hoveredId = 0;
+    unsigned activeId = 0;
+    unsigned navId = 0;
+    unsigned watchedId = 0;
+    if (!bg3le_imgui_hovered(name, sizeof(name), &hoveredId, &activeId,
+                             &navId, &watchedId)) {
+        return 0;
+    }
+    lua_pushstring(L, name);
+    lua_pushinteger(L, (lua_Integer)hoveredId);
+    lua_pushinteger(L, (lua_Integer)activeId);
+    lua_pushinteger(L, (lua_Integer)navId);
+    lua_pushinteger(L, (lua_Integer)watchedId);
+    return 5;
+}
+
 int l_imgui_mouse_move(lua_State* L) {
     if (lua_isnoneornil(L, 1)) {
         bg3le_imgui_hold_mouse(0, 0, false);
@@ -4551,6 +4739,20 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "ImguiTakeEvent");
     lua_pushcfunction(g_lua, l_imgui_input_state);
     lua_setfield(g_lua, -2, "ImguiInputState");
+    lua_pushcfunction(g_lua, l_imgui_window_geometry);
+    lua_setfield(g_lua, -2, "ImguiWindowGeometry");
+    lua_pushcfunction(g_lua, l_imgui_hovered);
+    lua_setfield(g_lua, -2, "ImguiHovered");
+    lua_pushcfunction(g_lua, l_imgui_watch);
+    lua_setfield(g_lua, -2, "ImguiWatch");
+    lua_pushcfunction(g_lua, l_imgui_load_font);
+    lua_setfield(g_lua, -2, "ImguiLoadFont");
+    lua_pushcfunction(g_lua, l_imgui_set_ui_scale);
+    lua_setfield(g_lua, -2, "ImguiSetUIScale");
+    lua_pushcfunction(g_lua, l_imgui_set_font_scale);
+    lua_setfield(g_lua, -2, "ImguiSetFontScale");
+    lua_pushcfunction(g_lua, l_imgui_viewport_size);
+    lua_setfield(g_lua, -2, "ImguiViewportSize");
     lua_pushcfunction(g_lua, l_imgui_mouse_move);
     lua_setfield(g_lua, -2, "ImguiMouseMove");
     lua_pushcfunction(g_lua, l_imgui_click_at);
@@ -5625,10 +5827,29 @@ end
 Ext._Internal.ImguiPump = imgui_pump
 
 function Ext.IMGUI.GetViewportSize()
-  -- Upstream asks the manager. bg3le has not bound that yet, so the honest
-  -- answer is to say so rather than return a plausible size a caller would
-  -- lay a window out against.
-  error("bg3le: Ext.IMGUI.GetViewportSize is not bound yet", 2)
+  local size = Ext._Internal.ImguiViewportSize()
+  if size == nil then
+    error("bg3le: the ImGui overlay has no viewport yet", 2)
+  end
+  return size
+end
+
+-- The manager's own font table, which is what upstream's LoadFont writes to.
+-- A path relative to the game's data, or empty for the default the language
+-- picks.
+function Ext.IMGUI.LoadFont(name, path, size)
+  if type(name) ~= "string" then
+    error("Ext.IMGUI.LoadFont(name, path, size) takes a name", 2)
+  end
+  return Ext._Internal.ImguiLoadFont(name, path or "", size or 0.0)
+end
+
+function Ext.IMGUI.SetUIScaleMultiplier(scale)
+  Ext._Internal.ImguiSetUIScale(scale)
+end
+
+function Ext.IMGUI.SetFontScaleMultiplier(scale)
+  Ext._Internal.ImguiSetFontScale(scale)
 end
 
 -- Upstream deprecated this one and warns; it does not scale anything.
@@ -5637,12 +5858,6 @@ function Ext.IMGUI.SetScale()
                 .. "by the extender")
 end
 
-for _, name in ipairs({"LoadFont", "SetUIScaleMultiplier",
-                       "SetFontScaleMultiplier"}) do
-  Ext.IMGUI[name] = needs(
-    "Ext.IMGUI." .. name .. " needs the font and scaling side of the "
-    .. "manager, which bg3le has not bound yet")
-end
 
 -- ---- Ext.Enums ----
 --

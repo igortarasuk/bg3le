@@ -37,8 +37,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <vector>
 #include <cstdlib>
 #include <exception>
@@ -71,6 +74,7 @@ bg3se::extui::IMGUIManager* manager() {
 bool imgui_overlay_wanted();
 void extender_globals_init();
 void imgui_api_init();
+void imgui_flush_events();
 
 // Constructs the manager and installs the hooks. Safe to call more than once,
 // and deliberately does not latch until it has actually built something: the
@@ -122,13 +126,131 @@ std::atomic<bool> g_want_mouse{false};
 std::atomic<bool> g_hovered_window{false};
 std::atomic<bool> g_nav_no_hover{false};
 
+// A window's layout, captured on the thread that drew it.
+//
+// Read live from the console thread this raced the frame and eventually
+// crashed the game: End() restores the window's cursor state and
+// FindWindowByName walks a list the drawing thread is rebuilding. Nothing
+// here is worth a crash, so the frame takes the snapshot and the console
+// reads the copy.
+constexpr std::size_t kGeometrySlots = 33;
+
+std::mutex& watch_lock() {
+    static std::mutex m;
+    return m;
+}
+
+std::string g_watch_name;
+float g_watch[kGeometrySlots] = {};
+bool g_watch_valid = false;
+char g_hovered_name[128] = {};
+unsigned g_hovered_id = 0;
+unsigned g_active_id = 0;
+unsigned g_nav_id = 0;
+unsigned g_watch_item_id = 0;
+std::string g_watch_item;
+
+void record_window() {
+    std::string name;
+    std::string item;
+    {
+        const std::lock_guard<std::mutex> held(watch_lock());
+        name = g_watch_name;
+        item = g_watch_item;
+    }
+
+    auto* gui = ImGui::GetCurrentContext();
+    std::snprintf(g_hovered_name, sizeof(g_hovered_name), "%s",
+                  gui->HoveredWindow != nullptr ? gui->HoveredWindow->Name
+                                                : "<none>");
+    g_hovered_id = gui->HoveredId;
+    g_active_id = gui->ActiveId;
+    g_nav_id = gui->NavId;
+
+    if (name.empty()) return;
+    auto* window = ImGui::FindWindowByName(name.c_str());
+    if (window == nullptr) {
+        const std::lock_guard<std::mutex> held(watch_lock());
+        g_watch_valid = false;
+        return;
+    }
+
+    float out[kGeometrySlots] = {};
+    out[0] = window->Pos.x;
+    out[1] = window->Pos.y;
+    out[2] = window->Size.x;
+    out[3] = window->Size.y;
+    out[4] = window->ContentRegionRect.Min.x;
+    out[5] = window->ContentRegionRect.Min.y;
+    out[6] = window->ContentRegionRect.Max.x;
+    out[7] = window->ContentRegionRect.Max.y;
+    out[8] = ImGui::GetIO().FontDefault != nullptr
+                 ? ImGui::GetIO().FontDefault->FontSize
+                 : 0.0f;
+    out[9] = window->DC.CursorStartPos.x;
+    out[10] = window->DC.CursorStartPos.y;
+    out[11] = window->DC.CursorMaxPos.x;
+    out[12] = window->DC.CursorMaxPos.y;
+    out[13] = ImGui::GetFontSize();
+    out[14] = ImGui::GetIO().FontGlobalScale;
+    out[15] = ImGui::GetIO().FontDefault != nullptr
+                  ? ImGui::GetIO().FontDefault->Scale
+                  : -1.0f;
+    out[16] = window->FontWindowScale;
+    out[17] = ImGui::GetStyle().FramePadding.y;
+    out[18] = (float)ImGui::GetIO().Fonts->Fonts.Size;
+    out[19] = window->Collapsed ? 1.0f : 0.0f;
+    out[20] = window->SkipItems ? 1.0f : 0.0f;
+    out[21] = window->DC.PrevLineSize.y;
+    out[22] = window->DC.CursorPos.y;
+    out[23] = window->ContentSize.y;
+    out[24] = window->ClipRect.Min.x;
+    out[25] = window->ClipRect.Min.y;
+    out[26] = window->ClipRect.Max.x;
+    out[27] = window->ClipRect.Max.y;
+    out[28] = window->Hidden ? 1.0f : 0.0f;
+    out[29] = (float)window->HiddenFramesCannotSkipItems;
+    out[30] = (float)window->HiddenFramesCanSkipItems;
+    out[31] = window->InnerClipRect.Min.y;
+    out[32] = window->InnerClipRect.Max.y;
+
+    const unsigned itemId = item.empty() ? 0u : window->GetID(item.c_str());
+
+    // Logged from here rather than read back, because this is the thread
+    // that drew it and the numbers that matter are the ones the frame used.
+    static int said = 0;
+    if (said < 3) {
+        ++said;
+        logf("imgui watch: %s at %.0f,%.0f %.0fx%.0f  clip %.0f,%.0f..%.0f,%.0f"
+             "  innerClip y %.0f..%.0f  hidden %d/%d/%d  collapsed %d"
+             "  skipItems %d  font %.2f  prevLine %.2f  item %u",
+             name.c_str(), out[0], out[1], out[2], out[3], out[24], out[25],
+             out[26], out[27], out[31], out[32], window->Hidden ? 1 : 0,
+             (int)window->HiddenFramesCannotSkipItems,
+             (int)window->HiddenFramesCanSkipItems,
+             window->Collapsed ? 1 : 0, window->SkipItems ? 1 : 0, out[13],
+             out[21], itemId);
+    }
+
+    const std::lock_guard<std::mutex> held(watch_lock());
+    std::memcpy(g_watch, out, sizeof(out));
+    g_watch_item_id = itemId;
+    g_watch_valid = true;
+}
+
 void record_frame() {
     g_frames.fetch_add(1, std::memory_order_relaxed);
+
+    // Nothing below is safe without a context: ImGui::GetDrawData reaches
+    // through the global one, and the first ticks arrive long before it
+    // exists now that this runs from the game's own event loop rather than
+    // from the story thread.
+    if (ImGui::GetCurrentContext() == nullptr) return;
 
     // imgui's own count, which only advances if Update got past its early
     // return and reached NewFrame. Without it there is no telling a tick
     // that drew nothing from one that never drew.
-    if (ImGui::GetCurrentContext() != nullptr) {
+    {
         g_imgui_frames.store(ImGui::GetFrameCount(),
                              std::memory_order_relaxed);
     }
@@ -136,7 +258,7 @@ void record_frame() {
     // Where imgui thinks the mouse is, and how big it thinks the screen is.
     // Both are the SDL side's to supply, and both were zero while that was a
     // stub -- worth reporting rather than inferring from a vertex count.
-    if (ImGui::GetCurrentContext() != nullptr) {
+    {
         auto const& io = ImGui::GetIO();
         g_mouse_x.store(io.MousePos.x, std::memory_order_relaxed);
         g_mouse_y.store(io.MousePos.y, std::memory_order_relaxed);
@@ -155,6 +277,8 @@ void record_frame() {
         g_nav_no_hover.store(gui->NavHighlightItemUnderNav,
                              std::memory_order_relaxed);
     }
+
+    record_window();
 
     auto* draw = ImGui::GetDrawData();
     if (draw == nullptr) return;
@@ -254,8 +378,20 @@ void imgui_overlay_tick() {
     auto* ui = manager();
     if (ui == nullptr) return;
 
+    // Update calls back into SDL, and this is called from inside
+    // SDL_PollEvent; anything in there that pumped the event loop would
+    // re-enter and draw a frame inside a frame.
+    static thread_local bool inside = false;
+    if (inside) return;
+    inside = true;
+    struct Leave {
+        bool* Flag;
+        ~Leave() { *Flag = false; }
+    } leave{&inside};
+
     try {
         ui->Update();
+        imgui_flush_events();
         record_frame();
     } catch (std::exception const& e) {
         logf("imgui: Update failed, stopping the overlay: %s", e.what());
@@ -280,6 +416,65 @@ bool imgui_overlay_ready() {
 // Exposed because the alternative is guessing: bg3se's own IMGUI_DEBUG
 // logging is compiled out, so between "hooks installed" and a window
 // appearing there is nothing in the log at all.
+// The four of upstream's Ext.IMGUI functions that are the manager's own.
+extern "C" bool bg3le_imgui_load_font(char const* name, char const* path,
+                                      float size) {
+    auto* ui = bg3le::manager();
+    if (ui == nullptr || name == nullptr) return false;
+    if (!ui->WasUIInitialized()) return false;
+    return ui->LoadFont(bg3se::FixedString(name),
+                        path != nullptr ? path : "", size);
+}
+
+extern "C" void bg3le_imgui_set_ui_scale(float scale) {
+    if (auto* ui = bg3le::manager()) ui->SetUIScaleMultiplier(scale);
+}
+
+extern "C" void bg3le_imgui_set_font_scale(float scale) {
+    if (auto* ui = bg3le::manager()) ui->SetFontScaleMultiplier(scale);
+}
+
+extern "C" bool bg3le_imgui_viewport_size(int* width, int* height) {
+    auto* ui = bg3le::manager();
+    if (ui == nullptr) return false;
+    const auto size = ui->GetViewportSize();
+    *width = size.x;
+    *height = size.y;
+    return true;
+}
+
+// Names the window, and the item within it, whose layout the next frame
+// should record. Its numbers are read back with bg3le_imgui_window_geometry.
+extern "C" void bg3le_imgui_watch(char const* window, char const* item) {
+    const std::lock_guard<std::mutex> held(bg3le::watch_lock());
+    bg3le::g_watch_name = window != nullptr ? window : "";
+    bg3le::g_watch_item = item != nullptr ? item : "";
+    bg3le::g_watch_valid = false;
+}
+
+extern "C" bool bg3le_imgui_window_geometry(float* out, std::size_t count) {
+    const std::lock_guard<std::mutex> held(bg3le::watch_lock());
+    if (!bg3le::g_watch_valid) return false;
+    for (std::size_t i = 0; i < count && i < bg3le::kGeometrySlots; ++i) {
+        out[i] = bg3le::g_watch[i];
+    }
+    return true;
+}
+
+extern "C" bool bg3le_imgui_hovered(char* name, std::size_t size,
+                                    unsigned* hoveredId, unsigned* activeId,
+                                    unsigned* navId, unsigned* watchedId) {
+    const std::lock_guard<std::mutex> held(bg3le::watch_lock());
+    if (name != nullptr && size > 0) {
+        std::snprintf(name, size, "%s", bg3le::g_hovered_name);
+    }
+    if (hoveredId != nullptr) *hoveredId = bg3le::g_hovered_id;
+    if (activeId != nullptr) *activeId = bg3le::g_active_id;
+    if (navId != nullptr) *navId = bg3le::g_nav_id;
+    if (watchedId != nullptr) *watchedId = bg3le::g_watch_item_id;
+    return true;
+}
+
 // Holds the mouse at a position, or stops holding it.
 extern "C" void bg3le_imgui_hold_mouse(float x, float y, bool holding) {
     const std::lock_guard<std::mutex> held(bg3le::input_lock());

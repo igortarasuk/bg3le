@@ -121,6 +121,13 @@ struct FieldDesc {
     // of these by position: the first call through a shifted Assign was a
     // jump to address zero.
     bool (*Assign)(void* container, void const* values, std::size_t count);
+    // Optional only: engages or clears it through the container's own
+    // emplace() and reset(), so the payload is default-constructed and the
+    // flag is set the way the type itself sets it rather than by guessing
+    // where libc++ keeps it.
+    //
+    // After Assign, for the reason above.
+    void (*Engage)(void* container, bool engaged);
 };
 
 }  // namespace bg3le

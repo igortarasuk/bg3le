@@ -86,6 +86,24 @@ void imgui_api_init() {
     logf("imgui: widget tree created and handed to the manager");
 }
 
+// Hands the queued callbacks to bg3le's own delivery.
+//
+// Upstream flushes this from IMGUIObjectManager::ClientUpdate, but only
+// after pinning its own client Lua state -- and bg3le never attaches one, so
+// that pin is always false and nothing was ever flushed: every click and
+// every change sat in the queue for the life of the process. The queue is
+// drained here instead, on the thread that just drew the frame.
+//
+// The lua_State* is unused: bg3le's LuaDelegate posts to its own queue
+// rather than calling through a registry entry, and that queue knows which
+// context registered each callback. See src/vendor/imgui_events.cpp.
+void imgui_flush_events() {
+    const std::lock_guard<std::mutex> held(lock());
+    auto& manager = objects();
+    if (manager == nullptr) return;
+    manager->GetEventQueue().Flush(nullptr);
+}
+
 // The widget a handle names, and bg3se's own short name for its class.
 // src/vendor/imgui_events.cpp needs both to find where an event lives.
 bg3se::extui::Renderable* imgui_renderable(std::uint64_t handle) {

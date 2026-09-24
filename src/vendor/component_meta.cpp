@@ -411,6 +411,19 @@ void* optional_data_thunk(void const* opt) {
     return (void*)&**o;
 }
 
+// Engages or clears an optional, through the type's own emplace() and
+// reset(). Writing the flag directly would mean knowing where libc++ keeps
+// it, and that is not the same place for every payload.
+template <class O>
+void optional_engage_thunk(void* opt, bool engaged) {
+    auto* o = static_cast<O*>(opt);
+    if (engaged) {
+        if (!o->has_value()) o->emplace();
+    } else {
+        o->reset();
+    }
+}
+
 // std::variant holds one of several types, and which one is known only at
 // runtime -- so unlike every other container here its element cannot be
 // described by a single type. It carries one descriptor per alternative
@@ -624,6 +637,11 @@ constexpr FieldDesc make_field(char const* name, std::size_t offset) {
         describe_elements.template operator()<E>();
         f.Count = &optional_count_thunk<T>;
         f.Data = &optional_data_thunk<T>;
+        // Only where the payload can be default-constructed: engaging one
+        // that cannot would have nothing to put in it.
+        if constexpr (std::is_default_constructible_v<E>) {
+            f.Engage = &optional_engage_thunk<T>;
+        }
     } else if constexpr (VariantTraits<T>::kIsVariant) {
         f.Alternatives = VariantTraits<T>::kAlternatives;
         f.ActiveIndex = &variant_index_thunk<T>;
@@ -1476,6 +1494,93 @@ extern "C" bool bg3le_meta_set_assign(void const* handle, char const* path,
     if (elemSize != r.Field.ElemSize) return false;
 
     return r.Field.Assign(r.Address, values, count);
+}
+
+// Engages or clears an optional field, and hands back where its payload lives
+// so the caller can write it.
+//
+// What makes an optional writable at all: the flag and the payload are one
+// object as far as the type is concerned, and only the type knows where the
+// flag is. Reading one never needed that -- has_value() and operator* are
+// enough -- so this is the write side arriving late.
+extern "C" char const* bg3le_meta_kind_name(std::uint8_t kind);
+
+extern "C" bool bg3le_meta_optional_set(void const* handle, char const* path,
+                                        void* component, bool engaged,
+                                        void** payload, std::uint8_t* kind,
+                                        std::uint8_t* elemKind,
+                                        std::uint16_t* elemCount) {
+    if (handle == nullptr || path == nullptr || component == nullptr) {
+        return false;
+    }
+
+    const auto r = resolve_path(static_cast<ClassFields const*>(handle), path,
+                                component);
+    if (!r.Ok || r.Address == nullptr) {
+        logf("optional set: %s does not resolve", path);
+        return false;
+    }
+    if (r.Field.Kind != FieldKind::Optional) {
+        logf("optional set: %s is %s, not an optional", path,
+             bg3le_meta_kind_name((std::uint8_t)r.Field.Kind));
+        return false;
+    }
+    if (r.Field.Engage == nullptr || r.Field.Data == nullptr) {
+        logf("optional set: %s has no %s accessor", path,
+             r.Field.Engage == nullptr ? "engage" : "data");
+        return false;
+    }
+
+    r.Field.Engage(r.Address, engaged);
+
+    if (payload != nullptr) {
+        *payload = engaged ? r.Field.Data(r.Address) : nullptr;
+    }
+
+    // The payload is described by the element descriptor, not by the
+    // optional's own scalar fields: an optional<glm::vec2> holds something
+    // that is itself an array of two floats, and the optional's ElemKind
+    // says nothing about that. Writing through the wrong one is how the
+    // engage succeeded and the write then quietly failed.
+    FieldDesc const* inner =
+        r.Field.ElemDesc != nullptr ? r.Field.ElemDesc : &r.Field;
+    if (kind != nullptr) *kind = reportable_kind(*inner);
+    if (elemKind != nullptr) *elemKind = (std::uint8_t)inner->ElemKind;
+    if (elemCount != nullptr) *elemCount = inner->ElemCount;
+    return true;
+}
+
+// Whether an optional field holds anything, and where. The read side of
+// bg3le_meta_optional_set, and the same reason it needs a descriptor rather
+// than an address: has_value() belongs to the type.
+//
+// Returns false if the path is not an optional at all; `engaged` says
+// whether it holds a value.
+extern "C" bool bg3le_meta_optional_get(void const* handle, char const* path,
+                                        void* component, bool* engaged,
+                                        void** payload, std::uint8_t* kind,
+                                        std::uint8_t* elemKind,
+                                        std::uint16_t* elemCount) {
+    if (handle == nullptr || path == nullptr || component == nullptr) {
+        return false;
+    }
+
+    const auto r = resolve_path(static_cast<ClassFields const*>(handle), path,
+                                component);
+    if (!r.Ok || r.Address == nullptr) return false;
+    if (r.Field.Kind != FieldKind::Optional) return false;
+    if (r.Field.Count == nullptr || r.Field.Data == nullptr) return false;
+
+    const bool has = r.Field.Count(r.Address) != 0;
+    if (engaged != nullptr) *engaged = has;
+    if (payload != nullptr) *payload = has ? r.Field.Data(r.Address) : nullptr;
+
+    FieldDesc const* inner =
+        r.Field.ElemDesc != nullptr ? r.Field.ElemDesc : &r.Field;
+    if (kind != nullptr) *kind = reportable_kind(*inner);
+    if (elemKind != nullptr) *elemKind = (std::uint8_t)inner->ElemKind;
+    if (elemCount != nullptr) *elemCount = inner->ElemCount;
+    return true;
 }
 
 // The current length of a dynamic array, and the element stride. Needs the

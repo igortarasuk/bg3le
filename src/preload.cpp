@@ -43,7 +43,7 @@ namespace bg3le {
 // Defined in src/vendor/imgui_overlay.cpp, which needs bg3se headers this
 // file does not include.
 void imgui_overlay_start();
-void imgui_overlay_tick();
+
 
 namespace {
 
@@ -422,7 +422,6 @@ void update_messages_hook(void* self) {
     debug_server_note_story_thread();
     debug_server_pump();
     lua_tick();
-    bg3le::imgui_overlay_tick();
     ensure_achievement_gate_patch();
     if (g_orig_update_messages != nullptr) g_orig_update_messages(self);
 }
