@@ -1009,6 +1009,8 @@ extern "C" bool bg3le_meta_type_name_at(void const* handle, char const* path,
                                         char const** name,
                                         std::uint16_t* length);
 extern "C" void* bg3le_global_switches();
+extern "C" void bg3le_imgui_status(bool* wanted, bool* started,
+                                   bool* initialized);
 extern "C" bool bg3le_stats_name_id(void const* object, std::uint32_t* out);
 extern "C" bool bg3le_fixed_string_recheck(std::uint32_t id,
                                            char const** cached,
@@ -2569,6 +2571,18 @@ int l_stats_name_recheck(lua_State* L) {
     return 3;
 }
 
+// Ext._Internal.ImguiStatus() -> wanted, started, initialized
+int l_imgui_status(lua_State* L) {
+    bool wanted = false;
+    bool started = false;
+    bool initialized = false;
+    bg3le_imgui_status(&wanted, &started, &initialized);
+    lua_pushboolean(L, wanted ? 1 : 0);
+    lua_pushboolean(L, started ? 1 : 0);
+    lua_pushboolean(L, initialized ? 1 : 0);
+    return 3;
+}
+
 // Ext._Internal.GlobalSwitches() -> address
 //
 // ls::GlobalSwitches has no symbol; src/vendor/global_switches.cpp finds it by
@@ -4104,6 +4118,8 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "StatsCopyFrom");
     lua_pushcfunction(g_lua, l_global_switches);
     lua_setfield(g_lua, -2, "GlobalSwitches");
+    lua_pushcfunction(g_lua, l_imgui_status);
+    lua_setfield(g_lua, -2, "ImguiStatus");
     lua_pushcfunction(g_lua, l_stats_name_recheck);
     lua_setfield(g_lua, -2, "StatsNameRecheck");
     lua_pushcfunction(g_lua, l_stats_attr_translated);

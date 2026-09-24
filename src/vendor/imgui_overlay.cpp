@@ -31,6 +31,7 @@
 
 #include <Extender/Client/IMGUI/IMGUI.h>
 #include <Extender/Client/SDLManager.h>
+#include <Extender/ScriptExtender.h>
 
 #include <cstdlib>
 #include <exception>
@@ -44,16 +45,24 @@ namespace bg3le {
 
 namespace {
 
-// Held rather than static-initialised: the manager touches imgui, and imgui
-// must not be built before the library has finished loading.
-std::unique_ptr<bg3se::SDLManager> g_sdl;
-std::unique_ptr<bg3se::extui::IMGUIManager> g_ui;
+// The manager belongs to the extender object, not to this file.
+//
+// bg3se's widget code reaches it as gExtender->IMGUI() -- that is how a
+// texture or a font gets registered -- so driving a separate instance would
+// mean two managers, one drawing and one being written to. This drives the
+// one the widgets can see.
 bool g_started = false;
 bool g_waiting_said = false;
+
+bg3se::extui::IMGUIManager* manager() {
+    if (bg3se::gExtender == nullptr) return nullptr;
+    return &bg3se::gExtender->IMGUI();
+}
 
 }  // namespace
 
 bool imgui_overlay_wanted();
+void extender_globals_init();
 
 // Constructs the manager and installs the hooks. Safe to call more than once,
 // and deliberately does not latch until it has actually built something: the
@@ -73,34 +82,37 @@ void imgui_overlay_start() {
     g_started = true;
 
     try {
-        g_sdl = std::make_unique<bg3se::SDLManager>();
-        g_ui = std::make_unique<bg3se::extui::IMGUIManager>(*g_sdl);
-        g_ui->EnableHooks();
+        extender_globals_init();
+        auto* ui = manager();
+        if (ui == nullptr) {
+            logf("imgui: no extender object; the overlay cannot start");
+            return;
+        }
+        ui->EnableHooks();
+        ui->EnableUI(true);
         logf("imgui: overlay hooks installed; waiting for the swapchain");
     } catch (std::exception const& e) {
         logf("imgui: could not start the overlay: %s", e.what());
-        g_ui.reset();
-        g_sdl.reset();
     } catch (...) {
         logf("imgui: could not start the overlay");
-        g_ui.reset();
-        g_sdl.reset();
     }
 }
 
 // Per frame, from the same hook that runs the Lua timers. The backend draws
 // from the present hook; this is the manager's own bookkeeping.
 void imgui_overlay_tick() {
-    if (g_ui == nullptr) return;
+    if (!g_started) return;
+    auto* ui = manager();
+    if (ui == nullptr) return;
 
     try {
-        g_ui->Update();
+        ui->Update();
     } catch (std::exception const& e) {
         logf("imgui: Update failed, stopping the overlay: %s", e.what());
-        g_ui.reset();
+        g_started = false;
     } catch (...) {
         logf("imgui: Update failed, stopping the overlay");
-        g_ui.reset();
+        g_started = false;
     }
 }
 
@@ -108,7 +120,21 @@ void imgui_overlay_tick() {
 // the milestone worth reporting: it means the hooks fired and the swapchain
 // was recognised.
 bool imgui_overlay_ready() {
-    return g_ui != nullptr && g_ui->WasUIInitialized();
+    auto* ui = manager();
+    return ui != nullptr && ui->WasUIInitialized();
+}
+
+// Whether the overlay was asked for, got as far as installing its hooks, and
+// whether the render backend has built its own resources.
+//
+// Exposed because the alternative is guessing: bg3se's own IMGUI_DEBUG
+// logging is compiled out, so between "hooks installed" and a window
+// appearing there is nothing in the log at all.
+extern "C" void bg3le_imgui_status(bool* wanted, bool* started,
+                                   bool* initialized) {
+    if (wanted != nullptr) *wanted = imgui_overlay_wanted();
+    if (started != nullptr) *started = g_started;
+    if (initialized != nullptr) *initialized = imgui_overlay_ready();
 }
 
 }  // namespace bg3le

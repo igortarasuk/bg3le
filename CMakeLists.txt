@@ -153,7 +153,8 @@ list(APPEND VENDOR_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/version_text.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/statics.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/imgui_overlay.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/global_switches.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/global_switches.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/extender_globals.cpp)
 
 # Kept in step with tools/vendor-exclude.txt.
 set(VENDOR_EXCLUDE
