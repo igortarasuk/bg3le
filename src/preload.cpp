@@ -36,6 +36,7 @@
 #include "stackdump.h"
 #include "mem.h"
 #include "log.h"
+#include "console.h"
 
 namespace bg3le {
 namespace {
@@ -46,6 +47,7 @@ std::once_flag g_story_once;
 std::once_flag g_init_struct_once;
 
 void ensure_symbols();
+void ensure_achievement_gate_patch();
 
 // Defined in src/vendor/platform_linux.cpp.
 extern "C" bool bg3le_fixed_string_intern(char const* text,
@@ -414,6 +416,7 @@ void update_messages_hook(void* self) {
     debug_server_note_story_thread();
     debug_server_pump();
     lua_tick();
+    ensure_achievement_gate_patch();
     if (g_orig_update_messages != nullptr) g_orig_update_messages(self);
 }
 
@@ -669,85 +672,76 @@ void dump_arg_desc(const void* desc, unsigned id, const char* kind) {
 
 // ISteamUserStats vtable hook state (installed later, once the game first
 // asks for the interface -- see "Steam achievement diagnostics" below).
-// Declared here, ahead of call_wrapper, so EnableAchievements can reach them;
-// still visible from that later, differently-scoped block via ordinary
-// outward name lookup once `using namespace bg3le;` is in effect there.
 using SetAchievementFn = bool (*)(void*, const char*);
-using StoreStatsFn = bool (*)(void*);
 std::atomic<SetAchievementFn> g_real_set_achievement{nullptr};
-std::atomic<StoreStatsFn> g_real_store_stats{nullptr};
-std::atomic<void*> g_user_stats_iface{nullptr};
 std::atomic<bool> g_user_stats_vtable_patched{false};
 
-// EnableAchievements (Linux equivalent of bg3se's IsModded/ThrowError patch):
-// the engine's own Osi.UnlockAchievement native handler silently no-ops when
-// the save is modded, well before it would ever reach
-// ISteamUserStats::SetAchievement -- confirmed by exhaustive live tracing
-// (see reference/ACHIEVEMENTS-DIAGNOSIS.md, "Session 4"). Rather than locate
-// and byte-patch that internal branch, force the real Steam call ourselves
-// from here: call_wrapper/achievement_gate_wrapper see every
-// Osi.UnlockAchievement dispatch (function id 0x80001669) regardless of what
-// the engine's own handler decides to do with it, since this fires before
-// the internal per-function dispatch.
-// The id of Osi.UnlockAchievement, taken from the engine's own function
-// mapping when the story loads rather than written down: a DIV id is a
-// property of the build, and the one this was developed against is not
-// necessarily the one running.
-std::atomic<unsigned> g_unlock_achievement_id{0};
+// EnableAchievements: the engine's per-module "is official" predicate,
+// patched to `mov eax,1; ret` like bg3se's IsModded patch.
+constexpr std::uintptr_t kAchievementPredicate = 0x37675f0;
+constexpr unsigned char kAchievementPredicateBytes[9] = {
+    0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x50};
+constexpr unsigned char kAchievementPredicatePatch[6] = {
+    0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3};
 
-// BG3LE_ACHIEVEMENTS=0 turns the forcing off, for a run that wants the
-// engine's own behaviour.
-bool achievements_enabled() {
-    char const* opt = std::getenv("BG3LE_ACHIEVEMENTS");
-    return opt == nullptr || opt[0] != '0';
+// Off with BG3LE_ACHIEVEMENTS=0, or "EnableAchievements": false in
+// ScriptExtenderSettings.json next to the binary (default on).
+bool achievement_patch_disabled() {
+    static const bool disabled = [] {
+        const char* e = std::getenv("BG3LE_ACHIEVEMENTS");
+        if (e != nullptr && std::strcmp(e, "0") == 0) {
+            logf("EnableAchievements: BG3LE_ACHIEVEMENTS=0, predicate left unpatched");
+            return true;
+        }
+        char exe[4096];
+        const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        if (n <= 0) return false;
+        exe[n] = '\0';
+        std::string dir(exe);
+        const std::size_t slash = dir.rfind('/');
+        if (slash != std::string::npos) dir.erase(slash);
+        const bool on = settings_flag(dir, "EnableAchievements", true);
+        if (!on) logf("EnableAchievements: disabled in ScriptExtenderSettings.json");
+        return !on;
+    }();
+    return disabled;
 }
 
-void maybe_force_unlock_achievement(unsigned id, const void* arg_desc) {
-    const unsigned wanted = g_unlock_achievement_id.load();
-    if (wanted == 0 || id != wanted) return;
-    if (!achievements_enabled()) return;
+// LD_PRELOAD also lands in steam-launch-wrapper and reaper.
+// Only the real game binary is patched.
+bool host_is_game() {
+    static const bool game = [] {
+        char exe[4096];
+        const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        if (n <= 0) return false;
+        exe[n] = '\0';
+        const char* base = std::strrchr(exe, '/');
+        base = base != nullptr ? base + 1 : exe;
+        const bool ok = std::strcmp(base, "bg3") == 0;
+        if (!ok) logf("EnableAchievements: host is %s, not bg3 -- skipping", base);
+        return ok;
+    }();
+    return game;
+}
 
-    auto real = g_real_set_achievement.load();
-    void* iface = g_user_stats_iface.load();
-    if (real == nullptr || iface == nullptr) {
-        logf("EnableAchievements: steam hook not ready yet, skipping forced unlock");
+// Idempotent: applies once, then only re-checks the bytes.
+void ensure_achievement_gate_patch() {
+    if (!host_is_game() || achievement_patch_disabled()) return;
+    if (bytes_match(kAchievementPredicate, kAchievementPredicatePatch,
+                    sizeof(kAchievementPredicatePatch))) {
         return;
     }
-
-    auto type_of = next<int (*)(const void*)>("_ZNK16COsiArgumentDesc13GetOpaqueTypeEv");
-    auto get_str = next<const char* (*)(const void*)>(
-        "_ZNK16COsiArgumentDesc12GetAnyStringEv");
-    if (type_of == nullptr || get_str == nullptr) return;
-
-    // Walk the OsiArgumentDesc chain looking for the STRING argument (type 4
-    // per base_type_name above) -- the achievement id. The CHARACTER argument
-    // is a GUIDSTRING (type 5), not STRING, so this can't confuse the two.
-    const void* node = arg_desc;
-    for (unsigned n = 0; n < 4 && node != nullptr; ++n) {
-        std::uintptr_t next_param = 0;
-        if (!safe_read(node, &next_param, sizeof(next_param))) break;
-
-        if (type_of(node) == 4) {  // STRING
-            char buf[128];
-            const char* name = get_str(node);
-            if (safe_cstr(name, buf, sizeof(buf))) {
-                bool rc = real(iface, buf);
-                logf("EnableAchievements: forced SetAchievement(\"%s\") -> %s",
-                     buf, rc ? "true" : "false");
-                // SetAchievement only stages the change locally; StoreStats
-                // is what actually syncs it (and fires the toast).
-                auto store = g_real_store_stats.load();
-                if (store != nullptr) {
-                    bool stored = store(iface);
-                    logf("EnableAchievements: forced StoreStats() -> %s",
-                         stored ? "true" : "false");
-                }
-            }
-            return;
-        }
-        node = reinterpret_cast<const void*>(next_param);
+    static bool first = true;
+    if (patch_bytes(kAchievementPredicate, kAchievementPredicateBytes,
+                    sizeof(kAchievementPredicateBytes), kAchievementPredicatePatch,
+                    sizeof(kAchievementPredicatePatch))) {
+        logf("EnableAchievements: %s IsModded predicate at 0x%lx",
+             first ? "patched" : "re-applied", (unsigned long)kAchievementPredicate);
+    } else if (first) {
+        logf("WARNING: EnableAchievements predicate patch refused -- "
+             "achievements will stay mod-blocked");
     }
-    logf("EnableAchievements: no STRING argument found in UnlockAchievement call");
+    first = false;
 }
 
 long call_wrapper(long a, long b, long c, long d, long e, long f) {
@@ -755,15 +749,6 @@ long call_wrapper(long a, long b, long c, long d, long e, long f) {
     if (++seen <= 10) logf("DIV Call  arg0=0x%lx arg1=0x%lx", a, b);
     if (seen <= 3) dump_arg_desc(reinterpret_cast<const void*>(b),
                                  (unsigned)a, "DIV Call ");
-    maybe_force_unlock_achievement((unsigned)a, reinterpret_cast<const void*>(b));
-    return g_real_call != nullptr ? g_real_call(a, b, c, d, e, f) : 0;
-}
-
-// Lean, always-installed counterpart to call_wrapper: no per-call logging
-// overhead, just the achievement-unlock gate every build should carry
-// regardless of the BG3LE_WRAP_DIV diagnostic opt-in.
-long achievement_gate_wrapper(long a, long b, long c, long d, long e, long f) {
-    maybe_force_unlock_achievement((unsigned)a, reinterpret_cast<const void*>(b));
     return g_real_call != nullptr ? g_real_call(a, b, c, d, e, f) : 0;
 }
 
@@ -792,16 +777,14 @@ void* maybe_wrap_div_table(void* init_fn) {
     g_real_call = reinterpret_cast<Thunk6>(copy[1]);
     g_real_query = reinterpret_cast<Thunk6>(copy[2]);
 
+    // osi::invoke() bypasses the DIV table, so it needs
+    // the real handlers even without diagnostic wrapping.
+    osi::set_handlers(reinterpret_cast<void*>(g_real_call),
+                      reinterpret_cast<void*>(g_real_query));
+
     const char* opt = std::getenv("BG3LE_WRAP_DIV");
     if (opt == nullptr || opt[0] != '1') {
-        copy[1] = reinterpret_cast<std::uintptr_t>(&achievement_gate_wrapper);
-        // osi::invoke() (bg3le's own Lua-facing Osi.* bridge) calls straight
-        // through whatever handler osi::set_handlers was given -- it never
-        // goes through this DIV table at all, so it needs the wrapper too or
-        // Lua-triggered UnlockAchievement calls silently skip the gate above.
-        osi::set_handlers(reinterpret_cast<void*>(copy[1]),
-                          reinterpret_cast<void*>(copy[2]));
-        return copy;
+        return init_fn;
     }
 
     copy[1] = reinterpret_cast<std::uintptr_t>(&call_wrapper);
@@ -1004,17 +987,11 @@ void dump_osiris_api(void* self) {
                 osi::story_function_count());
     }
 
-    for (osi::Function const& fn : bindable) {
-        if (fn.name == "UnlockAchievement") {
-            g_unlock_achievement_id.store(fn.id);
-            break;
-        }
-    }
-    if (achievements_enabled() && g_unlock_achievement_id.load() != 0) {
-        // bg3se says "Modded achievements enabled." at its own equivalent
-        // point; ours works differently enough to be worth naming.
-        statusf("Modded achievements enabled (UnlockAchievement forced "
-                "through Steam directly)");
+    if (!achievement_patch_disabled() &&
+        bytes_match(kAchievementPredicate, kAchievementPredicatePatch,
+                    sizeof(kAchievementPredicatePatch))) {
+        // Same point at which bg3se reports it.
+        statusf("Modded achievements enabled");
     }
 
     lua_bind_osi(bindable);
@@ -1135,6 +1112,7 @@ extern "C" long _ZN7COsiris20RegisterDIVFunctionsEP19TOsirisInitFunction(
     ensure_symbols();  // game is initialised by now; its allocator is usable
     std::call_once(g_init_struct_once, [init_fn] { dump_init_struct(init_fn); });
     void* table = maybe_wrap_div_table(init_fn);
+    ensure_achievement_gate_patch();
     return real != nullptr ? real(self, table) : 0;
 }
 
@@ -1302,15 +1280,11 @@ bool hooked_set_achievement(void* self, const char* name) {
 // pointer is seen, rather than on every FindOrCreateUserInterface call.
 void maybe_hook_user_stats_vtable(void* iface) {
     if (iface == nullptr) return;
-    g_user_stats_iface.store(iface);
     bool expected = false;
     if (!g_user_stats_vtable_patched.compare_exchange_strong(expected, true)) return;
 
     void** vtable = *reinterpret_cast<void***>(iface);
     void** slot = vtable + 7;  // +0x38 -- SetAchievement, per the flat-API thunk
-    // +0x50 -- StoreStats, per the flat-API thunk. Not patched, just cached:
-    // EnableAchievements calls it directly to sync a forced SetAchievement.
-    g_real_store_stats.store(reinterpret_cast<StoreStatsFn>(vtable[10]));
 
     const long page = ::sysconf(_SC_PAGESIZE);
     const auto addr = reinterpret_cast<std::uintptr_t>(slot);
@@ -1379,6 +1353,8 @@ __attribute__((constructor)) static void bg3le_init() {
     log_init();
     logf("bg3le loaded");
     cleanup_sanity_check();
+    // Before main and the fork, so load caches see it.
+    bg3le::ensure_achievement_gate_patch();
 
     // Symbol loading is deferred to the first Osiris callback: allocating
     // here runs before the game's allocator exists.
