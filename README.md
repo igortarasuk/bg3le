@@ -121,10 +121,17 @@ component's declared size with the size the engine recorded, and
   proxy that reads an attribute when it is asked for, as upstream's does.
   Snapshotting all two hundred of them per fetch made a mod's stats pass
   quadratic — the collector's share grew with a heap the mod keeps, 8ms per
-  stat at two thousand and 120ms at ten — and modifier metadata, a list's
-  modifiers, an object's properties and the text behind a pool index are
-  each read once rather than per attribute per stat. Every attribute kind
-  is decoded — ints, floats, strings, GUIDs, enumerations and flag sets;
+  stat at two thousand and 120ms at ten. Everything a mod hits in a loop is
+  indexed rather than scanned: stats by name, names by modifier list,
+  resource banks by GUID, and modifier metadata, a list's modifiers and an
+  object's properties read once rather than per attribute. The one that
+  mattered most was smaller than any of them — `bg3le_fixed_string` cached
+  only successful lookups, so an *unset* FixedString field cost three
+  system calls every time it was read, which came to 73% of the extender's
+  CPU and was the difference between a mod's stats pass finishing in five
+  seconds and never finishing at all. `BG3LE_COUNT_READS=1` is how that was
+  found and how the next one will be. Every attribute kind is decoded —
+  ints, floats, strings, GUIDs, enumerations and flag sets;
   `RPGStats` has no symbol and its layout is not ours (our
   `TreasureRarities` sits at 800 where the engine's is at 3648), so nothing
   is read through a member offset: the anchor is seven consecutive
