@@ -79,6 +79,13 @@ component's declared size with the size the engine recorded, and
   same — and only once a mod subscribes, so until then every node keeps the
   engine's own pointers. Engine-side activity reaches it too: a listener on a
   database sees the fact a procedure's own rule inserts
+- **`Ext.Debug.GenerateIdeHelpers`** writes the LuaLS annotations upstream
+  writes, to the path upstream writes them to: 20,361 `Osi.*` stubs with
+  `@param` and `@return` from the story's own signatures, plus the bare global
+  for each of the 1,302 engine functions. The database names far more than the
+  bound list does — a procedure and a user query have no dispatch handle and
+  are exactly what a mod author wants annotations for — so it is generated
+  from the database and the bound list together
 - **A client Lua context as well as the server's.** The game is two contexts
   in one process and upstream runs a Lua state for each, so bg3le does too:
   each has its own `Ext`, its own `Mods` table, and runs the bootstrap that

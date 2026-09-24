@@ -1988,6 +1988,54 @@ std::size_t load_out_param_counts(std::vector<Function>* functions,
     return applied;
 }
 
+// Every function the database names, whether or not it can be called.
+//
+// story_functions returns only the ones reachable through the engine's
+// dispatch, because its caller binds them. This is for describing them: a
+// procedure and a user query have no dispatch handle and are still what a mod
+// author wants annotations for, so the kind comes from the function object and
+// the id is left at nought when there is none.
+std::vector<Function> all_functions() {
+    const CacheLock lock(osiris_cache_lock());
+
+    std::vector<Function> out;
+    if (!bind_defs()) return out;
+    out.reserve(database().size());
+
+    for (auto const& entry : database()) {
+        if (entry.second.Def == 0) continue;
+
+        const std::size_t slash = entry.first.rfind('/');
+        if (slash == std::string::npos || slash == 0) continue;
+        const std::size_t arity = (std::size_t)std::strtoul(
+            entry.first.c_str() + slash + 1, nullptr, 10);
+        if (entry.second.Types.size() != arity) continue;
+
+        std::uint32_t type = 0;
+        std::uint32_t handle = 0;
+        if (type_offset() != 0) {
+            read_type_and_handle(entry.second.Def, type_offset(), &type,
+                                 &handle);
+        }
+
+        Function fn;
+        fn.name = entry.first.substr(0, slash);
+        // The kind lives in the low three bits of the id, and a function with
+        // no dispatch handle still has a kind: carry it in an id of its own so
+        // Function::kind() answers either way.
+        fn.id = handle != 0 ? handle : (type & 7u);
+        fn.params = entry.second.Types;
+        fn.out_params = entry.second.Outs;
+        out.push_back(std::move(fn));
+    }
+
+    std::sort(out.begin(), out.end(), [](Function const& a, Function const& b) {
+        if (a.name != b.name) return a.name < b.name;
+        return a.params.size() < b.params.size();
+    });
+    return out;
+}
+
 std::vector<Function> story_functions(std::vector<Function> const& known) {
     const CacheLock lock(osiris_cache_lock());
     std::unordered_set<std::string> seen;
@@ -2638,6 +2686,16 @@ bool install_node_hooks() {
 }
 
 }  // namespace
+
+// An Osiris type resolved to one of the five built-in ones.
+//
+// The story declares its own types as aliases of these, so anything that has
+// to name a type -- the IDE helpers, for one -- needs the base rather than the
+// declared id.
+std::uint16_t base_type(std::uint16_t declared) {
+    const CacheLock lock(osiris_cache_lock());
+    return resolve_alias(declared);
+}
 
 std::size_t story_function_count() { return g_story_functions; }
 

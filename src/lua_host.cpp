@@ -281,6 +281,124 @@ int l_watch_osiris(lua_State* L) {
 // session where no mod calls a procedure should not pay. bg3se resolves
 // its Osi.* through a metatable for the same reason; a name that is never
 // used costs nothing.
+// Ext._Internal.OsiIdeHelpers(builtinOnly) -> the annotation text.
+//
+// Upstream's DoGenerateIdeHelpers, over the same data: one LuaLS annotation
+// block and one stub definition per Osiris function, under Osi. and -- for
+// the engine's own functions, which are also globals -- under the bare name
+// as well. Out-parameters become @return rather than @param, and a query with
+// none gets the boolean upstream gives it.
+//
+// CRLF because upstream writes CRLF, so the output can be diffed against the
+// real extender's.
+const char* osi_lua_type(std::uint8_t declared) {
+    switch (osi::base_type(declared)) {
+        case osi::kInteger:
+        case osi::kInteger64: return "integer";
+        case osi::kReal:      return "number";
+        case osi::kString:    return "string";
+        case osi::kGuidString: return "string GUID";
+        default:              return "any";
+    }
+}
+
+bool osi_is_builtin(osi::Function const& fn) {
+    switch (fn.kind()) {
+        case osi::kEvent:
+        case osi::kCall:
+        case osi::kQuery:
+        case osi::kSysCall:
+        case osi::kSysQuery: return true;
+        default: return false;
+    }
+}
+
+void osi_helpers_for(osi::Function const& fn, std::string* out) {
+    // Which trailing parameters the engine fills in. Unknown means none, the
+    // same reading the call path takes.
+    const std::size_t total = fn.params.size();
+    const std::size_t outs =
+        fn.out_params >= 0 ? std::min((std::size_t)fn.out_params, total) : 0;
+    const std::size_t ins = total - outs;
+
+    std::string comment;
+    for (std::size_t i = 0; i < ins; ++i) {
+        comment += "--- @param arg";
+        comment += std::to_string(i + 1);
+        comment += " ";
+        comment += osi_lua_type(fn.params[i]);
+        comment += "\r\n";
+    }
+
+    if (outs > 0) {
+        for (std::size_t i = ins; i < total; ++i) {
+            comment += "--- @return ";
+            comment += osi_lua_type(fn.params[i]);
+            comment += "\r\n";
+        }
+    } else if (fn.is_query()) {
+        comment += "--- @return boolean Did the query succeed?\r\n";
+    }
+
+    std::string defn = fn.name;
+    defn += " = function (";
+    for (std::size_t i = 0; i < ins; ++i) {
+        defn += "arg";
+        defn += std::to_string(i + 1);
+        if (i + 1 < ins) defn += ", ";
+    }
+    defn += ") end\r\n\r\n";
+
+    *out += comment;
+    *out += "Osi.";
+    *out += defn;
+
+    if (osi_is_builtin(fn)) {
+        *out += comment;
+        *out += defn;
+    }
+}
+
+int osi_ide_helpers(lua_State* L) {
+    const bool builtinOnly = lua_toboolean(L, 1) != 0;
+
+    // Everything the database names, not just what is bound: a procedure and
+    // a user query have no dispatch handle, so they never reach g_functions,
+    // and they are exactly what a mod author wants annotations for.
+    std::vector<osi::Function> functions = osi::all_functions();
+    if (functions.empty()) functions = g_functions;
+
+    // The kind comes out of the function object, at an offset only a full
+    // signature walk recovers -- and this story's signatures came from the
+    // cache, so there was no walk and every kind read as nought. The bound
+    // list carries the right id for all 1,303 engine functions whatever
+    // happened, so it fills in what the database could not say. Without this
+    // no function counted as a builtin and none got its global name.
+    std::unordered_map<std::string, std::uint32_t> boundIds;
+    boundIds.reserve(g_functions.size());
+    for (osi::Function const& fn : g_functions) {
+        boundIds.emplace(fn.name + "/" + std::to_string(fn.params.size()),
+                         fn.id);
+    }
+    for (osi::Function& fn : functions) {
+        if (fn.id != 0) continue;
+        auto found =
+            boundIds.find(fn.name + "/" + std::to_string(fn.params.size()));
+        if (found != boundIds.end()) fn.id = found->second;
+    }
+
+    std::string out;
+    out.reserve(0x20000);
+
+    for (osi::Function const& fn : functions) {
+        if (builtinOnly && !osi_is_builtin(fn)) continue;
+        osi_helpers_for(fn, &out);
+    }
+
+    lua_pushlstring(L, out.data(), out.size());
+    return 1;
+}
+
 int osi_story_lookup(lua_State* L) {
     char const* asked = luaL_checkstring(L, 1);
 
@@ -1502,6 +1620,7 @@ extern "C" int bg3le_ext_pak_modules(lua_State* L);
 extern "C" int bg3le_ext_mod_settings_order(lua_State* L);
 extern "C" int bg3le_ext_pak_read(lua_State* L);
 extern "C" int bg3le_ext_save_file(lua_State* L);
+extern "C" int bg3le_ext_write_data_file(lua_State* L);
 extern "C" int bg3le_ext_memory_usage(lua_State* L);
 extern "C" int bg3le_ext_show_error(lua_State* L);
 extern "C" int bg3le_math_add(lua_State* L);
@@ -3602,6 +3721,8 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "Replicate");
     lua_pushcfunction(g_lua, l_world_probe);
     lua_setfield(g_lua, -2, "WorldProbe");
+    lua_pushcfunction(g_lua, osi_ide_helpers);
+    lua_setfield(g_lua, -2, "OsiIdeHelpers");
     lua_pushcfunction(g_lua, osi_story_lookup);
     lua_setfield(g_lua, -2, "StoryFunction");
     lua_pushcfunction(g_lua, l_is_client_state);
@@ -3792,6 +3913,8 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "LoadFile");
     lua_pushcfunction(g_lua, bg3le_ext_save_file);
     lua_setfield(g_lua, -2, "SaveFile");
+    lua_pushcfunction(g_lua, bg3le_ext_write_data_file);
+    lua_setfield(g_lua, -2, "WriteDataFile");
     lua_pushcfunction(g_lua, bg3le_ext_memory_usage);
     lua_setfield(g_lua, -2, "GetMemoryUsage");
     lua_pushcfunction(g_lua, bg3le_ext_show_error);
@@ -4253,9 +4376,38 @@ function Ext.Debug.DebugDumpLifetimes()
   Ext.Log.Print("bg3le does not use lifetime-scoped references")
 end
 
-function Ext.Debug.GenerateIdeHelpers()
-  error("bg3le: Ext.Debug.GenerateIdeHelpers needs the type metadata "
-        .. "writer, which is not implemented", 2)
+-- Ext.Debug.GenerateIdeHelpers(builtinOnly)
+--
+-- One LuaLS annotation block and one stub per Osiris function, written where
+-- upstream writes it: under the base module's Story/RawFiles/Lua in the
+-- game's Data directory, which is the tree an editor has open.
+--
+-- Upstream refuses unless Osiris is available, because the function database
+-- is what it reads; so does this.
+function Ext.Debug.GenerateIdeHelpers(builtinOnly)
+  local base = Ext.Mod.GetBaseMod()
+  local dir = base and base.Info and base.Info.Directory
+  if dir == nil or dir == "" then
+    error("bg3le: Ext.Debug.GenerateIdeHelpers cannot name the base module's "
+          .. "directory", 2)
+  end
+
+  local text = Ext._Internal.OsiIdeHelpers(builtinOnly == true)
+  if text == nil or #text == 0 then
+    error("bg3le: Ext.Debug.GenerateIdeHelpers() can only be called when "
+          .. "Osiris is available", 2)
+  end
+
+  local path, err = Ext._Internal.WriteDataFile(
+    "Mods/" .. dir .. "/Story/RawFiles/Lua/OsiIdeHelpers.lua", text)
+  if path == nil then
+    error("bg3le: Ext.Debug.GenerateIdeHelpers could not save: "
+          .. tostring(err), 2)
+  end
+
+  Ext.Log.Print("bg3le: wrote " .. #text .. " bytes of Osiris IDE helpers to "
+                .. path)
+  return path
 end
 
 function Ext.Debug.Crash()
@@ -4576,9 +4728,9 @@ function Ext.Types.AddCustomProperty(typeName, property, getter, setter)
                          {Get = getter, Set = setter})
 end
 
-function Ext.Types.GenerateIdeHelpers()
-  error("bg3le: Ext.Types.GenerateIdeHelpers needs the annotation writer, "
-        .. "which is not implemented", 2)
+-- Listed under both modules upstream, and the same generator behind each.
+function Ext.Types.GenerateIdeHelpers(builtinOnly)
+  return Ext.Debug.GenerateIdeHelpers(builtinOnly)
 end
 
 -- ---- Ext.Vars ----

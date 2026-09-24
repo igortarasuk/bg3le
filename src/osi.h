@@ -68,9 +68,17 @@ std::size_t load_out_param_counts(std::vector<Function>* functions,
 // what that mapping gave, so the same function is not returned twice.
 std::vector<Function> story_functions(std::vector<Function> const& known);
 
+// Every function the database names, callable or not, sorted by name and
+// arity. For describing them rather than for binding them.
+std::vector<Function> all_functions();
+
 // How many the database held that story_functions could not return, which
 // on this build is all of them: they carry no dispatch handle.
 std::size_t story_function_count();
+
+// An Osiris type resolved to one of the five built-in ones, since the story
+// declares its own as aliases of those.
+std::uint16_t base_type(std::uint16_t declared);
 
 // How many nodes Osiris' node list holds, or 0 if it was not found.
 std::size_t node_count();

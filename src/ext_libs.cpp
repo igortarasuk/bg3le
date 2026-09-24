@@ -336,6 +336,51 @@ extern "C" int bg3le_ext_save_file(lua_State* L) {
     return 1;
 }
 
+// Ext._Internal.WriteDataFile(relative, contents) -> path, or nil and why.
+//
+// Under the game's Data directory rather than the profile, which is where
+// upstream puts the IDE helpers: a mod's own source tree is what an editor
+// has open. Ext.IO.SaveFile deliberately cannot write here, and this is not
+// a general-purpose writer either -- the caller is the helper generator, and
+// the same climb-out refusal applies.
+extern "C" int bg3le_ext_write_data_file(lua_State* L) {
+    char const* relative = luaL_checkstring(L, 1);
+    std::size_t length = 0;
+    char const* contents = luaL_checklstring(L, 2, &length);
+
+    std::string path;
+    if (!resolve_under(data_root(), relative, &path)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s does not resolve under the Data directory",
+                        relative);
+        return 2;
+    }
+    if (!make_parents(path)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "could not create the directories for %s",
+                        path.c_str());
+        return 2;
+    }
+
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "could not open %s for writing", path.c_str());
+        return 2;
+    }
+    const bool ok =
+        length == 0 || std::fwrite(contents, 1, length, f) == length;
+    std::fclose(f);
+
+    if (!ok) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "could not write %s", path.c_str());
+        return 2;
+    }
+    lua_pushstring(L, path.c_str());
+    return 1;
+}
+
 // ---- misc -----------------------------------------------------------------
 
 extern "C" int bg3le_ext_memory_usage(lua_State* L) {
