@@ -1008,6 +1008,7 @@ extern "C" char const* bg3le_meta_class_name(void const* handle);
 extern "C" bool bg3le_meta_type_name_at(void const* handle, char const* path,
                                         char const** name,
                                         std::uint16_t* length);
+extern "C" void* bg3le_global_switches();
 extern "C" bool bg3le_stats_copy_from(void const* dest, void const* source,
                                       std::size_t* carried,
                                       std::size_t* total);
@@ -2535,6 +2536,17 @@ int l_mod_settings(lua_State* L) {
     return 1;
 }
 
+// Ext._Internal.GlobalSwitches() -> address
+//
+// ls::GlobalSwitches has no symbol; src/vendor/global_switches.cpp finds it by
+// its own contents and verifies the base before reporting it.
+int l_global_switches(lua_State* L) {
+    void* at = bg3le_global_switches();
+    if (at == nullptr) return 0;
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)at);
+    return 1;
+}
+
 // Ext._Internal.StatsCopyFrom(destAddr, sourceName) -> carried, total
 int l_stats_copy_from(lua_State* L) {
     auto const* dest = (void const*)(std::uintptr_t)luaL_checkinteger(L, 1);
@@ -4057,6 +4069,8 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "ModList");
     lua_pushcfunction(g_lua, l_stats_copy_from);
     lua_setfield(g_lua, -2, "StatsCopyFrom");
+    lua_pushcfunction(g_lua, l_global_switches);
+    lua_setfield(g_lua, -2, "GlobalSwitches");
     lua_pushcfunction(g_lua, l_stats_attr_translated);
     lua_setfield(g_lua, -2, "StatsAttrTranslated");
     lua_pushcfunction(g_lua, l_stats_attr_condition);
@@ -5864,9 +5878,31 @@ function Ext.Utils.GetGameState()
   return Ext._Internal.GameState and Ext._Internal.GameState() or "Running"
 end
 
+-- The engine's settings object. It has no symbol, so it is searched for by
+-- its own contents -- see src/vendor/global_switches.cpp and
+-- reference/GLOBAL-SWITCHES.md.
+--
+-- The search finds the object's language string reliably and cannot confirm
+-- the base, because bg3se's declared layout is a Windows reverse-engineering
+-- whose offsets are not this build's: two thirds of its members are named
+-- field_NN and several of them are types whose size differs here. So this
+-- refuses rather than handing back an object whose fields read the wrong
+-- bytes, and the log carries the best candidate and the members that
+-- disagreed, so the next attempt starts from a measurement.
+--
+-- If the layout is ever established, nothing else has to change: the address
+-- goes through the same field machinery a component or a resource does, and
+-- all 148 members become reachable by name.
 function Ext.Utils.GetGlobalSwitches()
-  error("bg3le: Ext.Utils.GetGlobalSwitches needs the engine's "
-        .. "GlobalSwitches object, which is not located yet", 2)
+  local addr = Ext._Internal.GlobalSwitches()
+  if addr == nil then
+    error("bg3le: Ext.Utils.GetGlobalSwitches cannot confirm the engine's "
+          .. "GlobalSwitches object -- bg3se's declared layout does not "
+          .. "describe this build's struct, so reading it would report the "
+          .. "wrong fields. The search and what it measured are in the "
+          .. "extender log and reference/GLOBAL-SWITCHES.md", 2)
+  end
+  return Ext._Internal.ReadObject(addr, "GlobalSwitches", "", {})
 end
 
 function Ext.Utils.GetDialogManager()
