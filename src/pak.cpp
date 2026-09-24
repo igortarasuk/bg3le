@@ -271,6 +271,29 @@ bool pak_list(char const* path,
     return true;
 }
 
+bool pak_priority(char const* path, unsigned* priority) {
+    std::FILE* f = std::fopen(path, "rb");
+    if (f == nullptr) return false;
+
+    unsigned char header[kHeaderSize];
+    const bool read = std::fread(header, 1, sizeof(header), f)
+                          == sizeof(header)
+                      && std::memcmp(header, "LSPK", 4) == 0;
+    std::fclose(f);
+    if (!read) return false;
+
+    std::uint32_t version = 0;
+    std::memcpy(&version, header + 4, sizeof(version));
+    // 15 and 16 have no priority field; they are what mod tools wrote, and
+    // the engine gives those the base priority.
+    if (version != 18 && version != 15 && version != 16) return false;
+
+    if (priority != nullptr) {
+        *priority = version == 18 ? header[21] : 0u;
+    }
+    return true;
+}
+
 bool pak_read(char const* path,
               std::function<bool(char const* name)> const& accept,
               std::function<void(char const* name, char const* data,

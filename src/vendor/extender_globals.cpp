@@ -40,6 +40,7 @@
 #include <stdafx.h>
 
 #include <Extender/ScriptExtender.h>
+#include <Extender/Client/ScriptExtenderClient.h>
 #include <GameDefinitions/Symbols.h>
 
 #include <memory>
@@ -92,8 +93,25 @@ void extender_globals_init() {
         bg3se::gExtender = std::make_unique<bg3se::ScriptExtender>();
     }
 
-    logf("extender: globals stood up (config and static symbols; global "
-         "switches are bg3le's default until the engine's is confirmed)");
+    // And the client's extension state, because the ImGui manager's own
+    // update reaches for it every frame.
+    //
+    // IMGUIObjectManager::ClientUpdate does one thing -- pin the client Lua
+    // state and flush the deferred callback queue -- and it gets the state
+    // through ecl::ExtensionState::Get(), which asserts on a null
+    // unique_ptr. That assert traps, so the first frame after a widget tree
+    // was attached killed the game with SIGILL rather than an error.
+    //
+    // ResetExtensionState is what fills it in upstream, and all three things
+    // it does are trivial here: clear a list of local messages, seed an RNG,
+    // clear the path overrides. With the state present the pin finds no Lua
+    // -- bg3le's contexts are its own -- so the flush is skipped, which is
+    // the right answer until bg3le delivers those callbacks itself.
+    bg3se::gExtender->GetClient().ResetExtensionState();
+
+    logf("extender: globals stood up (config, static symbols and the client "
+         "extension state; global switches are bg3le's default until the "
+         "engine's is confirmed)");
 }
 
 // Points GetGlobalSwitches() at the engine's own object.

@@ -2221,6 +2221,27 @@ extern "C" bool bg3le_meta_enum_value_at(char const* enumName,
     return false;
 }
 
+// The value of one label, by name. What Ext.IMGUI needs to accept an enum
+// argument the way upstream does: as a name, not only as a number.
+extern "C" bool bg3le_meta_enum_label_value(char const* enumName,
+                                           char const* label,
+                                           std::uint64_t* value) {
+    if (enumName == nullptr || label == nullptr || value == nullptr) {
+        return false;
+    }
+
+    std::size_t at = 0;
+    char const* name = nullptr;
+    std::uint64_t found = 0;
+    while (bg3le_meta_enum_value_at(enumName, at++, &name, &found)) {
+        if (name != nullptr && std::strcmp(name, label) == 0) {
+            *value = found;
+            return true;
+        }
+    }
+    return false;
+}
+
 extern "C" std::size_t bg3le_meta_enum_count() { return std::size(kAllEnums); }
 
 // Parses a GUID the way the engine spells it, which is the inverse of

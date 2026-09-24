@@ -208,31 +208,8 @@ void EngineHooks::HookAll()
 
 void EngineHooks::UnhookAll() {}
 
-// ---------------------------------------------------------------------------
-// SDLManager
-//
-// Hooks SDL_PollEvent and friends to drive the ImGui overlay. The game does
-// link SDL2, so this is implementable later; it needs the hooks that
-// EngineHooks does.
-// ---------------------------------------------------------------------------
-
-SDLManager::SDLManager() = default;
-SDLManager::~SDLManager() = default;
-
-void SDLManager::EnableHooks()
-{
-    bg3le::logf("SDLManager: SDL hooks are not installed on Linux");
-}
-
-void SDLManager::DisableHooks() {}
-void SDLManager::InitializeUI() {}
-void SDLManager::DestroyUI() {}
-void SDLManager::NewFrame() {}
-
-void SDLManager::InjectEvent(SDL_Event const& evt)
-{
-    (void)evt;
-}
+// SDLManager is in src/vendor/sdl_linux.cpp: the overlay needs the window and
+// the event stream, which is real work rather than a stand-in.
 
 // ---------------------------------------------------------------------------
 // aspk::Component

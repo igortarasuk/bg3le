@@ -154,7 +154,12 @@ list(APPEND VENDOR_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/statics.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/imgui_overlay.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/global_switches.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/extender_globals.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/extender_globals.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/imgui_api.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/file_reader.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/sdl_linux.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/imgui_events.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/imgui_methods.cpp)
 
 # Kept in step with tools/vendor-exclude.txt.
 set(VENDOR_EXCLUDE
@@ -270,6 +275,8 @@ add_library(bg3le SHARED
     src/detour_interpose.cpp
     src/inflate.cpp
     src/pak.cpp
+    src/game_files.cpp
+    src/sdl_forward.cpp
     src/math.cpp
     src/ext_libs.cpp
     # Yann Collet's LZ4, vendored rather than linked: the sniper container

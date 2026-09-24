@@ -21,6 +21,13 @@ namespace bg3le {
 bool pak_list(char const* path,
               std::function<void(char const* name)> const& sink);
 
+// The archive's load priority, as the engine reads it: where two archives
+// hold the same path, the higher priority wins. The game ships most of its
+// own at zero and its patch archives above them.
+//
+// Returns false if `path` is not an archive this reader understands.
+bool pak_priority(char const* path, unsigned* priority);
+
 bool pak_read(char const* path,
               std::function<bool(char const* name)> const& accept,
               std::function<void(char const* name, char const* data,

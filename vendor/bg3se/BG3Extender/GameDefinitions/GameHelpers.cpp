@@ -15,6 +15,13 @@
 #include <GameDefinitions/Ai.inl>
 #include <GameDefinitions/Base/Lock.inl>
 
+// bg3le: reading the game's data out of its archives, since the engine's
+// file reader cannot be called by name in the Linux build.
+namespace bg3le {
+    bg3se::FileReader* make_data_file_reader(std::string_view path);
+    bool destroy_data_file_reader(bg3se::FileReader* reader);
+}
+
 namespace bg3se
 {
     EnumRegistry& EnumRegistry::Get()
@@ -104,6 +111,15 @@ namespace bg3se
 
     FileReaderPin StaticSymbols::MakeFileReader(StringView path, PathRootType root, bool canonicalize) const
     {
+        // bg3le: the engine's reader is unreachable by symbol here, so the
+        // game's own data is read out of its archives instead. See
+        // src/vendor/file_reader.cpp.
+        if (root == PathRootType::Data) {
+            auto* own = bg3le::make_data_file_reader(
+                std::string_view(path.data(), path.size()));
+            if (own != nullptr) return FileReaderPin(own);
+        }
+
         if (ls__PathRoots == nullptr || ls__FileReader__ctor == nullptr) {
             ERR("StaticSymbols::MakeFileReader(): File reader API not available!");
             return FileReaderPin(nullptr);
@@ -125,6 +141,9 @@ namespace bg3se
 
     void StaticSymbols::DestroyFileReader(FileReader* reader)
     {
+        // bg3le: ours to free if bg3le read it; see MakeFileReader above.
+        if (bg3le::destroy_data_file_reader(reader)) return;
+
         if (ls__FileReader__dtor != nullptr) {
             ls__FileReader__dtor(reader);
         }
@@ -790,6 +809,7 @@ void MakePolymorphicRef(lua_State* L, aspk::TLMaterialComponent::Parameter* valu
 END_NS()
 
 #include <GameDefinitions/Render.h>
+
 
 BEGIN_SE()
 

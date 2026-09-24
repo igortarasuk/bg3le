@@ -36,6 +36,7 @@
 
 #include <stdafx.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cmath>
 #include <cstring>
@@ -196,6 +197,144 @@ std::size_t booleans_agreeing(void const* base, Offsets const& at,
     return agreed;
 }
 
+// ---------------------------------------------------------------------------
+// Solving for the layout
+//
+// bg3se's offsets are a Windows reverse-engineering, and the notes in
+// reference/GLOBAL-SWITCHES.md record what the search found: on the
+// best candidate the disagreements begin at +208 and are the same four
+// members run after run. That is the signature of a member before +208 with
+// a different size on this build -- everything after it has drifted by a
+// constant -- rather than of a search finding noise.
+//
+// So rather than accept or reject bg3se's offsets whole, this looks for the
+// drift. Take the lowest offset that disagrees, try shifting every offset
+// from there up by a constant, and keep the shift that agrees best. Repeat
+// on what still disagrees, up to a few breaks.
+//
+// If it converges the answer is a layout, not a guess: a hundred-odd
+// independent checks agreeing on one set of offsets. If it does not, that is
+// reported and the object is still refused.
+// ---------------------------------------------------------------------------
+
+struct Break {
+    std::uint32_t Pivot{0};
+    int Shift{0};
+};
+
+std::uint32_t adjusted(std::uint32_t offset,
+                       std::vector<Break> const& breaks) {
+    int delta = 0;
+    for (Break const& at : breaks) {
+        if (offset >= at.Pivot) delta += at.Shift;
+    }
+    const int moved = (int)offset + delta;
+    return moved < 0 ? 0u : (std::uint32_t)moved;
+}
+
+bool bool_agrees(void const* base, std::uint32_t offset) {
+    std::uint8_t value = 0;
+    if (!safe_read((char const*)base + offset, &value, 1)) return false;
+    return value <= 1;
+}
+
+bool float_agrees(void const* base, std::uint32_t offset) {
+    float value = 0.0f;
+    if (!safe_read((char const*)base + offset, &value, 4)) return false;
+    if (!std::isfinite(value)) return false;
+    const float magnitude = value < 0.0f ? -value : value;
+    return magnitude == 0.0f || (magnitude >= 1e-6f && magnitude <= 1e6f);
+}
+
+// Every declared member that does not read as its own type under these
+// breaks, lowest offset first.
+std::vector<BoolField> disagreements(void const* base, Offsets const& at,
+                                     std::vector<Break> const& breaks) {
+    std::vector<BoolField> bad;
+    for (BoolField const& field : at.Bools) {
+        if (!bool_agrees(base, adjusted(field.Offset, breaks))) {
+            bad.push_back(field);
+        }
+    }
+    for (BoolField const& field : at.Floats) {
+        if (!float_agrees(base, adjusted(field.Offset, breaks))) {
+            bad.push_back(field);
+        }
+    }
+    std::sort(bad.begin(), bad.end(),
+              [](BoolField const& a, BoolField const& b) {
+                  return a.Offset < b.Offset;
+              });
+    return bad;
+}
+
+// How many members from `pivot` up agree under these breaks.
+std::size_t agreeing_from(void const* base, Offsets const& at,
+                          std::vector<Break> const& breaks,
+                          std::uint32_t pivot) {
+    std::size_t agreed = 0;
+    for (BoolField const& field : at.Bools) {
+        if (field.Offset < pivot) continue;
+        if (bool_agrees(base, adjusted(field.Offset, breaks))) ++agreed;
+    }
+    for (BoolField const& field : at.Floats) {
+        if (field.Offset < pivot) continue;
+        if (float_agrees(base, adjusted(field.Offset, breaks))) ++agreed;
+    }
+    return agreed;
+}
+
+std::size_t members_from(Offsets const& at, std::uint32_t pivot) {
+    std::size_t total = 0;
+    for (BoolField const& field : at.Bools) {
+        if (field.Offset >= pivot) ++total;
+    }
+    for (BoolField const& field : at.Floats) {
+        if (field.Offset >= pivot) ++total;
+    }
+    return total;
+}
+
+// The shifts that make this base read as GlobalSwitches, or an empty result
+// if no small set of them does.
+//
+// Shifts are tried in steps of four: a member whose size differs does so by
+// a whole field, and every type in this struct is four- or eight-aligned.
+bool solve_layout(void const* base, Offsets const& at,
+                  std::vector<Break>* breaks) {
+    constexpr int kRange = 128;
+    constexpr int kStep = 4;
+    constexpr std::size_t kMaxBreaks = 6;
+
+    breaks->clear();
+    for (std::size_t round = 0; round < kMaxBreaks; ++round) {
+        const auto bad = disagreements(base, at, *breaks);
+        if (bad.empty()) return true;
+
+        const std::uint32_t pivot = bad.front().Offset;
+        const std::size_t total = members_from(at, pivot);
+        std::size_t best = agreeing_from(base, at, *breaks, pivot);
+        int bestShift = 0;
+
+        for (int shift = -kRange; shift <= kRange; shift += kStep) {
+            if (shift == 0) continue;
+
+            std::vector<Break> trial = *breaks;
+            trial.push_back(Break{pivot, shift});
+            const std::size_t agreed = agreeing_from(base, at, trial, pivot);
+            if (agreed > best) {
+                best = agreed;
+                bestShift = shift;
+            }
+        }
+
+        if (bestShift == 0) return false;  // nothing improves it
+        breaks->push_back(Break{pivot, bestShift});
+        if (best == total) return disagreements(base, at, *breaks).empty();
+    }
+    return disagreements(base, at, *breaks).empty();
+}
+
 void* g_switches = nullptr;
 bool g_searched = false;
 
@@ -314,6 +453,30 @@ void* search() {
             for (std::size_t i = 0; i < bad.size() && i < 16; ++i) {
                 logf("global switches:   +%-5u %s", bad[i].Offset,
                      bad[i].Name != nullptr ? bad[i].Name : "?");
+            }
+
+            // And whether the drift can be solved for. See solve_layout.
+            std::vector<Break> breaks;
+            if (solve_layout(bestAt, at, &breaks)) {
+                logf("global switches: the layout solves with %zu break%s --",
+                     breaks.size(), breaks.size() == 1 ? "" : "s");
+                for (Break const& b : breaks) {
+                    logf("global switches:   everything from +%u shifts by "
+                         "%+d", b.Pivot, b.Shift);
+                }
+                logf("global switches: with those, all %zu declared booleans "
+                     "and %zu floats read as their own type",
+                     at.Bools.size(), at.Floats.size());
+            } else {
+                const auto left = disagreements(bestAt, at, breaks);
+                logf("global switches: the layout does not solve -- %zu "
+                     "break%s tried, %zu members still disagree",
+                     breaks.size(), breaks.size() == 1 ? "" : "s",
+                     left.size());
+                for (Break const& b : breaks) {
+                    logf("global switches:   tried: from +%u shift %+d",
+                         b.Pivot, b.Shift);
+                }
             }
         }
     }

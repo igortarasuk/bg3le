@@ -39,6 +39,14 @@ public:
     void NewFrame();
     void InjectEvent(SDL_Event const& evt);
 
+    // bg3le: the Linux build has no inline hooks, so these are reached from
+    // exported forwarders the dynamic linker routes SDL's calls through --
+    // see src/sdl_forward.cpp. Same bodies as the detoured versions below.
+    void OnCreateWindow(SDL_Window* window);
+    int OnPollEvent(SDLPollEventProc* wrapped, SDL_Event* event);
+    void OnIsTextInputActive(SDL_bool active);
+    bool WantsTextInput() const;
+
 private:
     void SDLCreateWindowHooked(const char* title,
         int x, int y, int w,

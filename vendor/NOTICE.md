@@ -302,6 +302,43 @@ under python3, and with protoc:
     protoc --cpp_out=. Osiris/Debugger/osidebug.proto
     protoc --cpp_out=. Lua/Debugger/LuaDebug.proto
 
+### Three changes of behaviour, not of syntax
+
+Everything above is a clang or ABI fix: the code still does what upstream
+wrote. These three do something different, because on Linux the thing
+upstream relies on is not reachable. `tools/check-vendor-patches.py` checks
+all three, since re-copying a file from upstream reverts them silently.
+
+**`GameDefinitions/GameHelpers.cpp` — `MakeFileReader` reads the archives.**
+Upstream opens a data file through `ls::FileReader`'s constructor, and no
+engine function in this build carries a symbol to call. Every caller got
+"File reader API not available!", including `IMGUIManager::LoadFont`, which
+left the imgui font atlas empty — and Norbyte's imgui fork has
+`AddFontDefault()` disabled, so an empty atlas draws nothing at all.
+`FileReader` is a plain struct, so bg3le reads the game's own LSPK archives
+(`src/game_files.cpp`) and fills one in (`src/vendor/file_reader.cpp`).
+`DestroyFileReader` releases a reader that came from there and falls through
+otherwise.
+
+**`Extender/Client/SDLManager.h` — four public entry points.** Upstream
+detours `SDL_CreateWindow`, `SDL_PollEvent` and the text-input trio. bg3le
+has no inline hooks, but the game imports all five from `libSDL2.so` by name,
+so `src/sdl_forward.cpp` exports them and the dynamic linker routes the calls
+to `src/vendor/sdl_linux.cpp`, which is bg3le's implementation of the class.
+`OnCreateWindow`, `OnPollEvent`, `OnIsTextInputActive` and `WantsTextInput`
+are the same bodies as the private detour hooks, reachable from outside.
+
+**`Lua/Shared/LuaDelegate.h` — a delegate is an id, not a registry
+entry.** Upstream's holds a `lua::RegistryEntry`, which finds its manager
+through `lua::State::FromLua(L)` — bg3se's own Lua state, which bg3le never
+starts, so constructing one dereferenced a null. And calling one marshals the
+arguments through bg3se's userdata machinery, whose metatables are registered
+during that same state's init, so a widget would reach Lua as an object with
+no methods on it. So `LuaDelegate` holds an id into bg3le's own table and
+`Call` posts the arguments to a queue drained on the thread that owns the
+context which registered the callback — `src/vendor/imgui_events.cpp`. A
+widget fires on the render thread, which must not touch a Lua state.
+
 ## vendor/compat — bg3le's own code
 
 Shims that let the upstream sources compile unmodified. They are force-included

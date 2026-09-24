@@ -1,5 +1,36 @@
 #pragma once
 
+// bg3le: where a delegate's arguments go, and where Push finds its
+// function. Declared rather than included, because the queue is bg3le's own
+// and does not depend on anything here.
+namespace bg3se::lua { struct ImguiHandle; }
+
+namespace bg3le {
+    using Widget = bg3se::lua::ImguiHandle const&;
+
+    void delegate_push(lua_State* L, uint32_t id);
+    void delegate_post(uint32_t id);
+    void delegate_post(uint32_t id, Widget widget);
+    void delegate_post(uint32_t id, Widget widget, bool value);
+    void delegate_post(uint32_t id, Widget widget, int value);
+    void delegate_post(uint32_t id, Widget widget, Widget value);
+    void delegate_post(uint32_t id, Widget widget, glm::vec4 const& value);
+    void delegate_post(uint32_t id, Widget widget, glm::ivec4 const& value);
+    void delegate_post(uint32_t id, Widget widget,
+                       bg3se::STDString const& value);
+
+    // Anything bg3le has no delivery for. Non-template overloads win, so
+    // this catches only the shapes above have not covered; it reports the
+    // drop rather than failing to build.
+    void delegate_unsupported(uint32_t id, char const* what);
+
+    template <class... TArgs>
+    inline void delegate_post(uint32_t id, TArgs&&...)
+    {
+        delegate_unsupported(id, "an argument shape bg3le does not deliver");
+    }
+}
+
 BEGIN_NS(lua)
 
 template <class TArgs, class TReturn>
@@ -8,6 +39,24 @@ struct ProtectedFunctionCaller;
 template <class T>
 class LuaDelegate;
 
+// bg3le: a delegate here is an id into bg3le's own table, not a
+// lua::RegistryEntry.
+//
+// Upstream's holds a RegistryEntry, which reaches its manager through
+// lua::State::FromLua(L) -- bg3se's own Lua state. bg3le runs its own
+// contexts and never starts bg3se's, so constructing one jumped through a
+// null. And calling one marshals the arguments through bg3se's userdata
+// machinery, whose metatables are registered during that same state's init,
+// so a widget would arrive in Lua as an object with no methods.
+//
+// So the id is all that is stored, and Call posts the arguments to a queue
+// bg3le drains on the thread that owns the context which registered the
+// callback -- the render thread is where a widget fires, and it must not
+// touch Lua. See src/vendor/imgui_events.cpp and Ext.IMGUI in
+// src/lua_host.cpp.
+//
+// Zero is "not set", which is what operator bool reports, and is what the
+// widget code checks before queueing anything at all.
 template<class TRet, class ...TArgs>
 class LuaDelegate<TRet(TArgs...)>
 {
@@ -16,49 +65,55 @@ public:
     using ArgumentTuple = std::tuple<TArgs...>;
 
     inline LuaDelegate() {}
-    inline LuaDelegate(lua_State* L, int index)
-        : ref_(L, index)
-    {}
 
-    inline LuaDelegate(lua_State* L, Ref const& local)
-        : ref_(L, local)
-    {}
-
-    inline LuaDelegate(lua_State* L, FunctionRef const& f)
-        : ref_(L, f.Index)
-    {}
+    // The three upstream constructors take a function off a Lua stack, which
+    // only bg3se's own binding layer does. bg3le's callbacks are registered
+    // through Ext._Internal.ImguiSetCallback instead, so these yield an
+    // unset delegate rather than pretending to hold one.
+    inline LuaDelegate(lua_State* L, int index) {}
+    inline LuaDelegate(lua_State* L, Ref const& local) {}
+    inline LuaDelegate(lua_State* L, FunctionRef const& f) {}
 
     inline ~LuaDelegate() {}
 
     inline LuaDelegate(LuaDelegate const& o)
-        : ref_(o.ref_)
+        : id_(o.id_)
     {}
 
     inline LuaDelegate(LuaDelegate && o) noexcept
-    {
-        ref_ = std::move(o.ref_);
-    }
+        : id_(o.id_)
+    {}
 
     inline LuaDelegate& operator = (LuaDelegate const& o)
     {
-        ref_ = o.ref_;
+        id_ = o.id_;
         return *this;
     }
-    
+
     inline LuaDelegate& operator = (LuaDelegate && o) noexcept
     {
-        ref_ = std::move(o.ref_);
+        id_ = o.id_;
         return *this;
     }
 
     explicit inline operator bool() const
     {
-        return (bool)ref_;
+        return id_ != 0;
+    }
+
+    inline uint32_t Id() const
+    {
+        return id_;
+    }
+
+    inline void SetId(uint32_t id)
+    {
+        id_ = id;
     }
 
     inline void Push(lua_State* L) const
     {
-        ref_.Push(L);
+        bg3le::delegate_push(L, id_);
     }
 
     TRet Call(lua_State* L, TArgs... args)
@@ -72,26 +127,19 @@ public:
 
     TRet Call(lua_State* L, ArgumentTuple const& args)
     {
-        EnterVMCheck(L);
-        StackCheck _(L);
+        std::apply(
+            [this](auto const&... unpacked) {
+                bg3le::delegate_post(id_, unpacked...);
+            },
+            args);
 
-        ref_.Push(L);
-        Ref func(L, lua_absindex(L, -1));
-
-        ProtectedFunctionCaller<ArgumentTuple, TRet> caller{ func, args };
-
-        if constexpr (std::is_same_v<TRet, void>) {
-            caller.Call(L);
-            lua_pop(L, 1);
-        } else {
-            auto rval = caller.Call(L);
-            lua_pop(L, 1);
-            return rval;
+        if constexpr (!std::is_same_v<TRet, void>) {
+            return TRet{};
         }
     }
 
 private:
-    RegistryEntry ref_;
+    uint32_t id_{ 0 };
 };
 
 template <class T>

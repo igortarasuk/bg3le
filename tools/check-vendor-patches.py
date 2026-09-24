@@ -114,6 +114,19 @@ CHECKS = [
     ("NsCustomDataContext has a usual operator delete",
      lambda: "static void operator delete(void* ptr) noexcept"
              in text("BG3Extender/Lua/Libs/ClientUI/CustomProperties.inl")),
+
+    # These three are not clang fixes; they are the places bg3le had to
+    # change upstream's behaviour rather than its syntax. Losing one is
+    # silent and expensive, so they are checked the same way.
+    ("MakeFileReader reads the game's archives",
+     lambda: "bg3le::make_data_file_reader"
+             in text("BG3Extender/GameDefinitions/GameHelpers.cpp")),
+    ("SDLManager has the Linux forwarder entry points",
+     lambda: "int OnPollEvent(SDLPollEventProc* wrapped, SDL_Event* event);"
+             in text("BG3Extender/Extender/Client/SDLManager.h")),
+    ("LuaDelegate posts to bg3le's callback queue",
+     lambda: "bg3le::delegate_post"
+             in text("BG3Extender/Lua/Shared/LuaDelegate.h")),
 ]
 
 

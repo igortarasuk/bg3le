@@ -1009,8 +1009,45 @@ extern "C" bool bg3le_meta_type_name_at(void const* handle, char const* path,
                                         char const** name,
                                         std::uint16_t* length);
 extern "C" void* bg3le_global_switches();
+#include "vendor/imgui_args.h"
+
 extern "C" void bg3le_imgui_status(bool* wanted, bool* started,
                                    bool* initialized);
+extern "C" std::uint64_t bg3le_imgui_new_window(char const* name);
+extern "C" std::uint64_t bg3le_imgui_add(std::uint64_t parent,
+                                         char const* kind,
+                                         ImguiArg const* args,
+                                         std::size_t count);
+extern "C" bool bg3le_imgui_call(std::uint64_t handle, char const* name,
+                                 ImguiArg const* args, std::size_t count,
+                                 ImguiArg* out);
+extern "C" std::size_t bg3le_imgui_children(std::uint64_t handle,
+                                            std::uint64_t* out,
+                                            std::size_t capacity);
+extern "C" void* bg3le_imgui_object(std::uint64_t handle,
+                                    char const** typeName);
+extern "C" bool bg3le_imgui_destroy(std::uint64_t handle);
+extern "C" void bg3le_imgui_enable_demo(bool enabled);
+extern "C" void bg3le_imgui_frame_stats(std::uint64_t* frames, int* vertices,
+                                        int* lists, int* drawnFrames);
+extern "C" void bg3le_imgui_hold_mouse(float x, float y, bool holding);
+extern "C" void bg3le_imgui_click_at(float x, float y, int button);
+extern "C" void bg3le_imgui_input_state(float* mouseX, float* mouseY,
+                                        float* displayW, float* displayH,
+                                        bool* mouseDown, bool* wantMouse,
+                                        bool* hoveredWindow,
+                                        bool* navNoHover);
+extern "C" std::uint32_t bg3le_imgui_set_callback(std::uint64_t handle,
+                                                  char const* name,
+                                                  void* state);
+extern "C" bool bg3le_imgui_clear_callback(std::uint64_t handle,
+                                           char const* name);
+extern "C" bool bg3le_imgui_take_event(void* state, std::uint32_t* id,
+                                       std::uint64_t* widget,
+                                       std::uint8_t* argKind, bool* argBool,
+                                       int* argInt, std::uint64_t* argWidget,
+                                       float* argVec, int* argIVec,
+                                       char const** argString);
 extern "C" bool bg3le_stats_name_id(void const* object, std::uint32_t* out);
 extern "C" bool bg3le_fixed_string_recheck(std::uint32_t id,
                                            char const** cached,
@@ -2571,6 +2608,376 @@ int l_stats_name_recheck(lua_State* L) {
     return 3;
 }
 
+// A widget handle is index | salt << 24 | type << 56, and the first window
+// gets every one of those as zero -- Window is the first object type and a
+// fresh pool slot starts at salt zero. So zero is a real handle and only
+// InvalidHandle means failure.
+constexpr std::uint64_t kImguiInvalidHandle = 0xffffffffffffffffull;
+
+// Ext._Internal.ImguiNewWindow(name) -> handle
+int l_imgui_new_window(lua_State* L) {
+    const auto handle = bg3le_imgui_new_window(luaL_checkstring(L, 1));
+    if (handle == kImguiInvalidHandle) return 0;
+    lua_pushinteger(L, (lua_Integer)handle);
+    return 1;
+}
+
+// Lua's own values, read into the form the widget methods take.
+//
+// A vector arrives as a table of numbers, a widget as one carrying a Handle,
+// and nil is an argument the caller left out -- which is exactly what
+// upstream's std::optional parameters mean. Strings point into the Lua stack,
+// so nothing here outlives the call that reads it.
+void read_imgui_args(lua_State* L, int first, ImguiArg* out,
+                     std::size_t* count) {
+    *count = 0;
+    const int top = lua_gettop(L);
+
+    for (int at = first; at <= top && *count < kImguiMaxArgs; ++at) {
+        ImguiArg& arg = out[(*count)++];
+        arg = ImguiArg{};
+
+        switch (lua_type(L, at)) {
+        case LUA_TBOOLEAN:
+            arg.Kind = kImguiArgBool;
+            arg.Bool = lua_toboolean(L, at) != 0;
+            break;
+
+        case LUA_TNUMBER:
+            arg.Kind = lua_isinteger(L, at) ? kImguiArgInt : kImguiArgNumber;
+            arg.Int = (int)lua_tointeger(L, at);
+            arg.Number = lua_tonumber(L, at);
+            break;
+
+        case LUA_TSTRING:
+            arg.Kind = kImguiArgText;
+            arg.Text = lua_tostring(L, at);
+            break;
+
+        case LUA_TTABLE: {
+            // A widget, if it carries a handle; a vector otherwise.
+            lua_getfield(L, at, "Handle");
+            if (lua_isinteger(L, -1)) {
+                arg.Kind = kImguiArgHandle;
+                arg.Handle = (std::uint64_t)lua_tointeger(L, -1);
+                lua_pop(L, 1);
+                break;
+            }
+            lua_pop(L, 1);
+
+            int written = 0;
+            for (int i = 1; i <= 4; ++i) {
+                lua_rawgeti(L, at, i);
+                if (!lua_isnumber(L, -1)) {
+                    lua_pop(L, 1);
+                    break;
+                }
+                arg.Vec[written++] = (float)lua_tonumber(L, -1);
+                lua_pop(L, 1);
+            }
+
+            switch (written) {
+            case 2: arg.Kind = kImguiArgVec2; break;
+            case 3: arg.Kind = kImguiArgVec3; break;
+            case 4: arg.Kind = kImguiArgVec4; break;
+            default: arg.Kind = kImguiArgNone; break;
+            }
+            break;
+        }
+
+        default:
+            // nil, and anything else, is "not passed".
+            arg.Kind = kImguiArgNone;
+            break;
+        }
+    }
+}
+
+// The result of a method, as the value Lua should see plus whether it is a
+// widget handle the caller has to wrap.
+int push_imgui_result(lua_State* L, ImguiArg const& value) {
+    switch (value.Kind) {
+    case kImguiArgBool:
+        lua_pushboolean(L, value.Bool ? 1 : 0);
+        lua_pushboolean(L, 0);
+        return 2;
+
+    case kImguiArgInt:
+        lua_pushinteger(L, value.Int);
+        lua_pushboolean(L, 0);
+        return 2;
+
+    case kImguiArgNumber:
+        lua_pushnumber(L, value.Number);
+        lua_pushboolean(L, 0);
+        return 2;
+
+    case kImguiArgText:
+        lua_pushstring(L, value.Text != nullptr ? value.Text : "");
+        lua_pushboolean(L, 0);
+        return 2;
+
+    case kImguiArgVec2:
+    case kImguiArgVec3:
+    case kImguiArgVec4: {
+        const int width = value.Kind == kImguiArgVec2   ? 2
+                          : value.Kind == kImguiArgVec3 ? 3
+                                                        : 4;
+        lua_createtable(L, width, 0);
+        for (int i = 0; i < width; ++i) {
+            lua_pushnumber(L, value.Vec[i]);
+            lua_rawseti(L, -2, i + 1);
+        }
+        lua_pushboolean(L, 0);
+        return 2;
+    }
+
+    case kImguiArgHandle:
+        if (value.Handle == kImguiInvalidHandle) {
+            lua_pushnil(L);
+            lua_pushboolean(L, 0);
+            return 2;
+        }
+        lua_pushinteger(L, (lua_Integer)value.Handle);
+        lua_pushboolean(L, 1);
+        return 2;
+
+    default:
+        lua_pushnil(L);
+        lua_pushboolean(L, 0);
+        return 2;
+    }
+}
+
+// Ext._Internal.ImguiAdd(parent, kind, ...) -> handle
+int l_imgui_add(lua_State* L) {
+    const auto parent = (std::uint64_t)luaL_checkinteger(L, 1);
+    char const* kind = luaL_checkstring(L, 2);
+
+    ImguiArg args[kImguiMaxArgs];
+    std::size_t count = 0;
+    read_imgui_args(L, 3, args, &count);
+
+    const auto handle = bg3le_imgui_add(parent, kind, args, count);
+    if (handle == kImguiInvalidHandle) return 0;
+    lua_pushinteger(L, (lua_Integer)handle);
+    return 1;
+}
+
+// Ext._Internal.ImguiCall(handle, name, ...) -> ok, value, isWidget
+int l_imgui_call(lua_State* L) {
+    const auto handle = (std::uint64_t)luaL_checkinteger(L, 1);
+    char const* name = luaL_checkstring(L, 2);
+
+    ImguiArg args[kImguiMaxArgs];
+    std::size_t count = 0;
+    read_imgui_args(L, 3, args, &count);
+
+    ImguiArg result{};
+    if (!bg3le_imgui_call(handle, name, args, count, &result)) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    lua_pushboolean(L, 1);
+    return 1 + push_imgui_result(L, result);
+}
+
+// Ext._Internal.ImguiChildren(handle) -> array of handles
+int l_imgui_children(lua_State* L) {
+    const auto handle = (std::uint64_t)luaL_checkinteger(L, 1);
+
+    const std::size_t total = bg3le_imgui_children(handle, nullptr, 0);
+    std::vector<std::uint64_t> children(total);
+    const std::size_t got =
+        total == 0 ? 0 : bg3le_imgui_children(handle, children.data(), total);
+
+    lua_createtable(L, (int)std::min(got, total), 0);
+    for (std::size_t i = 0; i < total && i < got; ++i) {
+        lua_pushinteger(L, (lua_Integer)children[i]);
+        lua_rawseti(L, -2, (int)i + 1);
+    }
+    return 1;
+}
+
+// Ext._Internal.ImguiObject(handle) -> address, className
+//
+// What the field machinery needs to read or write a widget's properties: the
+// same pair a static data resource is read through. Resolved per access
+// rather than kept, because a widget lives in a pool that can move it.
+int l_imgui_object(lua_State* L) {
+    char const* typeName = nullptr;
+    void* at = bg3le_imgui_object((std::uint64_t)luaL_checkinteger(L, 1),
+                                  &typeName);
+    if (at == nullptr) return 0;
+
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)at);
+    // bg3se's own short name for the type; the field tables are keyed by the
+    // qualified one, which Ext._Internal.ClassName resolves.
+    lua_pushstring(L, typeName != nullptr ? typeName : "");
+    return 2;
+}
+
+int l_imgui_destroy(lua_State* L) {
+    lua_pushboolean(
+        L, bg3le_imgui_destroy((std::uint64_t)luaL_checkinteger(L, 1)) ? 1 : 0);
+    return 1;
+}
+
+// Ext._Internal.ImguiFrameStats() -> frames, vertices, drawLists
+//
+// What the last drawn frame produced. A widget tree that is attached but not
+// rendering looks exactly like one that is, until you count the geometry.
+int l_imgui_frame_stats(lua_State* L) {
+    std::uint64_t frames = 0;
+    int vertices = 0;
+    int lists = 0;
+    int drawn = 0;
+    bg3le_imgui_frame_stats(&frames, &vertices, &lists, &drawn);
+    lua_pushinteger(L, (lua_Integer)frames);
+    lua_pushinteger(L, vertices);
+    lua_pushinteger(L, lists);
+    lua_pushinteger(L, drawn);
+    return 4;
+}
+
+// Ext._Internal.ImguiSetCallback(handle, name) -> id or nil
+//
+// The calling state is what identifies the context, so an event a client
+// mod registered is never handed to the server's Lua.
+int l_imgui_set_callback(lua_State* L) {
+    const auto handle = (std::uint64_t)luaL_checkinteger(L, 1);
+    const auto id =
+        bg3le_imgui_set_callback(handle, luaL_checkstring(L, 2), (void*)L);
+    if (id == 0) return 0;
+    lua_pushinteger(L, (lua_Integer)id);
+    return 1;
+}
+
+int l_imgui_clear_callback(lua_State* L) {
+    const auto handle = (std::uint64_t)luaL_checkinteger(L, 1);
+    lua_pushboolean(
+        L, bg3le_imgui_clear_callback(handle, luaL_checkstring(L, 2)) ? 1 : 0);
+    return 1;
+}
+
+// Ext._Internal.ImguiTakeEvent() -> id, widgetHandle, argument
+//
+// Nothing if the queue holds nothing for this context. The argument is
+// whatever the event carries, already in Lua's own types.
+int l_imgui_take_event(lua_State* L) {
+    std::uint32_t id = 0;
+    std::uint64_t widget = 0;
+    std::uint8_t kind = 0;
+    bool argBool = false;
+    int argInt = 0;
+    std::uint64_t argWidget = 0;
+    float argVec[4] = {0, 0, 0, 0};
+    int argIVec[4] = {0, 0, 0, 0};
+    char const* argString = nullptr;
+
+    if (!bg3le_imgui_take_event((void*)L, &id, &widget, &kind, &argBool,
+                                &argInt, &argWidget, argVec, argIVec,
+                                &argString)) {
+        return 0;
+    }
+
+    lua_pushinteger(L, (lua_Integer)id);
+    lua_pushinteger(L, (lua_Integer)widget);
+
+    // Kept in step with ArgKind in src/vendor/imgui_events.cpp.
+    switch (kind) {
+    case 1:
+        lua_pushboolean(L, argBool ? 1 : 0);
+        break;
+    case 2:
+        lua_pushinteger(L, argInt);
+        break;
+    case 3:
+        lua_pushinteger(L, (lua_Integer)argWidget);
+        break;
+    case 4:
+        lua_createtable(L, 4, 0);
+        for (int i = 0; i < 4; ++i) {
+            lua_pushnumber(L, argVec[i]);
+            lua_rawseti(L, -2, i + 1);
+        }
+        break;
+    case 5:
+        lua_createtable(L, 4, 0);
+        for (int i = 0; i < 4; ++i) {
+            lua_pushinteger(L, argIVec[i]);
+            lua_rawseti(L, -2, i + 1);
+        }
+        break;
+    case 6:
+        lua_pushstring(L, argString != nullptr ? argString : "");
+        break;
+    default:
+        lua_pushnil(L);
+        break;
+    }
+    return 3;
+}
+
+// Ext._Internal.ImguiInputState() -> mouseX, mouseY, width, height, down
+int l_imgui_input_state(lua_State* L) {
+    float x = 0;
+    float y = 0;
+    float w = 0;
+    float h = 0;
+    bool down = false;
+    bool wantMouse = false;
+    bool hoveredWindow = false;
+    bool navNoHover = false;
+    bg3le_imgui_input_state(&x, &y, &w, &h, &down, &wantMouse, &hoveredWindow,
+                            &navNoHover);
+    lua_pushnumber(L, x);
+    lua_pushnumber(L, y);
+    lua_pushnumber(L, w);
+    lua_pushnumber(L, h);
+    lua_pushboolean(L, down ? 1 : 0);
+    lua_pushboolean(L, wantMouse ? 1 : 0);
+    lua_pushboolean(L, hoveredWindow ? 1 : 0);
+    lua_pushboolean(L, navNoHover ? 1 : 0);
+    return 8;
+}
+
+// Ext._Internal.ImguiMouseMove(x, y) -- or no arguments to let go
+//
+// What the overlay needs to be driven without a mouse: a test, or a mod
+// automating its own UI. imgui sees these exactly as it sees the real ones.
+//
+// The position is held rather than sent once, because the SDL backend sets
+// it from the real mouse every frame and would otherwise put it straight
+// back.
+int l_imgui_mouse_move(lua_State* L) {
+    if (lua_isnoneornil(L, 1)) {
+        bg3le_imgui_hold_mouse(0, 0, false);
+        return 0;
+    }
+    bg3le_imgui_hold_mouse((float)luaL_checknumber(L, 1),
+                           (float)luaL_checknumber(L, 2), true);
+    return 0;
+}
+
+// Ext._Internal.ImguiClickAt(x, y[, button]) -- a press and a release
+//
+// Queued, and applied one change per frame: two button changes in one frame
+// are one click to a widget, so a sweep that sent them all at once would
+// register once.
+int l_imgui_click_at(lua_State* L) {
+    bg3le_imgui_click_at((float)luaL_checknumber(L, 1),
+                         (float)luaL_checknumber(L, 2),
+                         (int)luaL_optinteger(L, 3, 0));
+    return 0;
+}
+
+int l_imgui_enable_demo(lua_State* L) {
+    bg3le_imgui_enable_demo(lua_toboolean(L, 1) != 0);
+    return 0;
+}
+
 // Ext._Internal.ImguiStatus() -> wanted, started, initialized
 int l_imgui_status(lua_State* L) {
     bool wanted = false;
@@ -4120,6 +4527,34 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "GlobalSwitches");
     lua_pushcfunction(g_lua, l_imgui_status);
     lua_setfield(g_lua, -2, "ImguiStatus");
+    lua_pushcfunction(g_lua, l_imgui_new_window);
+    lua_setfield(g_lua, -2, "ImguiNewWindow");
+    lua_pushcfunction(g_lua, l_imgui_add);
+    lua_setfield(g_lua, -2, "ImguiAdd");
+    lua_pushcfunction(g_lua, l_imgui_call);
+    lua_setfield(g_lua, -2, "ImguiCall");
+    lua_pushcfunction(g_lua, l_imgui_children);
+    lua_setfield(g_lua, -2, "ImguiChildren");
+    lua_pushcfunction(g_lua, l_imgui_object);
+    lua_setfield(g_lua, -2, "ImguiObject");
+    lua_pushcfunction(g_lua, l_imgui_destroy);
+    lua_setfield(g_lua, -2, "ImguiDestroy");
+    lua_pushcfunction(g_lua, l_imgui_enable_demo);
+    lua_setfield(g_lua, -2, "ImguiEnableDemo");
+    lua_pushcfunction(g_lua, l_imgui_frame_stats);
+    lua_setfield(g_lua, -2, "ImguiFrameStats");
+    lua_pushcfunction(g_lua, l_imgui_set_callback);
+    lua_setfield(g_lua, -2, "ImguiSetCallback");
+    lua_pushcfunction(g_lua, l_imgui_clear_callback);
+    lua_setfield(g_lua, -2, "ImguiClearCallback");
+    lua_pushcfunction(g_lua, l_imgui_take_event);
+    lua_setfield(g_lua, -2, "ImguiTakeEvent");
+    lua_pushcfunction(g_lua, l_imgui_input_state);
+    lua_setfield(g_lua, -2, "ImguiInputState");
+    lua_pushcfunction(g_lua, l_imgui_mouse_move);
+    lua_setfield(g_lua, -2, "ImguiMouseMove");
+    lua_pushcfunction(g_lua, l_imgui_click_at);
+    lua_setfield(g_lua, -2, "ImguiClickAt");
     lua_pushcfunction(g_lua, l_stats_name_recheck);
     lua_setfield(g_lua, -2, "StatsNameRecheck");
     lua_pushcfunction(g_lua, l_stats_attr_translated);
@@ -4923,6 +5358,291 @@ local LUA_TYPE_ID = {
 }
 
 local type_names_cache
+
+-- ---- Ext.IMGUI ----
+--
+-- Upstream's seven module functions and the widget objects NewWindow hands
+-- back. The names and shapes are upstream's exactly -- a mod written against
+-- bg3se has to run here unmodified -- and the implementation is bg3se's own
+-- widget tree, which is compiled into libbg3le.so; see
+-- reference/IMGUI-ASSESSMENT.md.
+--
+-- A widget is a handle, not a pointer: it lives in a pool that can move it,
+-- so the address and class are resolved on every access rather than kept.
+-- Properties go through the same field machinery a component or a static data
+-- resource does, so every property bg3se's maps describe is readable and
+-- writable by name. The Add* methods are P_FUN entries, which the field
+-- tables deliberately leave out, so they are bound here.
+--
+-- Client-side only, as upstream has it.
+Ext.IMGUI = {}
+
+-- Which Add* methods a widget that can hold children offers. One table
+-- rather than thirty closures, and the C side takes the kind by name for the
+-- same reason: from Lua every one of them is a label in and a widget out, and
+-- anything else the widget needs is set through its properties afterwards.
+local IMGUI_ADD = {
+  -- Containers.
+  AddGroup = "Group", AddCollapsingHeader = "CollapsingHeader",
+  AddTabBar = "TabBar", AddTree = "Tree", AddTable = "Table",
+  AddPopup = "Popup", AddChildWindow = "ChildWindow", AddMenu = "Menu",
+  -- Text.
+  AddText = "Text", AddTextLink = "TextLink", AddBulletText = "BulletText",
+  AddSeparatorText = "SeparatorText",
+  -- Layout.
+  AddSpacing = "Spacing", AddNewLine = "NewLine", AddSeparator = "Separator",
+  AddDummy = "Dummy",
+  -- Buttons and selection.
+  AddButton = "Button", AddSelectable = "Selectable",
+  AddImageButton = "ImageButton", AddCheckbox = "Checkbox",
+  AddRadioButton = "RadioButton", AddCombo = "Combo",
+  -- Images.
+  AddImage = "Image", AddIcon = "Icon",
+  -- Numbers and text entry.
+  AddInputText = "InputText", AddDrag = "Drag", AddDragInt = "DragInt",
+  AddSlider = "Slider", AddSliderInt = "SliderInt",
+  AddInputScalar = "InputScalar", AddInputInt = "InputInt",
+  AddColorEdit = "ColorEdit", AddColorPicker = "ColorPicker",
+  AddProgressBar = "ProgressBar",
+}
+
+-- The methods that are not Add*. Dispatched by name on the C side, which is
+-- where the widget's own type decides whether it has them; a name that this
+-- widget does not offer reports so rather than doing nothing.
+local IMGUI_METHOD = {
+  Destroy = true, GetStyle = true, SetStyle = true, GetColor = true,
+  SetColor = true, Activate = true, Tooltip = true,
+  RemoveChild = true, DetachChild = true, AttachChild = true,
+  RemoveAllChildren = true, GetChildren = true,
+  SetPos = true, SetSize = true, SetSizeConstraints = true,
+  SetContentSize = true, SetCollapsed = true, SetFocus = true,
+  SetScroll = true, SetBgAlpha = true,
+  AddMainMenu = true, AddTabItem = true, SetOpen = true, AddRow = true,
+  AddColumn = true, AddCell = true, Open = true, AddItem = true,
+}
+
+local imgui_widget = {}
+local make_widget
+
+local function type_of_widget(handle)
+  local _, short = Ext._Internal.ImguiObject(handle)
+  return short
+end
+
+-- The address and class of a widget right now, or nil if it is gone.
+local function widget_object(handle)
+  local addr, short = Ext._Internal.ImguiObject(handle)
+  if addr == nil then return nil end
+  -- The field tables are keyed by the qualified class name.
+  return addr, Ext._Internal.ClassName("extui::" .. short) or short
+end
+
+-- Callbacks.
+--
+-- The function stays here, filed under the id the C side hands back and
+-- writes into the widget; see src/vendor/imgui_events.cpp for why it is not
+-- held over there. A widget fires on the render thread, so nothing is called
+-- at that moment: the arguments are queued and drained from this context's
+-- tick, below.
+local imgui_callbacks = {}
+
+-- Which widget table to hand a callback, so the same widget arrives as the
+-- same table each time and `self` behaves. Weak-valued, so a widget the mod
+-- has dropped does not keep its table alive.
+local imgui_widgets = setmetatable({}, {__mode = "v"})
+
+local imgui_methods = {}
+
+function imgui_methods:Destroy()
+  local handle = rawget(self, "Handle")
+  for _, id in pairs(rawget(self, "Callbacks") or {}) do
+    imgui_callbacks[id] = nil
+  end
+  imgui_widgets[handle] = nil
+  return Ext._Internal.ImguiDestroy(handle)
+end
+
+imgui_widget.__index = function(self, key)
+  local method = imgui_methods[key]
+  if method ~= nil then return method end
+
+  local handle = rawget(self, "Handle")
+
+  -- An Add* call: make the child and hand back a widget for it.
+  local kind = IMGUI_ADD[key]
+  if kind ~= nil then
+    return function(_, ...)
+      local child = Ext._Internal.ImguiAdd(handle, kind, ...)
+      if child == nil then
+        error("bg3le: " .. key .. " is not available on this widget", 2)
+      end
+      return make_widget(child)
+    end
+  end
+
+  -- An event reads back as the function that was set, which is what
+  -- upstream's delegate does.
+  local registered = rawget(self, "Callbacks")
+  if registered ~= nil and registered[key] ~= nil then
+    return imgui_callbacks[registered[key]]
+  end
+
+  local addr, class = widget_object(handle)
+
+  -- A property of this widget's own class, before a method of that name.
+  --
+  -- The two namespaces overlap: Popup has an Open() method and Window has an
+  -- Open property, and a flat method table made `window.Open` a function.
+  -- Whether this class declares the property is what decides, which is the
+  -- same thing upstream's per-class property maps decide.
+  if addr ~= nil then
+    local value, err = Ext._Internal.ObjectGetField(addr, class, key)
+    if err == nil then return value end
+  end
+
+  if IMGUI_METHOD[key] then
+    if key == "Destroy" then return imgui_methods.Destroy end
+    if key == "GetChildren" then
+      return function()
+        local children = Ext._Internal.ImguiChildren(handle)
+        for i, child in ipairs(children) do children[i] = make_widget(child) end
+        return children
+      end
+    end
+
+    return function(_, ...)
+      local ok, value, isWidget = Ext._Internal.ImguiCall(handle, key, ...)
+      if not ok then
+        error(string.format("bg3le: %s is not a method on this widget (%s)",
+                            tostring(key), tostring(type_of_widget(handle))), 2)
+      end
+      if isWidget then return make_widget(value) end
+      return value
+    end
+  end
+
+  return nil
+end
+
+imgui_widget.__newindex = function(self, key, value)
+  local handle = rawget(self, "Handle")
+
+  -- A function can only be an event handler: no other property of a widget
+  -- takes one, and the C side refuses a name that is not a delegate.
+  local registered = rawget(self, "Callbacks")
+  if type(value) == "function" or registered ~= nil and registered[key] then
+    if registered == nil then
+      registered = {}
+      rawset(self, "Callbacks", registered)
+    end
+
+    local was = registered[key]
+    if was ~= nil then
+      imgui_callbacks[was] = nil
+      registered[key] = nil
+      Ext._Internal.ImguiClearCallback(handle, key)
+    end
+
+    if value == nil then return end
+
+    local id = Ext._Internal.ImguiSetCallback(handle, key)
+    if id == nil then
+      error(string.format("bg3le: %s is not an event on this widget",
+                          tostring(key)), 2)
+    end
+    imgui_callbacks[id] = value
+    registered[key] = id
+    return
+  end
+
+  local addr, class = widget_object(handle)
+  if addr == nil then
+    error("bg3le: this widget no longer exists", 2)
+  end
+
+  local ok, err = Ext._Internal.ObjectSetField(addr, class, key, value)
+  if not ok then error("bg3le: " .. tostring(err), 2) end
+end
+
+imgui_widget.__name = "ImguiHandle"
+
+make_widget = function(handle)
+  local existing = imgui_widgets[handle]
+  if existing ~= nil then return existing end
+
+  local widget = setmetatable({Handle = handle}, imgui_widget)
+  imgui_widgets[handle] = widget
+  return widget
+end
+
+function Ext.IMGUI.NewWindow(name)
+  if type(name) ~= "string" then
+    error("Ext.IMGUI.NewWindow(name) takes a name", 2)
+  end
+
+  local handle = Ext._Internal.ImguiNewWindow(name)
+  if handle == nil then
+    local wanted, started, ready = Ext._Internal.ImguiStatus()
+    if not wanted then
+      error("bg3le: the ImGui overlay is off; set BG3LE_IMGUI=1 to turn it "
+            .. "on", 2)
+    end
+    error(string.format(
+      "bg3le: Ext.IMGUI.NewWindow could not create a window "
+      .. "(started %s, render backend ready %s); see the imgui lines in the "
+      .. "extender log", tostring(started), tostring(ready)), 2)
+  end
+  return make_widget(handle)
+end
+
+function Ext.IMGUI.EnableDemo(enabled)
+  Ext._Internal.ImguiEnableDemo(enabled ~= false)
+end
+
+-- Delivering what the widgets queued.
+--
+-- Drained one at a time and re-checked, because a handler is free to build or
+-- destroy widgets, and an error in one handler must not swallow the rest.
+local function imgui_pump()
+  while true do
+    local id, handle, arg = Ext._Internal.ImguiTakeEvent()
+    if id == nil then return end
+
+    local fn = imgui_callbacks[id]
+    if fn ~= nil then
+      local ok, err = pcall(fn, make_widget(handle), arg)
+      if not ok then
+        Ext.Log.PrintError("bg3le: an Ext.IMGUI callback failed: "
+                           .. tostring(err))
+      end
+    end
+  end
+end
+
+-- Called from the tick pump rather than subscribed here: Ext.Events does not
+-- exist yet at this point in the prelude, and a widget callback should run
+-- before the handlers that may be waiting on what it changed.
+Ext._Internal.ImguiPump = imgui_pump
+
+function Ext.IMGUI.GetViewportSize()
+  -- Upstream asks the manager. bg3le has not bound that yet, so the honest
+  -- answer is to say so rather than return a plausible size a caller would
+  -- lay a window out against.
+  error("bg3le: Ext.IMGUI.GetViewportSize is not bound yet", 2)
+end
+
+-- Upstream deprecated this one and warns; it does not scale anything.
+function Ext.IMGUI.SetScale()
+  Ext.Log.Print("Ext.IMGUI.SetScale() is deprecated; UI scaling is managed "
+                .. "by the extender")
+end
+
+for _, name in ipairs({"LoadFont", "SetUIScaleMultiplier",
+                       "SetFontScaleMultiplier"}) do
+  Ext.IMGUI[name] = needs(
+    "Ext.IMGUI." .. name .. " needs the font and scaling side of the "
+    .. "manager, which bg3le has not bound yet")
+end
 
 -- ---- Ext.Enums ----
 --
@@ -6151,6 +6871,9 @@ function Ext._Internal.RunTimers()
   -- Anything the other context sent since the last tick, first: a message is
   -- what a timer or a handler this tick may be waiting on.
   Ext._Internal.DrainNetMessages()
+
+  -- And what the overlay's widgets queued, for the same reason.
+  Ext._Internal.ImguiPump()
 
   local now = Ext.Utils.MonotonicTime() / 1000.0
   local delta = last_tick ~= nil and (now - last_tick) or 0.0
