@@ -394,6 +394,65 @@ void osi_helpers_for(osi::Function const& fn, std::string* out) {
 //
 // A client context only exists once the client side has started, and a mod
 // that sends before then should reach its own listeners rather than nothing.
+// Whether a reset has been asked for.
+//
+// Performed on the tick rather than where it is asked for: Ext.Debug.Reset
+// is called from Lua, and closing the state you are executing in takes the
+// process with it. Upstream's is asynchronous for the same reason, and fires
+// ResetCompleted when it is done.
+bool g_reset_pending = false;
+
+// And whether the post-reset events are still owed. They are fired on the
+// tick after the reload rather than at the end of it, which is where
+// upstream's post-reset callback lands too: a mod's bootstrap may defer its
+// own setup to a tick, and a ResetCompleted handler that runs before that
+// finds a half-built mod.
+bool g_reset_events_pending = false;
+
+int l_request_reset(lua_State* L) {
+    g_reset_pending = true;
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+extern "C" std::size_t bg3le_meta_enum_count();
+extern "C" char const* bg3le_meta_enum_at(std::size_t index, bool* isBitmask);
+extern "C" bool bg3le_meta_enum_value_at(char const* enumName,
+                                         std::size_t index,
+                                         char const** label,
+                                         std::uint64_t* value);
+
+// Ext._Internal.EnumCount() -> how many enums bg3se describes.
+int l_enum_count(lua_State* L) {
+    lua_pushinteger(L, (lua_Integer)bg3le_meta_enum_count());
+    return 1;
+}
+
+// Ext._Internal.EnumAt(index) -> name, isBitmask
+int l_enum_at(lua_State* L) {
+    const auto index = (std::size_t)luaL_checkinteger(L, 1);
+    bool isBitmask = false;
+    char const* name = bg3le_meta_enum_at(index, &isBitmask);
+    if (name == nullptr) return 0;
+    lua_pushstring(L, name);
+    lua_pushboolean(L, isBitmask ? 1 : 0);
+    return 2;
+}
+
+// Ext._Internal.EnumValueAt(name, index) -> label, value
+int l_enum_value_at(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    const auto index = (std::size_t)luaL_checkinteger(L, 2);
+
+    char const* label = nullptr;
+    std::uint64_t value = 0;
+    if (!bg3le_meta_enum_value_at(name, index, &label, &value)) return 0;
+
+    lua_pushstring(L, label);
+    lua_pushinteger(L, (lua_Integer)value);
+    return 2;
+}
+
 int l_has_other_context(lua_State* L) {
     lua_State* other = (L == g_client_lua) ? g_server_lua : g_client_lua;
     lua_pushboolean(L, other != nullptr ? 1 : 0);
@@ -3828,6 +3887,14 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "PostToOtherContext");
     lua_pushcfunction(g_lua, l_has_other_context);
     lua_setfield(g_lua, -2, "HasOtherContext");
+    lua_pushcfunction(g_lua, l_request_reset);
+    lua_setfield(g_lua, -2, "RequestReset");
+    lua_pushcfunction(g_lua, l_enum_count);
+    lua_setfield(g_lua, -2, "EnumCount");
+    lua_pushcfunction(g_lua, l_enum_at);
+    lua_setfield(g_lua, -2, "EnumAt");
+    lua_pushcfunction(g_lua, l_enum_value_at);
+    lua_setfield(g_lua, -2, "EnumValueAt");
     lua_pushcfunction(g_lua, osi_story_lookup);
     lua_setfield(g_lua, -2, "StoryFunction");
     lua_pushcfunction(g_lua, l_is_client_state);
@@ -4540,9 +4607,47 @@ function Ext.Debug.Crash()
         .. "bg3le has no crash reporter", 2)
 end
 
+-- Ext.Debug.Reset()
+--
+-- Tears both Lua contexts down, builds them again and reloads every mod,
+-- which is what a mod author editing a script wants instead of restarting a
+-- game that takes ninety seconds to load here.
+--
+-- Deferred to the next tick, and upstream's is asynchronous for the same
+-- reason: this is called from the state being closed. Nothing after the call
+-- in the caller's own script will run in the state that made it, so there is
+-- nothing useful to return -- subscribe to Ext.Events.ResetCompleted in the
+-- new one instead.
+--
+-- Only the Lua is reset. The story is still loaded, the Osiris node hooks are
+-- still installed, and whatever a mod wrote into the engine before the reset
+-- is still written -- the same bargain upstream offers.
 function Ext.Debug.Reset()
-  error("bg3le: Ext.Debug.Reset needs the extension state reload path, "
-        .. "which is not implemented", 2)
+  Ext.Log.Print("bg3le: reset requested; both contexts rebuild on the next "
+                .. "tick")
+  Ext._Internal.RequestReset()
+end
+
+-- Called in each fresh context once the reload is done.
+--
+-- Upstream's order, from ScriptExtender::ResetLuaState: ModuleResume, then
+-- the session pair if a session is actually up, then ResetCompleted. The
+-- session pair is what a mod rebuilds its own state in -- Mod Configuration
+-- Menu's ResetCompleted handler reaches for a global that SessionLoaded
+-- creates, and firing ResetCompleted alone left it indexing a nil.
+--
+-- StatsLoaded is deliberately not re-fired, as upstream does not: stats did
+-- not reload, and a mod's stats pass is not idempotent.
+function Ext._Internal.AfterReset()
+  Ext._Internal.FireEvent("ModuleResume")
+
+  local state = Ext.Utils.GetGameState()
+  if state == "Paused" or state == "Running" then
+    Ext._Internal.FireEvent("SessionLoading")
+    Ext._Internal.FireEvent("SessionLoaded")
+  end
+
+  Ext._Internal.FireEvent("ResetCompleted")
 end
 
 function Ext.Debug.SetEntityRuntimeCheckLevel(level)
@@ -4637,6 +4742,77 @@ local LUA_TYPE_ID = {
 }
 
 local type_names_cache
+
+-- ---- Ext.Enums ----
+--
+-- Every enum and bitfield bg3se describes, by its Lua name, each one a table
+-- reached by label or by numeric value:
+--
+--   Ext.Enums.ClientGameState.Menu   -->  "Menu"
+--   Ext.Enums.ClientGameState[3]     -->  "Menu"
+--
+-- Upstream's entries are EnumValue objects rather than strings, and the
+-- difference is deliberate. bg3le reads an enum-typed field as its label --
+-- that is what reference/ verifies against the real extender, attribute for
+-- attribute -- and a comparison is what a mod does with these:
+-- Mod Configuration Menu asks
+-- `Ext.Utils.GetGameState() == Ext.Enums.ClientGameState["Menu"]`. Two
+-- strings compare equal there; a proxy object against a string never would,
+-- because Lua's __eq does not fire unless both sides are the same type. The
+-- label is the form that makes the comparison mean what it says.
+--
+-- Built on first use and kept. There are hundreds of enums and a mod
+-- generally wants one, so each is filled in when it is named.
+local enum_names = nil
+local enum_tables = {}
+
+local function build_enum_names()
+  if enum_names ~= nil then return enum_names end
+  enum_names = {}
+  for i = 0, Ext._Internal.EnumCount() - 1 do
+    local name = Ext._Internal.EnumAt(i)
+    if name ~= nil then enum_names[name] = true end
+  end
+  return enum_names
+end
+
+local function build_enum(name)
+  local made = {}
+  local i = 0
+  while true do
+    local label, value = Ext._Internal.EnumValueAt(name, i)
+    if label == nil then break end
+    -- Both directions, as upstream does: the label names the entry and the
+    -- numeric value reaches the same one.
+    made[label] = label
+    made[value] = label
+    i = i + 1
+  end
+  return made
+end
+
+Ext.Enums = setmetatable({}, {
+  __index = function(_, name)
+    if type(name) ~= "string" then return nil end
+    local found = enum_tables[name]
+    if found ~= nil then return found end
+    if not build_enum_names()[name] then return nil end
+
+    found = build_enum(name)
+    enum_tables[name] = found
+    return found
+  end,
+  -- Iterating yields every enum, which is what a mod listing them expects;
+  -- each is built as it is reached.
+  __pairs = function(self)
+    local key
+    return function()
+      key = next(build_enum_names(), key)
+      if key == nil then return nil end
+      return key, self[key]
+    end, self, nil
+  end,
+})
 
 function Ext.Types.GetAllTypes()
   if type_names_cache == nil then
@@ -8156,7 +8332,72 @@ void call_internal(const char* name) {
 void lua_set_symbols(const SymbolTable* symbols) { g_symbols = symbols; }
 
 
+void lua_load_mods();
+void lua_bind_osi(const std::vector<osi::Function>& functions);
+
+// Both contexts torn down and built again, then every mod reloaded.
+//
+// What upstream's Ext.Debug.Reset does, and for the reason it does it: a mod
+// author edits a script and wants it running without restarting a game that
+// takes a minute and a half to load here.
+//
+// The engine-side state is deliberately untouched. The story is still loaded,
+// the node hooks are still installed, and the Osiris bindings are rebuilt
+// from the function list bg3le already has -- resetting the Lua is the whole
+// of it. What a mod put in the engine before the reset stays there, which is
+// the same bargain upstream offers.
+void lua_reset() {
+    lua_State* oldServer = g_server_lua;
+    lua_State* oldClient = g_client_lua;
+
+    // Cleared first, so anything reached during the teardown sees no state
+    // rather than a closed one.
+    g_server_lua = nullptr;
+    g_client_lua = nullptr;
+    g_lua = nullptr;
+
+    if (oldClient != nullptr) lua_close(oldClient);
+    if (oldServer != nullptr) lua_close(oldServer);
+
+    build_state(false);
+    build_state(true);
+    g_lua = g_server_lua;
+    if (g_server_lua == nullptr) {
+        logf("lua: reset failed; the server context could not be rebuilt");
+        return;
+    }
+
+    // Osi.* lives in the state, so it has to be bound again. The function
+    // list is bg3le's own and survived, so this needs no walk.
+    if (!g_functions.empty()) {
+        const std::vector<osi::Function> functions = g_functions;
+        lua_bind_osi(functions);
+    }
+
+    lua_load_mods();
+
+    g_reset_events_pending = true;
+    logf("lua: reset -- both contexts rebuilt and every mod reloaded");
+}
+
 void lua_tick() {
+    if (g_reset_pending) {
+        g_reset_pending = false;
+        lua_reset();
+    }
+    if (g_server_lua == nullptr) return;
+
+    if (g_reset_events_pending) {
+        g_reset_events_pending = false;
+        {
+            InContext server(g_server_lua);
+            call_internal("AfterReset");
+        }
+        if (g_client_lua != nullptr) {
+            InContext client(g_client_lua);
+            call_internal("AfterReset");
+        }
+    }
     {
         InContext server(g_server_lua);
         call_internal("RunTimers");

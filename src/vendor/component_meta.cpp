@@ -763,6 +763,11 @@ struct EnumLabel {
 struct EnumDesc {
     std::string_view TypeName;
     char const* Name;
+    // The name a script writes. bg3se's generated metadata gives a namespaced
+    // enum a Lua name of its own -- ecl::GameState is ClientGameState -- and
+    // that is the only name Ext.Enums is reachable by, so it has to survive
+    // the re-expansion rather than being replaced by the C++ spelling.
+    char const* LuaName;
     bool IsBitmask;
     EnumLabel const* Labels;  // null-terminated
 };
@@ -870,18 +875,21 @@ struct EnumTable;
 // and compare exactly.
 // ---------------------------------------------------------------------------
 
-#define BEGIN_ENUM_IMPL(cls, bitmask)                                         \
+#define BEGIN_ENUM_IMPL(cls, luaname, bitmask)                                \
     namespace bg3le {                                                         \
     template <> struct EnumTable<cls> {                                       \
         static constexpr std::string_view kTypeName = type_name<cls>();       \
         static constexpr char const* kName = #cls;                            \
+        static constexpr char const* kLuaName = #luaname;                     \
         static constexpr bool kIsBitmask = bitmask;                           \
         static constexpr EnumLabel kLabels[] = {
 
-#define BEGIN_ENUM(T, type, id) BEGIN_ENUM_IMPL(T, false)
-#define BEGIN_BITMASK(T, type, id) BEGIN_ENUM_IMPL(T, true)
-#define BEGIN_ENUM_NS(NS, T, luaName, type, id) BEGIN_ENUM_IMPL(NS::T, false)
-#define BEGIN_BITMASK_NS(NS, T, luaName, type, id) BEGIN_ENUM_IMPL(NS::T, true)
+#define BEGIN_ENUM(T, type, id) BEGIN_ENUM_IMPL(T, T, false)
+#define BEGIN_BITMASK(T, type, id) BEGIN_ENUM_IMPL(T, T, true)
+#define BEGIN_ENUM_NS(NS, T, luaName, type, id) \
+    BEGIN_ENUM_IMPL(NS::T, luaName, false)
+#define BEGIN_BITMASK_NS(NS, T, luaName, type, id) \
+    BEGIN_ENUM_IMPL(NS::T, luaName, true)
 
 #define EV(label, value) { #label, (std::uint64_t)(value) },
 
@@ -912,6 +920,7 @@ template <class T>
 inline constexpr EnumDesc kEnumDesc{
     EnumTable<T>::kTypeName,
     EnumTable<T>::kName,
+    EnumTable<T>::kLuaName,
     EnumTable<T>::kIsBitmask,
     EnumTable<T>::kLabels,
 };
@@ -2154,6 +2163,64 @@ extern "C" char const* bg3le_meta_kind_name(std::uint8_t kind) {
 }
 
 // How many enums carry labels, for the startup log.
+// The enum registry, for Ext.Enums: every enum bg3se describes, by index,
+// and each one's labels and values.
+//
+// bg3le already decodes an enum-typed *field* through
+// bg3le_meta_enum_label, which asks by the path of the field that has the
+// type. Ext.Enums asks by the type itself, and nothing reached the registry
+// that way.
+extern "C" char const* bg3le_meta_enum_at(std::size_t index,
+                                          bool* isBitmask) {
+    if (index >= std::size(kAllEnums)) return nullptr;
+    auto const* e = kAllEnums[index];
+    if (isBitmask != nullptr) *isBitmask = e->IsBitmask;
+    // The Lua name, which is what a script writes: ClientGameState rather
+    // than ecl::GameState.
+    return e->LuaName != nullptr ? e->LuaName : e->Name;
+}
+
+// One label of an enum named by its Lua name, by index. False past the end,
+// which is how a caller knows to stop.
+extern "C" bool bg3le_meta_enum_value_at(char const* enumName,
+                                         std::size_t index,
+                                         char const** label,
+                                         std::uint64_t* value) {
+    if (enumName == nullptr || label == nullptr || value == nullptr) {
+        return false;
+    }
+
+    // Indexed by the C++ type name, and asked for by the Lua name; they
+    // differ only for the namespaced ones, so both are tried.
+    EnumDesc const* found = nullptr;
+    auto it = by_enum_name().find(enumName);
+    if (it != by_enum_name().end()) {
+        found = it->second;
+    } else {
+        for (auto const* e : kAllEnums) {
+            if (e->LuaName != nullptr
+                && std::strcmp(e->LuaName, enumName) == 0) {
+                found = e;
+                break;
+            }
+            if (e->Name != nullptr && std::strcmp(e->Name, enumName) == 0) {
+                found = e;
+                break;
+            }
+        }
+    }
+    if (found == nullptr || found->Labels == nullptr) return false;
+
+    std::size_t at = 0;
+    for (auto const* l = found->Labels; l->Name != nullptr; ++l, ++at) {
+        if (at != index) continue;
+        *label = l->Name;
+        *value = l->Value;
+        return true;
+    }
+    return false;
+}
+
 extern "C" std::size_t bg3le_meta_enum_count() { return std::size(kAllEnums); }
 
 // Parses a GUID the way the engine spells it, which is the inverse of

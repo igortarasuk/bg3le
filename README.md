@@ -79,6 +79,14 @@ component's declared size with the size the engine recorded, and
   same — and only once a mod subscribes, so until then every node keeps the
   engine's own pointers. Engine-side activity reaches it too: a listener on a
   database sees the fact a procedure's own rule inserts
+- **`Ext.Enums`**, every enum and bitfield bg3se describes, reachable by label
+  or by numeric value, under the Lua name the generated metadata gives it —
+  `Ext.Enums.ClientGameState.Menu`, not `ecl::GameState`. The entries are the
+  labels rather than upstream's `EnumValue` objects, deliberately: bg3le reads
+  an enum-typed field as its label, which is what `reference/` verifies
+  against the real extender, and a comparison is what a mod does with these.
+  Two strings compare equal; a proxy against a string never would, since
+  Lua's `__eq` does not fire across types
 - **`Ext.Net` crosses between the two contexts.** Upstream's messages ride
   the game's connection as protobuf because on Windows the two sides may be
   two machines; single-player is one process either way, and bg3le has both
@@ -220,12 +228,14 @@ component's declared size with the size the engine recorded, and
   physics and pathfinding, `Entity.Create`/`Destroy`, the atlas and resource
   managers and `GlobalSwitches`.
   `reference/ext-api-surface.txt` lists them with their shapes
-- **One session per process.** The story-load work runs once, so loading a
-  second save without restarting leaves Osiris bound to the first story's
-  mappings and every mod's script from the first session. Upstream resets
-  its Lua state per session; telling a new session from the two or three
-  story loads that make up one needs the game state machine, which bg3le
-  does not read yet. It says so rather than resetting at the wrong moment
+- **One session per process, unless asked.** `Ext.Debug.Reset()` works —
+  both contexts are torn down and built again and every mod reloads, which is
+  what a mod author editing a script wants — but it has to be asked for. The
+  story-load work still runs once, so loading a second save without
+  restarting leaves Osiris bound to the first story's mappings. Doing it
+  automatically means telling a new session from the two or three story loads
+  that make up one, which needs the game state machine bg3le does not read
+  yet, so it waits to be told rather than resetting at the wrong moment
 - **`ModManager.Settings`.** It sits past a hash map whose size on this build
   is not established, so `GetModManager` returns `BaseModule`,
   `LoadOrderedModules` and `AvailableMods` and omits it
