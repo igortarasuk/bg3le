@@ -1701,6 +1701,9 @@ extern "C" bool bg3le_mod_info(void const* module, bg3le::ModInfo* out);
 extern "C" std::size_t bg3le_mod_list_count(void const* module, int list);
 extern "C" bool bg3le_mod_list_at(void const* module, int list,
                                   std::size_t index, bg3le::ModShortDesc* out);
+extern "C" std::size_t bg3le_mods_settings_count();
+extern "C" bool bg3le_mods_settings_at(std::size_t index,
+                                       bg3le::ModShortDesc* out);
 
 extern "C" void* bg3le_stats_manager();
 extern "C" std::size_t bg3le_stats_count();
@@ -2479,6 +2482,21 @@ int l_mod_info(lua_State* L) {
     return 1;
 }
 
+void push_short_desc(lua_State* L, bg3le::ModShortDesc const& desc) {
+    lua_createtable(L, 0, 7);
+    set_string(L, "ModuleUUID", desc.ModuleUUIDString);
+    set_string(L, "ModuleUUIDString", desc.ModuleUUIDString);
+    set_string(L, "Name", desc.Name);
+    set_string(L, "Folder", desc.Folder);
+    set_string(L, "Hash", desc.Hash);
+    push_version(L, desc.ModVersion);
+    lua_setfield(L, -2, "ModVersion");
+    push_version(L, desc.PublishVersion);
+    lua_setfield(L, -2, "PublishVersion");
+    lua_pushinteger(L, (lua_Integer)desc.PublishHandle);
+    lua_setfield(L, -2, "PublishHandle");
+}
+
 // Ext._Internal.ModList(address, which) -> { ModuleShortDesc, ... }
 // which is 0 Dependencies, 1 ModConflicts, 2 Addons.
 int l_mod_list(lua_State* L) {
@@ -2491,20 +2509,24 @@ int l_mod_list(lua_State* L) {
     for (std::size_t i = 0; i < n; ++i) {
         bg3le::ModShortDesc desc{};
         if (!bg3le_mod_list_at(module, which, i, &desc)) break;
+        push_short_desc(L, desc);
+        lua_rawseti(L, -2, (int)i + 1);
+    }
+    return 1;
+}
 
-        lua_createtable(L, 0, 7);
-        set_string(L, "ModuleUUID", desc.ModuleUUIDString);
-        set_string(L, "ModuleUUIDString", desc.ModuleUUIDString);
-        set_string(L, "Name", desc.Name);
-        set_string(L, "Folder", desc.Folder);
-        set_string(L, "Hash", desc.Hash);
-        push_version(L, desc.ModVersion);
-        lua_setfield(L, -2, "ModVersion");
-        push_version(L, desc.PublishVersion);
-        lua_setfield(L, -2, "PublishVersion");
-        lua_pushinteger(L, (lua_Integer)desc.PublishHandle);
-        lua_setfield(L, -2, "PublishHandle");
-
+// Ext._Internal.ModSettings() -> { ModuleShortDesc, ... }
+//
+// ModManager::Settings.Mods, which is the mod list the session has rather
+// than the load order: for a loaded save it is what the save recorded, and
+// it omits the base modules the load order carries.
+int l_mod_settings(lua_State* L) {
+    const std::size_t n = bg3le_mods_settings_count();
+    lua_createtable(L, (int)n, 0);
+    for (std::size_t i = 0; i < n; ++i) {
+        bg3le::ModShortDesc desc{};
+        if (!bg3le_mods_settings_at(i, &desc)) break;
+        push_short_desc(L, desc);
         lua_rawseti(L, -2, (int)i + 1);
     }
     return 1;
@@ -3988,6 +4010,8 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "ModFind");
     lua_pushcfunction(g_lua, l_mod_managers);
     lua_setfield(g_lua, -2, "ModManagers");
+    lua_pushcfunction(g_lua, l_mod_settings);
+    lua_setfield(g_lua, -2, "ModSettings");
     lua_pushcfunction(g_lua, l_mod_manager_uuid_at);
     lua_setfield(g_lua, -2, "ModManagerUuidAt");
     lua_pushcfunction(g_lua, l_mod_base);
@@ -6647,6 +6671,12 @@ function Ext.Mod.GetModManager()
                                  Ext._Internal.ModAt),
     AvailableMods = collect(Ext._Internal.ModAvailableCount,
                             Ext._Internal.ModAvailableAt),
+    -- ModManager::Settings, which is one Array<ModuleShortDesc>. It sits at
+    -- a derived offset past AvailableMods, a hash map and a spare word --
+    -- see kSettingsModsAfterLoadOrder -- and it is the mod list the session
+    -- has rather than the load order: for a loaded save, what the save
+    -- recorded, without the base modules.
+    Settings = { Mods = Ext._Internal.ModSettings() },
   }
 end
 

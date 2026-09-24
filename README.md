@@ -178,7 +178,14 @@ component's declared size with the size the engine recorded, and
   `AddCustomProperty` work: upstream grafts them onto the type's property map,
   and bg3le keeps them keyed by type name, which every view of that type
   consults where the property map would have answered
-- `Ext.Mod`, all five functions. The mod manager has no symbol either, so
+- `Ext.Mod`, all five functions, and `GetModManager` returns all four members
+  including `Settings`. Its offset is derived rather than searched for — bg3se
+  declares `AvailableMods`, a `HashMap`, a spare word and then
+  `ModuleSettings`, which comes to 112 past the load order's array header —
+  and then confirmed against the running game before it was trusted: the array
+  there holds 29 descriptors naming real mods, and 29 authored mods plus the
+  14 base modules is the 43 the load order holds.
+  The mod manager has no symbol either, so
   the list is found from the one thing every install shares: the base
   module's UUID is the constant `ed539163-…`, which locates a `Module`
   exactly, and the array holding it is the load order. `ModuleInfo` turns
@@ -236,9 +243,6 @@ component's declared size with the size the engine recorded, and
   automatically means telling a new session from the two or three story loads
   that make up one, which needs the game state machine bg3le does not read
   yet, so it waits to be told rather than resetting at the wrong moment
-- **`ModManager.Settings`.** It sits past a hash map whose size on this build
-  is not established, so `GetModManager` returns `BaseModule`,
-  `LoadOrderedModules` and `AvailableMods` and omits it
 - **Writing stats, except strings and the compiled kinds.** Integer,
   enumeration and condition attributes are written: an attribute is one
   `int32` in the stat object, and a condition a mod builds at runtime goes

@@ -108,6 +108,21 @@ constexpr std::size_t kArrayHeader = 16;
 constexpr std::size_t kBaseModuleBeforeLoadOrder = 248;
 constexpr std::size_t kAvailableAfterLoadOrder = kArrayHeader;
 
+// ModManager::Settings.Mods, from the same header.
+//
+// Derived rather than searched for. bg3se declares the members in order:
+// LoadOrderedModules, AvailableMods, a HashMap<uint64_t, void*>, a uint64,
+// then ModuleSettings, which is a vtable and an Array<ModuleShortDesc>. That
+// is 16 for AvailableMods, 64 for the hash map -- a HashSet's three members
+// are 48 and the value array is 16 -- 8 for the spare word and 8 for the
+// vtable: 112.
+//
+// Confirmed against the running game before it was trusted: the array at
+// +112 holds 29 descriptors whose names read as GustavX, 5eSpells, PHB
+// Additional Spells and so on, and 29 authored mods plus the 14 base modules
+// is the 43 the load order holds.
+constexpr std::size_t kSettingsModsAfterLoadOrder = 112;
+
 template <class T>
 bool read_as(void const* addr, T* out) {
     return safe_read(addr, out, sizeof(T));
@@ -817,20 +832,10 @@ extern "C" std::size_t bg3le_mod_list_count(void const* module, int list) {
     return size > 4096 ? 0 : size;
 }
 
-extern "C" bool bg3le_mod_list_at(void const* module, int list,
-                                  std::size_t index, ModShortDesc* out) {
-    if (out == nullptr || index >= bg3le_mod_list_count(module, list)) {
-        return false;
-    }
-
-    std::uint64_t buffer = 0;
-    if (!read_as((char const*)module + kModuleLists[list], &buffer)) {
-        return false;
-    }
-    if (buffer == 0) return false;
-    auto const* desc = (char const*)(std::uintptr_t)buffer
-                       + index * kDescStride;
-
+// One ModuleShortDesc, wherever it sits. Shared by a module's own dependency
+// lists and by ModManager::Settings.Mods, so neither can decode it its own
+// way.
+bool read_short_desc(char const* desc, ModShortDesc* out) {
     char const* uuid = read_fixed_field(desc, kDescUuidString);
     // A short desc that does not name a module means the stride is wrong;
     // reporting nothing beats reporting the bytes that follow it.
@@ -845,6 +850,51 @@ extern "C" bool bg3le_mod_list_at(void const* module, int list,
     out->PublishHandle = 0;
     read_as(desc + kDescPublishHandle, &out->PublishHandle);
     return true;
+}
+
+extern "C" bool bg3le_mod_list_at(void const* module, int list,
+                                  std::size_t index, ModShortDesc* out) {
+    if (out == nullptr || index >= bg3le_mod_list_count(module, list)) {
+        return false;
+    }
+
+    std::uint64_t buffer = 0;
+    if (!read_as((char const*)module + kModuleLists[list], &buffer)) {
+        return false;
+    }
+    if (buffer == 0) return false;
+    return read_short_desc((char const*)(std::uintptr_t)buffer
+                               + index * kDescStride,
+                           out);
+}
+
+// ModManager::Settings.Mods -- the mod list as the session actually has it,
+// which for a loaded save is the list the save recorded. Distinct from the
+// load order, which adds the base modules, and from modsettings.lsx, which is
+// what was enabled the last time the menu wrote it.
+extern "C" std::size_t bg3le_mods_settings_count() {
+    if (!ready() || state().Header == 0) return 0;
+
+    auto const* head = (char const*)(std::uintptr_t)(
+        state().Header + kSettingsModsAfterLoadOrder);
+    std::uint32_t capacity = 0;
+    std::uint32_t size = 0;
+    if (!read_as(head + 8, &capacity) || !read_as(head + 12, &size)) return 0;
+    if (size > 4096 || size > capacity) return 0;
+    return size;
+}
+
+extern "C" bool bg3le_mods_settings_at(std::size_t index, ModShortDesc* out) {
+    if (out == nullptr || index >= bg3le_mods_settings_count()) return false;
+
+    auto const* head = (char const*)(std::uintptr_t)(
+        state().Header + kSettingsModsAfterLoadOrder);
+    std::uint64_t buffer = 0;
+    if (!read_as(head, &buffer) || buffer == 0) return false;
+
+    return read_short_desc((char const*)(std::uintptr_t)buffer
+                               + index * kDescStride,
+                           out);
 }
 
 }  // namespace bg3le
