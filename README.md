@@ -368,11 +368,12 @@ capture in `reference/` was taken against game `v4.73.98.727`, recorded in
 
 ## Contributing
 
-Patches welcome. Four checks want running before a pull request, all of which
+Patches welcome. Five checks want running before a pull request, all of which
 work without the game:
 
     ./tools/check-symbols.sh        # nothing references an undefined bg3le symbol
     ./tools/check-prelude.sh        # the Lua embedded in lua_host.cpp parses
+    python3 tools/check-views.py    # the container views, and JSON escaping
     python3 client/tools/check-output.py   # the console's terminal handling
     python3 client/tools/check-prompt.py   # prompt width against readline's idea of it
 
@@ -380,6 +381,17 @@ work without the game:
 undefined symbols allowed, because it has to interpose the engine's own, so a
 missing definition of *ours* builds cleanly and then kills the game at the
 first call. That has happened three times.
+
+And one that needs the game running with bg3le attached:
+
+    ./tools/check-reference.sh      # bg3le against the real extender's output
+
+`reference/*.txt` is output captured from the Script Extender on Windows, and
+that replays the same queries here and reports how far apart the answers are.
+It does not decide pass or fail — most of what differs is that the install is
+not the same one — but it is what found three broken entity calls and a key
+in every stat dump that upstream does not have. See
+[reference/REFERENCE-DIFFS.md](reference/REFERENCE-DIFFS.md).
 
 Two conventions worth knowing. Anything located by content is validated
 before use — a structure has to agree about something only the real one could
