@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cmath>
+#include <exception>
 #include <deque>
 #include <set>
 #include <cstring>
@@ -2591,14 +2592,37 @@ int l_stats_attr_find(lua_State* L) {
     auto addr = (std::uintptr_t)luaL_checkinteger(L, 1);
     char const* wanted = luaL_checkstring(L, 2);
 
+    // Caught rather than let out. Lua is built as C++ here, so an
+    // exception escaping a C function is caught by the interpreter and
+    // reported with whatever is on its stack -- which for this function is
+    // the name being looked up, so a mod reading Armor.Shield saw an error
+    // whose entire message was "Shield". Nothing about that says where it
+    // came from.
     auto const* object = (void const*)addr;
-    const int index = bg3le_stats_attr_index(object, wanted);
+    int index = -1;
+    try {
+        index = bg3le_stats_attr_index(object, wanted);
+    } catch (std::exception const& e) {
+        logf("stats: looking up attribute %s threw %s", wanted, e.what());
+        return 0;
+    } catch (...) {
+        logf("stats: looking up attribute %s threw", wanted);
+        return 0;
+    }
     if (index < 0) return 0;
 
     char const* typeName = nullptr;
     int kind = 0;
-    bg3le_stats_attr_at(object, (std::size_t)index, nullptr, &typeName, &kind,
-                        nullptr);
+    try {
+        bg3le_stats_attr_at(object, (std::size_t)index, nullptr, &typeName,
+                            &kind, nullptr);
+    } catch (std::exception const& e) {
+        logf("stats: reading attribute %s threw %s", wanted, e.what());
+        return 0;
+    } catch (...) {
+        logf("stats: reading attribute %s threw", wanted);
+        return 0;
+    }
 
     lua_pushinteger(L, index);
     lua_pushinteger(L, kind);

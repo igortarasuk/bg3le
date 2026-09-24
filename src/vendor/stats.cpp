@@ -1128,6 +1128,8 @@ extern "C" char const* bg3le_stats_name(void const* object) {
 // forty milliseconds, once -- and rebuilt if the array's size changes,
 // which is the only way its contents can, since a stat object does not
 // move once the manager holds it.
+std::unordered_map<std::string, void const*> const& stats_by_name();
+
 std::unordered_map<std::string, void const*> const& stats_by_name() {
     static std::unordered_map<std::string, void const*> byName;
     static std::uint32_t builtFor = 0;
@@ -1191,12 +1193,31 @@ stats_names_by_list() {
         safe_read_some(state().Objects.Buffer, all.data(),
                        (std::size_t)size * sizeof(void*)) / sizeof(void*);
 
+    // Only the object a lookup by name will actually return.
+    //
+    // Names are not unique across modifier lists: one animation path is
+    // carried by both a Character and a SpellData stat, and the two
+    // indexes disagreed about it -- Ext.Stats.GetStats("SpellData")
+    // listed the name while Ext.Stats.Get(name) handed back the
+    // Character, whose modifier list has no TargetConditions. A mod
+    // walking every spell and reading one got nil, which upstream never
+    // returns for a condition.
+    //
+    // So a name is filed under a list only when that list's object is the
+    // one the name resolves to. Everything GetStats hands out can then be
+    // read as a member of the list it came from.
+    auto const& byName = stats_by_name();
+
     std::vector<char const*>& every = byList[""];
     every.reserve(got);
     for (std::size_t i = 0; i < got; ++i) {
         if (all[i] == nullptr) continue;
         char const* name = bg3le_stats_name(all[i]);
         if (name == nullptr || name[0] == '\0') continue;
+
+        auto resolves = byName.find(name);
+        if (resolves == byName.end() || resolves->second != all[i]) continue;
+
         every.push_back(name);
 
         char const* list = bg3le_stats_type(all[i]);
@@ -1304,6 +1325,10 @@ void const* modifier_at(void const* object, std::size_t index) {
 // enumeration its values are read through, and the kind that follows from
 // that. Fixed for the run, and shared by every stat on the same list, so
 // this is worth remembering rather than re-reading per attribute per stat.
+// An attribute name is an identifier: this is the most it can be, and
+// anything longer is a pointer that has stopped meaning what it did.
+constexpr std::size_t kMaxAttrName = 128;
+
 struct ModifierMeta {
     char const* Name{nullptr};
     char const* TypeName{nullptr};
@@ -1346,6 +1371,19 @@ std::vector<std::int32_t> const* properties_of(void const* object) {
 
     const std::size_t count =
         (std::size_t)((char const*)end - (char const*)begin) / 4;
+
+    // Bounded. The count comes from two pointers read out of the object,
+    // and if either is not what it should be the answer can be enormous --
+    // a vector of it then throws, and an exception out of here is caught
+    // by the interpreter and reported with whatever is on its stack. No
+    // stat has thousands of attributes; the largest modifier list in the
+    // game has a few hundred.
+    constexpr std::size_t kMaxProperties = 4096;
+    if (count > kMaxProperties) {
+        cache.Object = nullptr;
+        return nullptr;
+    }
+
     std::vector<std::int32_t> all(count);
     const std::size_t got =
         safe_read_some(begin, all.data(), count * sizeof(std::int32_t))
@@ -1374,8 +1412,10 @@ ModifierMeta const* meta_of(void const* modifier) {
 
     // Not cached if the name did not resolve: this is kept for the run,
     // and an attribute whose name is missing is an attribute no caller can
-    // reach by name.
+    // reach by name. Nor if it is not a bounded identifier, which is what
+    // a name that has stopped pointing at a live string entry looks like.
     if (meta.Name == nullptr) return nullptr;
+    if (::strnlen(meta.Name, kMaxAttrName) >= kMaxAttrName) return nullptr;
     meta.Enumeration = enumeration_for(modifier);
     meta.Kind = property_type(meta.Enumeration);
     if (meta.Enumeration != nullptr) {
@@ -1655,7 +1695,18 @@ extern "C" int bg3le_stats_attr_index(void const* object,
             for (std::size_t i = 0; i < mods->size(); ++i) {
                 ModifierMeta const* meta = meta_of((*mods)[i]);
                 if (meta == nullptr || meta->Name == nullptr) continue;
-                names.emplace(meta->Name, (int)i);
+
+                // Bounded, because the name is a pointer into the engine's
+                // own string entry and an attribute name is a short
+                // identifier. Building a std::string from it unbounded
+                // reads until it finds a NUL, and on one Armor object that
+                // ran far enough to throw length_error -- which Lua, built
+                // as C++ here, caught and reported using whatever was on
+                // its stack. The error a mod saw was the single word
+                // "Shield", the name it had asked for.
+                const std::size_t length = ::strnlen(meta->Name, kMaxAttrName);
+                if (length == 0 || length >= kMaxAttrName) continue;
+                names.emplace(std::string(meta->Name, length), (int)i);
             }
         }
         known = byList.emplace(list, std::move(names)).first;
