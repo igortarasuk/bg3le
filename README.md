@@ -282,14 +282,13 @@ component's declared size with the size the engine recorded, and
 - **`Ext.IMGUI`**, which is Mod Configuration Menu's menu and the only thing
   in a 57-mod set known to need it — everything else of MCM's works, and
   5eSpells reads all of its settings through it today. Upstream's
-  implementation compiles here unchanged, Vulkan backend and all, but it
-  cannot be linked: it is written against bg3se's Lua binding framework —
-  `lua::ImguiHandle`, `lua::RegistryEntry`, `lua::gStructRegistry`,
-  `ecl::ExtensionState` — and bg3le's Lua layer is its own. Borrowing it
-  means replacing bg3le's foundation with bg3se's rather than adding a
-  feature. What bg3le's own would take, step by step and with the one design
-  question named, is in
-  [reference/IMGUI-ASSESSMENT.md](reference/IMGUI-ASSESSMENT.md)
+  implementation is already compiled and linked into `libbg3le.so`, imgui and
+  the Vulkan backend with it; what it cannot do is install its hooks, because
+  it wraps seven Vulkan entry points through Detours and
+  `vendor/compat/detours.h` reports failure. bg3le interposes Vulkan calls
+  already, so the fix is to record rather than patch — see
+  [reference/IMGUI-ASSESSMENT.md](reference/IMGUI-ASSESSMENT.md), which also
+  says how the first reading of this got it badly wrong
 - **Launching.** See [Running](#running)
 
 ## Building
