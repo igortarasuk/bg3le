@@ -6489,6 +6489,33 @@ function entity_methods:GetComponent(name)
   return get_component(self.Handle, name)
 end
 
+-- Every component this entity carries, keyed by name, as upstream's is.
+--
+-- Upstream asks the ECS for the entity's own component list. bg3le asks the
+-- other way round -- for each component it has metadata for, does this entity
+-- have it -- which reaches the same set: the answer is "the components that
+-- are both describable and present", and a component bg3le cannot describe
+-- could not be returned either way.
+--
+-- It is 2,107 questions rather than one, so it is a call to make when dumping
+-- an entity and not one to make in a loop. The names are cached because the
+-- list does not change within a session.
+local component_names = nil
+
+function entity_methods:GetAllComponents()
+  if component_names == nil then
+    component_names = Ext._Internal.ComponentTypeNames()
+  end
+
+  local handle = rawget(self, "Handle")
+  local out = {}
+  for _, name in ipairs(component_names) do
+    local component = get_component(handle, name)
+    if component ~= nil then out[name] = component end
+  end
+  return out
+end
+
 -- Marking the component changed is what the server acts on; setting the
 -- replication flags is what reaches the client. Both are needed for a write
 -- to show up in the UI.
@@ -7124,6 +7151,12 @@ local STAT_EXTRAS = {
 
   -- An empty attribute set means the discovery did not land, which is
   -- worth saying rather than handing back a name that looks complete.
+  --
+  -- bg3le's own, not upstream's, so it is listed in STAT_DIAGNOSTICS below
+  -- and does not appear at all unless it has something to report. It used
+  -- to come out of every dump as "AttributesUnavailable": null, which is a
+  -- key a mod iterating a stat would see and upstream does not have --
+  -- caught by tools/check-reference.sh against the real extender's capture.
   AttributesUnavailable = function(self)
     if Ext._Internal.StatsAttrCount(rawget(self, "__addr")) > 0 then
       return nil
@@ -7131,6 +7164,11 @@ local STAT_EXTRAS = {
     return "no attributes readable; see the stats lines in the extender log"
   end,
 }
+
+-- The extras that are bg3le's rather than upstream's. A key here is omitted
+-- when its value is nil, where one of upstream's own -- ModId, ModifierList
+-- and the rest -- is reported either way, because upstream reports those.
+local STAT_DIAGNOSTICS = {AttributesUnavailable = true}
 
 local stat_proxy = {}
 
@@ -7202,7 +7240,11 @@ stat_proxy.__pairs = function(self)
     end
   end
   local keys = {}
-  for k in pairs(cache) do keys[#keys + 1] = k end
+  for k in pairs(cache) do
+    if not (STAT_DIAGNOSTICS[k] and cache[k] == STAT_NIL) then
+      keys[#keys + 1] = k
+    end
+  end
   for k in pairs(STAT_METHODS) do keys[#keys + 1] = k end
   table.sort(keys)
 
@@ -8117,10 +8159,23 @@ end
 --
 -- Handles come back as the integers Ext.Entity.Get accepts, which is what
 -- upstream returns too.
+-- Entities, not handles.
+--
+-- This returned the raw handles, and upstream returns entity objects: a
+-- caller writes `for _, e in ipairs(...) do if e.DisplayName ...`, which on a
+-- number raises "attempt to index a number value". Caught by
+-- tools/check-reference.sh against the capture from the real extender, where
+-- the same query works.
+local function entities_from(handles)
+  local out = {}
+  for i, handle in ipairs(handles) do out[i] = Ext.Entity.Get(handle) end
+  return out
+end
+
 function Ext.Entity.GetAllEntities()
   local handles, err = Ext._Internal.AllEntities()
   if handles == nil then error("bg3le: " .. tostring(err), 2) end
-  return handles
+  return entities_from(handles)
 end
 
 function Ext.Entity.GetAllEntitiesWithComponent(component)
@@ -8129,7 +8184,7 @@ function Ext.Entity.GetAllEntitiesWithComponent(component)
   end
   local handles, err = Ext._Internal.AllEntities(component)
   if handles == nil then error("bg3le: " .. tostring(err), 2) end
-  return handles
+  return entities_from(handles)
 end
 
 -- The entities the engine gave a UUID, which is the set carrying
@@ -8138,11 +8193,12 @@ function Ext.Entity.GetAllEntitiesWithUuid()
   local handles, err = Ext._Internal.AllEntities("Uuid")
   if handles == nil then error("bg3le: " .. tostring(err), 2) end
 
-  -- Upstream keys this one by UUID rather than returning a plain list.
+  -- Upstream keys this one by UUID rather than returning a plain list, and
+  -- the values are entities like everywhere else.
   local out = {}
   for _, handle in ipairs(handles) do
     local uuid = Ext.Entity.HandleToUuid(handle)
-    if uuid ~= nil then out[uuid] = handle end
+    if uuid ~= nil then out[uuid] = Ext.Entity.Get(handle) end
   end
   return out
 end
@@ -8161,8 +8217,7 @@ function Ext.Entity.GetEntitiesAroundPosition(position, radius)
 
   local out = {}
   local limit = radius * radius
-  for _, handle in ipairs(Ext.Entity.GetAllEntitiesWithComponent("Transform")) do
-    local entity = Ext.Entity.Get(handle)
+  for _, entity in ipairs(Ext.Entity.GetAllEntitiesWithComponent("Transform")) do
     local transform = entity ~= nil and entity.Transform or nil
     local at = transform ~= nil and transform.Transform or nil
     local translate = at ~= nil and at.Translate or nil
@@ -8171,7 +8226,7 @@ function Ext.Entity.GetEntitiesAroundPosition(position, radius)
       local dy = translate[2] - position[2]
       local dz = translate[3] - position[3]
       if dx * dx + dy * dy + dz * dz <= limit then
-        out[#out + 1] = handle
+        out[#out + 1] = entity
       end
     end
   end

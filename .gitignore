@@ -3,6 +3,11 @@ build/
 # generated UTF-8 shadows of bg3se headers
 reference/bg3se-compat/build/
 
+# bg3le's own answers to the reference queries, written by
+# tools/check-reference.sh for diffing. The captures from the real extender
+# beside them are the source of truth and are tracked; these are not.
+reference/bg3le/
+
 # third-party sources fetched by tools/fetch-externals.sh
 external/third_party/
 
