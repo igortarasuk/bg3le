@@ -292,6 +292,10 @@ add_executable(symdump tools/symdump.cpp src/elf_symbols.cpp src/log.cpp)
 # Greps another process memory, for questions that have to be answered
 # with the shim absent.
 add_executable(memgrep tools/memgrep.c)
+# A C program, so the global -stdlib=libc++ has nothing to act on and clang
+# says so. The flag is added for every target above; dropping it here is
+# narrower than making it conditional there.
+target_compile_options(memgrep PRIVATE -Wno-unused-command-line-argument)
 
 add_executable(modsettings tools/modsettings.cpp src/pak.cpp
                src/inflate.cpp src/log.cpp external/lz4/lz4.c)
