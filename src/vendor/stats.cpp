@@ -102,6 +102,7 @@ char const* text_of(bg3se::FixedString const& fs) {
 
 extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
                                             std::uint32_t* out);
+extern "C" void bg3le_fixed_string_forget_failures();
 extern "C" bool bg3le_meta_format_guid(void const* bytes, char* out,
                                        std::size_t capacity);
 
@@ -1137,6 +1138,10 @@ std::unordered_map<std::string, void const*> const& stats_by_name() {
     byName.clear();
     builtFor = size;
 
+    // A name that failed to resolve early must not keep an index
+    // missing for the rest of the session.
+    bg3le_fixed_string_forget_failures();
+
     std::vector<void const*> all(size);
     const std::size_t got =
         safe_read_some(state().Objects.Buffer, all.data(),
@@ -1176,6 +1181,10 @@ stats_names_by_list() {
 
     byList.clear();
     builtFor = size;
+
+    // A name that failed to resolve early must not keep an index
+    // missing for the rest of the session.
+    bg3le_fixed_string_forget_failures();
 
     std::vector<void const*> all(size);
     const std::size_t got =
@@ -1362,6 +1371,11 @@ ModifierMeta const* meta_of(void const* modifier) {
 
     ModifierMeta meta;
     meta.Name = text_of(modName);
+
+    // Not cached if the name did not resolve: this is kept for the run,
+    // and an attribute whose name is missing is an attribute no caller can
+    // reach by name.
+    if (meta.Name == nullptr) return nullptr;
     meta.Enumeration = enumeration_for(modifier);
     meta.Kind = property_type(meta.Enumeration);
     if (meta.Enumeration != nullptr) {

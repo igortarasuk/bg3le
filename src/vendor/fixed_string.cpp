@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <unordered_map>
 #include <vector>
 #include <string>
@@ -379,6 +380,34 @@ extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
 }
 
 // The text of a FixedString index, or null. length may be null.
+// Resolved once per id. The text lives in the engine's own entry and stays
+// put for as long as the entry does, so the pointer keeps.
+struct Known {
+    char const* Text;
+    std::uint32_t Length;
+};
+
+std::unordered_map<std::uint32_t, Known>& resolved_strings() {
+    static std::unordered_map<std::uint32_t, Known> known;
+    return known;
+}
+
+// Forgets the ids that did not resolve.
+//
+// Keeping failures is what stops an unset field costing three system calls
+// every time it is read. It is wrong for anything built once and kept: an
+// id that failed early -- before its bucket was allocated, say -- would
+// stay failed, so a stat whose name resolved to nothing would be missing
+// from an index for the rest of the session. That is not hypothetical, it
+// made Ext.Stats.Get("PotentSpellcasting") return nil. An index builder
+// calls this first and resolves afresh.
+extern "C" void bg3le_fixed_string_forget_failures() {
+    auto& known = resolved_strings();
+    for (auto it = known.begin(); it != known.end();) {
+        it = it->second.Text == nullptr ? known.erase(it) : std::next(it);
+    }
+}
+
 extern "C" char const* bg3le_fixed_string(std::uint32_t index,
                                           std::uint32_t* length) {
     void* table = bg3le_string_table();
@@ -390,12 +419,7 @@ extern "C" char const* bg3le_fixed_string(std::uint32_t index,
     // array and the header -- three reads -- and reading a stat asks for
     // a couple of hundred strings, most of them the same ones over and
     // over.
-    struct Known {
-        char const* Text;
-        std::uint32_t Length;
-    };
-    static std::unordered_map<std::uint32_t, Known> known;
-
+    auto& known = resolved_strings();
     auto found = known.find(index);
     if (found != known.end()) {
         if (length != nullptr) *length = found->second.Length;
@@ -405,13 +429,18 @@ extern "C" char const* bg3le_fixed_string(std::uint32_t index,
     std::uint32_t got = 0;
     char const* text = resolve(table, index, &got);
 
-    // Failures are kept too. An id that does not resolve is not going to
-    // start resolving -- ids are stable -- and not keeping them meant an
-    // unset FixedString field cost three reads every single time it was
-    // looked at. That, not the successful lookups, was three quarters of
-    // the extender's CPU during a mod's stats pass.
-    known.emplace(index, Known{text, got});
+    // Only successes are kept. Keeping failures was worth three quarters
+    // of the extender's CPU when the expensive lookups above it were
+    // linear scans -- an unset field cost three reads every time it was
+    // read -- and it was wrong: an id can fail because its bucket has not
+    // been allocated yet, and a cached failure made that permanent. A
+    // stat's name would resolve to nothing, so the stat was missing from
+    // every index built afterwards, and a mod reading it got nil.
+    //
+    // With the lookups indexed the saving is not needed. If it is ever
+    // needed again it has to expire, not persist.
     if (text == nullptr) return nullptr;
+    known.emplace(index, Known{text, got});
 
     if (length != nullptr) *length = got;
     return text;

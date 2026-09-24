@@ -4641,6 +4641,12 @@ function ModEvent:Throw(payload)
     local handler = self.Handlers[handle]
     if handler ~= nil and callable(handler) then
       local started = Ext.Utils.MonotonicTime()
+      -- pcall, not xpcall. A traceback would be worth having -- a handler
+      -- that fails with "Shield" says nothing about which mod or which
+      -- line -- but an error handler is what makes the interpreter call
+      -- nse_lua_report_handled_error, and that hook crashed the game on
+      -- the first mod error until it was hardened. Worth revisiting once
+      -- the hardened hook has seen some use.
       local ok, err = pcall(handler, payload)
       if not ok then
         Ext.Log.PrintError(string.format(
@@ -5659,6 +5665,18 @@ end
 -- write causing this?" can be answered from outside the process. It is
 -- how the FixedString path below was shown to be the thing that hangs the
 -- engine.
+-- Integers and enumerations store a value in the stat object's own slot.
+-- Conditions and strings have to put the value into one of RPGStats'
+-- pools first, which appends into the array's spare capacity and raises
+-- its size.
+--
+-- Those two spent a while switched off here, on the reading that a run
+-- dying mid-load was one of those appends racing the engine. It was not:
+-- the crash was bg3le's own nse_lua_report_handled_error, which the
+-- interpreter calls only when an error handler is installed, and which
+-- an xpcall added that afternoon turned from dead code into a segfault on
+-- the first mod error. Three A/B runs were attributed to the wrong thing
+-- before a core dump named it.
 local STAT_WRITABLE_KINDS = {
   [0] = "int", [1] = "int", [3] = "string", [4] = "enum", [8] = "condition",
 }
@@ -7354,9 +7372,26 @@ void lua_run(const char* code) {
 //
 // It fires for every handled error, including the deliberate ones in our timer
 // and mod-loading paths, so this goes to the log rather than the console.
+//
+// Called from luaG_errormsg while an error is being raised and an error
+// handler is installed -- which is to say from inside xpcall, and from
+// nowhere else. That made it effectively dead code here until something
+// used xpcall, and then it segfaulted on the first mod error: this ran
+// with the interpreter mid-throw and read the stack as though it were in
+// a normal call.
+//
+// So it touches as little as possible. No conversion, which can run a
+// metamethod or allocate and raise again; no assumption that there is
+// anything on the stack at all, which is not true for a stack-overflow or
+// memory error.
 __attribute__((weak))
 void nse_lua_report_handled_error(lua_State* L) {
-    const char* err = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1)
-                                                     : "(not a string)";
-    bg3le::logf("lua: handled error: %s", err);
+    if (L == nullptr || lua_gettop(L) < 1) return;
+    if (lua_type(L, -1) != LUA_TSTRING) return;
+
+    std::size_t length = 0;
+    const char* err = lua_tolstring(L, -1, &length);
+    if (err == nullptr || length == 0) return;
+
+    bg3le::logf("lua: handled error: %.*s", (int)length, err);
 }
