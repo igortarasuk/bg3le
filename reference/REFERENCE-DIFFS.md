@@ -105,9 +105,61 @@ enums) rather than at `Variant2`, which is where the string `"Placeholder"`
 lives. 121 is not a byte of `"Placeholder"`, so it is not simply the string
 read as an integer.
 
-What this needs next is the raw bytes: the address of the `Params` field, its
-buffer pointer, and a hexdump of the first hundred bytes of that buffer.
-bg3le has `Ext._Internal.FieldAddress` for a component but no equivalent for
-an object reached by address, so that is the small piece of tooling to add
-first. With the bytes in hand the stride and the discriminant's offset are
-read off rather than derived, the same way `HashSet`'s three members were.
+### The bytes
+
+`Ext._Internal.ObjectFieldAddress` was added for this — the object
+counterpart of `FieldAddress`, which only took an entity handle. With it:
+
+    expression at 0x5b58f547b70  class StatsExpressionPooled  path "Params"
+    Params field at 0x5b58f547b70, 16 bytes
+    buffer 0x5b5440b8340  capacity 2  size 2
+
+      +  0  07 3f 0b 44 b5 05 00 00  73 63 72 69 70 74 69 6f
+      + 16  6e 22 20 22 68 35 38 66  00 39 33 39 39 67 35 36
+      + 32  00 00 00 00 38 62 30 67  38 62 64 62 67 36 31 36
+      + 48  35 31 35 36 33 62 36 39  07 22 00 31 22 00 00 00
+      + 64  00 3c 0b 44 b5 05 00 00  73 69 74 69 6f 6e 45 66
+      + 80  66 65 63 74 22 20 22 32  00 39 61 65 32 64 35 2d
+      + 96  03 05 00 00 32 00 00 00  00 00 00 00 00 00 00 00
+      +112  00 00 00 00 00 00 00 00  04 00 00 00 00 00 00 00
+
+Three things fall out, and the third is the one that matters.
+
+**The count is 2 after all.** The size field reads 2, not 1. The `#Params == 1`
+that Lua reported is an artefact of the reader: `read_object_path` returns
+nil for a valueless variant and assigns it into the array, so a nil second
+element leaves a hole and `#` stops at one. The count was never wrong.
+
+**`Params` is at offset 0**, as the declaration says, and that is
+corroborated rather than assumed: `Code` is declared at +16 and reads back
+`"Placeholder0"` correctly, so the two members either side of that boundary
+both agree.
+
+**But the buffer does not hold what upstream reports.** Upstream's first
+param is the string `"Placeholder"`, eleven characters, which is short enough
+to live inline in an `STDString` — so somewhere in these bytes there should
+be `50 6c 61 63 65 68 6f 6c 64 65 72` with a length of `0b` at the end of its
+sixteen. There is no `50 6c 61 63` anywhere in the dump. What is there is
+fragments of unrelated text — `"scriptio"`, `"n" "h58f"`, `"sitionEffect"
+"2"`, `"9ae2d5-"` — which is a string pool, and two eight-byte values that
+look like pointers into that same allocation (`0x5b5440b3f07` at +0 and
+`0x5b5440b3c00` at +64).
+
+So the next question is not the stride. It is whether this is the array
+upstream reads at all. Two readings fit the bytes:
+
+- the pooled expression bg3le resolved is not the one the functor's
+  `StatsExpressionRef` points at, and `Code` matching is a coincidence of
+  two expressions sharing the placeholder code — testable, since
+  `RefCount` differs between them and the reference captured 961 against
+  this reading's 1555; or
+- `Array<Param>`'s header is not a pointer, a capacity and a size on this
+  build, and `buf` is being read from the wrong eight bytes. The 64-byte
+  spacing between the two pointer-shaped values is suggestive here: a
+  `Param` whose union is 56 bytes with a one-byte discriminant at +56 would
+  be 64 bytes with alignment 8, and `07` and `04` do sit at +56 and +120.
+  Those are not the alternatives upstream reports (1 then 7), but they are
+  in range for a nine-alternative variant.
+
+Settling it wants the functor's `StatsExpressionRef` bytes next, and the
+`RefCount` comparison, before any more attention goes on the stride.

@@ -4150,6 +4150,37 @@ int l_field_address(lua_State* L) {
     return 2;
 }
 
+// Ext._Internal.ObjectFieldAddress(address, class, path)
+//   -> address, size
+//
+// The same as FieldAddress, for an object reached by address rather than a
+// component reached by entity handle. What settles a layout that is in
+// doubt: `StatsExpressionPooled.Params` reads as one element holding a
+// number where upstream reports two and a string, and deciding between a
+// wrong field offset and a wrong variant stride needs the bytes rather than
+// another reading of the declaration.
+int l_object_field_address(lua_State* L) {
+    Subject subject;
+    const char* className = nullptr;
+    if (!subject_from_object(L, 1, 2, &subject, &className)) return 2;
+    const char* path = luaL_checkstring(L, 3);
+
+    void* address = nullptr;
+    std::uint8_t kind = 0;
+    std::uint16_t size = 0;
+    bool readOnly = false;
+    if (!bg3le_meta_resolve(subject.Meta, path, subject.Base, &address, &kind,
+                            &size, &readOnly)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s.%s does not resolve", className, path);
+        return 2;
+    }
+
+    lua_pushinteger(L, (lua_Integer)(std::uintptr_t)address);
+    lua_pushinteger(L, size);
+    return 2;
+}
+
 // Ext._Internal.FieldBytes(handle, component, path [, count])
 //
 // The field's raw bytes as hex, grouped in eights, so a struct's shape can be
@@ -4871,6 +4902,8 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "ObjectVariantIndex");
     lua_pushcfunction(g_lua, l_object_map_key);
     lua_setfield(g_lua, -2, "ObjectMapKey");
+    lua_pushcfunction(g_lua, l_object_field_address);
+    lua_setfield(g_lua, -2, "ObjectFieldAddress");
     lua_pushcfunction(g_lua, l_field_address);
     lua_setfield(g_lua, -2, "FieldAddress");
     lua_pushcfunction(g_lua, l_field_bytes);
