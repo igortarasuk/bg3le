@@ -230,13 +230,17 @@ component's declared size with the size the engine recorded, and
 
 ## What is left
 
-- **86 of `Ext.*` refuse rather than answer.** Every name bg3se exposes is
+- **59 of `Ext.*` refuse rather than answer.** Every name bg3se exposes is
   present — `tools/api-coverage.lua` reports 715 of 715 — but the ones
   needing machinery bg3le does not have raise instead of returning a
-  plausible wrong answer: stat writes, functor execution, `Ext.Level`'s
-  physics and pathfinding, `Entity.Create`/`Destroy`, the atlas and resource
-  managers, and `GlobalSwitches` — whose object is findable by its own
-  language string and whose declared layout is not this build's, measured in
+  plausible wrong answer. `tools/count-refusals.py` derives the number from
+  the source, because this one was stale at 86 for a while: 24 of the 59 are
+  `Ext.Level`'s physics and pathfinding, 8 each `Ext.Stats`' creation and
+  functor execution and `Ext.StaticData`'s bank writes and atlas, 6
+  `Ext.Template`'s local and cache managers, and the rest are singles —
+  `Entity.Create`/`Destroy`, `Types.Construct`, and `GlobalSwitches`, whose
+  object is findable by its own language string and whose declared layout is
+  not this build's, measured in
   [reference/GLOBAL-SWITCHES.md](reference/GLOBAL-SWITCHES.md).
   `reference/ext-api-surface.txt` lists them with their shapes
 - **One session per process, unless asked.** `Ext.Debug.Reset()` works —
@@ -258,19 +262,28 @@ component's declared size with the size the engine recorded, and
   level load between one and the next in its *own* code, so it is off
   unless `BG3LE_STAT_STRING_WRITES=1`. Functors,
   roll conditions and requirements are held compiled by the engine and are
-  not attempted; `SetPersistence` and `CopyFrom` still raise, and `Sync`
-  reports what it cannot do rather than raising, because a mod that writes
-  and then syncs would otherwise lose the write it already made.
+  not attempted. `CopyFrom` works — it is upstream's own loop over the
+  indexed properties, which are the whole of a stat's scalar surface, and it
+  refuses across modifier lists exactly as upstream does. `SetPersistence`
+  still raises, and `Sync` reports what it cannot do rather than raising,
+  because a mod that writes and then syncs would otherwise lose the write it
+  already made — and because the thing `Sync` would rebuild is reachable
+  anyway: `Ext.Stats.GetCachedSpell` resolves the compiled prototype and its
+  fields are writable.
   [reference/STAT-WRITES.md](reference/STAT-WRITES.md) has the layout and
   the three theories that were tested and eliminated
-- **Functors, conditions and requirements inside stats.** Their shapes are
-  recorded in `reference/stats-spell.txt` — nested objects carrying a
-  `TypeId` — and bg3se exposes them through the same property maps this
-  already re-expands for components, so the field machinery should reach
-  them once `Object::Functors` is located
-- **The last 6% of the field kinds.** 3,344 of 3,558 fields convert
-  (94.0%, from `tools/meta-check.c`; the count grew when static data
-  resources joined the table and they carry `TranslatedString`): scalars, enums and bitmasks, nested
+- **The parameters of a pooled stats expression.** Functors, conditions and
+  requirements themselves are decoded: a status' `Damage` functor reads back
+  with its `DamageType`, `FunctorUuid`, flags and contexts, and matches the
+  real extender's capture. What does not is
+  `StatsExpressionPooled.Params` — upstream decodes `1d4` into
+  `["Roll", {AmountOfDices = 1, DiceValue = "D4", …}]` and bg3le returns the
+  `Code` and an empty array. The elements are `std::variant`s, which is the
+  kind the field machinery reaches last. See
+  [reference/REFERENCE-DIFFS.md](reference/REFERENCE-DIFFS.md)
+- **The last 4% of the field kinds.** 3,426 of 3,558 fields convert
+  (96.3%, from `tools/meta-check.c`; it was 94.0% before `STDString` was
+  given this build's sixteen-byte layout): scalars, enums and bitmasks, nested
   structs, fixed and dynamic arrays, hash sets, hash maps, glm vectors,
   `std::optional`, `std::variant` and `FixedString`. What is left is mostly
   `TranslatedString` and raw pointers. Naming an unsupported field raises
@@ -401,14 +414,21 @@ variable rather than being deleted, so the next game patch can re-run it.
 
 ## How it hooks
 
-No Detours and no instruction-length decoder. Three primitives in
-`src/hook.cpp` and `src/preload.cpp`:
+No instruction-length decoder, and nothing is patched in the middle of a
+function. Four primitives, in `src/hook.cpp`, `src/preload.cpp` and
+`src/detour_interpose.cpp`:
 
 1. PLT/dynamic-symbol interposition, by mangled name
 2. vtable-slot patching — one aligned store, and it verifies the slot's
    current contents first, so a shifted binary is refused rather than corrupted
 3. call-site patching — rewrites `call rel32` displacements to a nearby
    trampoline, since rel32 cannot reach a shared library from the executable
+4. `DetourAttachEx`, for the vendored code that expects Microsoft Detours. It
+   records the target and the replacement rather than patching either, and
+   one exported forwarder per hooked function lets the dynamic linker do what
+   Detours would have done. That is what brings up bg3se's seven Vulkan hooks
+   for the ImGui overlay; the two mistakes it took to get right are in
+   [reference/IMGUI-ASSESSMENT.md](reference/IMGUI-ASSESSMENT.md)
 
 Symbols come from the native binary's own `.symtab` (102,920 of them) plus
 11,214 recovered from embedded `__PRETTY_FUNCTION__` strings attributed to
