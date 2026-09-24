@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <iterator>
 #include <unordered_map>
 #include <vector>
@@ -556,6 +557,13 @@ std::unordered_map<std::uint32_t, Known>& resolved_strings() {
     return known;
 }
 
+// Copies of the entries the pool does not terminate. A deque rather than a
+// vector because the cache holds pointers into these and they must not move.
+std::deque<std::string>& owned_strings() {
+    static std::deque<std::string> owned;
+    return owned;
+}
+
 // Forgets the ids that did not resolve.
 //
 // Keeping failures is what stops an unset field costing three system calls
@@ -606,6 +614,33 @@ extern "C" char const* bg3le_fixed_string(std::uint32_t index,
     // With the lookups indexed the saving is not needed. If it is ever
     // needed again it has to expire, not persist.
     if (text == nullptr) return nullptr;
+
+    // The entry's own length is authoritative, and most callers hand this
+    // straight to strlen or to lua_pushstring. An entry whose text is not
+    // terminated at Length runs into the one after it in the pool, and the
+    // result looks like a real name with another string glued to the end:
+    // ELEMENTALAFFINITY_ACID came back as
+    // "ELEMENTALAFFINITY_ACIDTARGETAOE_IF(HasPassive(..." -- eight of 24,828
+    // stat names, enough to break a mod that walks them all and reads an
+    // attribute off each.
+    //
+    // So an unterminated entry is copied and terminated once, and the copy
+    // is what the cache holds. The engine's own bytes are never written, and
+    // a terminated entry -- which is nearly all of them -- still hands back
+    // the pointer into the pool.
+    // The terminator is read with safe_read rather than indexed: it is one
+    // byte past what the entry declares, and an entry at the end of a bucket
+    // could put it on a page that is not there. A read that fails counts as
+    // unterminated, which copies -- the safe answer either way.
+    char terminator = 1;
+    const bool readable =
+        safe_read(text + got, &terminator, sizeof(terminator));
+    if (!readable || terminator != '\0') {
+        auto& owned = owned_strings();
+        owned.emplace_back(text, got);
+        text = owned.back().c_str();
+    }
+
     known.emplace(index, Known{text, got});
 
     if (length != nullptr) *length = got;
