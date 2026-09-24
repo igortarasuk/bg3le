@@ -104,6 +104,7 @@ char const* text_of(bg3se::FixedString const& fs) {
 extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
                                             std::uint32_t* out);
 extern "C" void bg3le_fixed_string_forget_failures();
+extern "C" void bg3le_fixed_string_forget_all();
 extern "C" bool bg3le_meta_format_guid(void const* bytes, char* out,
                                        std::size_t capacity);
 
@@ -1107,6 +1108,14 @@ extern "C" void* bg3le_stats_at(std::size_t index) {
     return (void*)object_at(index);
 }
 
+// The raw FixedString id of a stat's Name, for the diagnostic that asks
+// whether it still resolves to the same text.
+extern "C" bool bg3le_stats_name_id(void const* object, std::uint32_t* out) {
+    const CacheLock lock(stats_cache_lock());
+    if (object == nullptr || out == nullptr) return false;
+    return read_as((char const*)object + state().NameOffset, out);
+}
+
 extern "C" char const* bg3le_stats_name(void const* object) {
     const CacheLock lock(stats_cache_lock());
     if (object == nullptr || !ready()) return nullptr;
@@ -1145,9 +1154,12 @@ std::unordered_map<std::string, void const*> const& stats_by_name() {
     byName.clear();
     builtFor = size;
 
-    // A name that failed to resolve early must not keep an index
-    // missing for the rest of the session.
-    bg3le_fixed_string_forget_failures();
+    // Nothing this index read before is trusted again, because this only runs
+    // when the stats array has grown -- the engine is still parsing, and a
+    // name resolved mid-parse can be the bytes that were there before the
+    // engine wrote it. Forgetting failures alone left one such name cached
+    // for the session; see bg3le_fixed_string_forget_all.
+    bg3le_fixed_string_forget_all();
 
     std::vector<void const*> all(size);
     const std::size_t got =
@@ -1189,9 +1201,12 @@ stats_names_by_list() {
     byList.clear();
     builtFor = size;
 
-    // A name that failed to resolve early must not keep an index
-    // missing for the rest of the session.
-    bg3le_fixed_string_forget_failures();
+    // Nothing this index read before is trusted again, because this only runs
+    // when the stats array has grown -- the engine is still parsing, and a
+    // name resolved mid-parse can be the bytes that were there before the
+    // engine wrote it. Forgetting failures alone left one such name cached
+    // for the session; see bg3le_fixed_string_forget_all.
+    bg3le_fixed_string_forget_all();
 
     std::vector<void const*> all(size);
     const std::size_t got =

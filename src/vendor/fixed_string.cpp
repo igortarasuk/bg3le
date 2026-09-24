@@ -573,6 +573,31 @@ std::deque<std::string>& owned_strings() {
 // from an index for the rest of the session. That is not hypothetical, it
 // made Ext.Stats.Get("PotentSpellcasting") return nil. An index builder
 // calls this first and resolves afresh.
+// Everything, successes included, for a caller about to re-read a set of ids
+// it has seen before.
+//
+// A success can be premature. The engine interns a stat's name as it parses
+// the stats, and an id read before its entry was written resolves to whatever
+// the memory held -- on one run a stat's Name came back as
+// "ls::TranslatedStringRepository::s_HandleUnknown", a symbol string, on an
+// object that was otherwise a perfectly good SpellData stat with 204
+// attributes and a valid Using. Caching that made it permanent for the
+// session, and 5eSpells walks every SpellData stat and reads an attribute off
+// each, so one bad name broke the mod.
+//
+// Intermittent, and it has not been caught in the act -- the stats array is a
+// different size on every load, so the index lands at a different point in the
+// parse. Ext._Internal.StatsNameRecheck is there to settle it when it happens
+// again: it resolves an id fresh and prints that beside what the cache holds.
+//
+// The pointers already handed out stay valid: the cache holds either a pointer
+// into the engine's own entry, which does not move, or a copy owned by
+// owned_strings(), which is never cleared.
+extern "C" void bg3le_fixed_string_forget_all() {
+    const CacheLock lock(string_cache_lock());
+    resolved_strings().clear();
+}
+
 extern "C" void bg3le_fixed_string_forget_failures() {
     const CacheLock lock(string_cache_lock());
     auto& known = resolved_strings();
@@ -647,6 +672,32 @@ extern "C" char const* bg3le_fixed_string(std::uint32_t index,
     return text;
 }
 
+
+// The text an id resolves to now, ignoring the cache, alongside what the
+// cache holds.
+//
+// Diagnostic. A stat whose Name id resolves to something that is not a stat
+// name -- a symbol, on one run -- is either a cache that went stale or a
+// resolve that was wrong from the start, and those want different fixes. This
+// tells them apart: if `fresh` and `cached` differ, the cache is stale.
+extern "C" bool bg3le_fixed_string_recheck(std::uint32_t id,
+                                           char const** cached,
+                                           char const** fresh) {
+    const CacheLock lock(string_cache_lock());
+    if (cached == nullptr || fresh == nullptr) return false;
+
+    void* table = bg3le_string_table();
+    if (table == nullptr) return false;
+
+    *cached = nullptr;
+    auto& known = resolved_strings();
+    auto found = known.find(id);
+    if (found != known.end()) *cached = found->second.Text;
+
+    std::uint32_t got = 0;
+    *fresh = resolve(table, id, &got);
+    return true;
+}
 
 // A FixedString for text the game does not already hold.
 //

@@ -16,12 +16,15 @@
 // derivation from value counts puts it.
 
 #include <stdafx.h>
+#include <variant>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+
+#include <GameDefinitions/Stats/Expression.h>
 
 #include "ls_string.h"
 
@@ -342,6 +345,31 @@ extern "C" void bg3le_stats_expression_dump(void const* pooled) {
 
     logf("expr: Params buffer %p, capacity %u, size %u", buffer, capacity,
          size);
+
+    // What this build compiles the element to. std::variant keeps its
+    // discriminant after the union, so a union of a different size puts the
+    // index somewhere else -- which is why Params[0] reads as alternative 256
+    // of nine. The index offset is found rather than assumed: set the variant
+    // to two known alternatives and look for the byte that follows.
+    using Param = bg3se::StatsExpressionInternal::Param;
+    logf("expr: this build's Param is %zu bytes, aligned %zu, %zu "
+         "alternatives", sizeof(Param), alignof(Param),
+         std::variant_size_v<Param>);
+
+    Param probe;
+    probe.emplace<0>();
+    unsigned char first[sizeof(Param)];
+    std::memcpy(first, &probe, sizeof(Param));
+    probe.emplace<7>();  // int32_t
+    unsigned char second[sizeof(Param)];
+    std::memcpy(second, &probe, sizeof(Param));
+
+    for (std::size_t at = 0; at < sizeof(Param); ++at) {
+        if (first[at] == 0 && second[at] == 7) {
+            logf("expr: this build keeps the index at +%zu", at);
+            break;
+        }
+    }
     for (std::size_t off = 0; off < 128; off += 8) {
         std::uint64_t word = 0;
         if (!read_as((char const*)buffer + off, &word)) break;

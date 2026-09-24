@@ -1009,6 +1009,10 @@ extern "C" bool bg3le_meta_type_name_at(void const* handle, char const* path,
                                         char const** name,
                                         std::uint16_t* length);
 extern "C" void* bg3le_global_switches();
+extern "C" bool bg3le_stats_name_id(void const* object, std::uint32_t* out);
+extern "C" bool bg3le_fixed_string_recheck(std::uint32_t id,
+                                           char const** cached,
+                                           char const** fresh);
 extern "C" bool bg3le_stats_copy_from(void const* dest, void const* source,
                                       std::size_t* carried,
                                       std::size_t* total);
@@ -2534,6 +2538,35 @@ int l_mod_settings(lua_State* L) {
         lua_rawseti(L, -2, (int)i + 1);
     }
     return 1;
+}
+
+// Ext._Internal.StatsNameRecheck(addr) -> id, cached, fresh
+//
+// Diagnostic, for a stat whose Name resolves to text that is not a stat name.
+// If the cached and fresh answers differ, the string cache went stale.
+int l_stats_name_recheck(lua_State* L) {
+    auto const* object =
+        (void const*)(std::uintptr_t)luaL_checkinteger(L, 1);
+
+    std::uint32_t id = 0;
+    if (!bg3le_stats_name_id(object, &id)) return 0;
+
+    char const* cached = nullptr;
+    char const* fresh = nullptr;
+    if (!bg3le_fixed_string_recheck(id, &cached, &fresh)) return 0;
+
+    lua_pushinteger(L, (lua_Integer)id);
+    if (cached != nullptr) {
+        lua_pushstring(L, cached);
+    } else {
+        lua_pushnil(L);
+    }
+    if (fresh != nullptr) {
+        lua_pushstring(L, fresh);
+    } else {
+        lua_pushnil(L);
+    }
+    return 3;
 }
 
 // Ext._Internal.GlobalSwitches() -> address
@@ -4071,6 +4104,8 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "StatsCopyFrom");
     lua_pushcfunction(g_lua, l_global_switches);
     lua_setfield(g_lua, -2, "GlobalSwitches");
+    lua_pushcfunction(g_lua, l_stats_name_recheck);
+    lua_setfield(g_lua, -2, "StatsNameRecheck");
     lua_pushcfunction(g_lua, l_stats_attr_translated);
     lua_setfield(g_lua, -2, "StatsAttrTranslated");
     lua_pushcfunction(g_lua, l_stats_attr_condition);
