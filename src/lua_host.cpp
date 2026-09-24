@@ -726,6 +726,10 @@ extern "C" bool bg3le_fixed_string_intern(char const* text,
                                           unsigned int* out);
 extern "C" bool bg3le_fixed_string_index_of(char const* wanted,
                                             unsigned int* out);
+extern "C" char const* bg3le_meta_class_name(void const* handle);
+extern "C" bool bg3le_meta_type_name_at(void const* handle, char const* path,
+                                        char const** name,
+                                        std::uint16_t* length);
 extern "C" bool bg3le_meta_lsstring_assign(void* address, char const* text,
                                            std::size_t length);
 
@@ -2437,6 +2441,44 @@ int l_component_type_names(lua_State* L) {
     return 1;
 }
 
+// Ext._Internal.ClassName(name) -> the reflected class name.
+//
+// A component answers to three names and only one of them keys the type
+// registry, so a view has to be told which it is before it can report a type.
+int l_class_name(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+
+    void const* meta = bg3le_meta_component(name);
+    if (meta == nullptr) meta = bg3le_meta_class(name);
+    if (meta == nullptr) return 0;
+
+    char const* className = bg3le_meta_class_name(meta);
+    if (className == nullptr) return 0;
+    lua_pushstring(L, className);
+    return 1;
+}
+
+// Ext._Internal.TypeNameAt(class, path) -> the declared type of that field.
+//
+// A nested struct is an object with a type of its own, and a view over one
+// should say which -- Ext.Types.GetObjectType on entity.Transform.Translate
+// has to name a type GetTypeInfo can then find.
+int l_type_name_at(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    const char* path = luaL_optstring(L, 2, "");
+
+    void const* meta = bg3le_meta_component(name);
+    if (meta == nullptr) meta = bg3le_meta_class(name);
+    if (meta == nullptr) return 0;
+
+    char const* found = nullptr;
+    std::uint16_t length = 0;
+    if (!bg3le_meta_type_name_at(meta, path, &found, &length)) return 0;
+
+    lua_pushlstring(L, found, length);
+    return 1;
+}
+
 // Ext._Internal.TypeNames() -> every reflected class name, for Ext.Types.
 int l_type_names(lua_State* L) {
     const std::size_t count = bg3le_meta_class_count();
@@ -3658,6 +3700,10 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "ComponentTypeNames");
     lua_pushcfunction(g_lua, l_type_names);
     lua_setfield(g_lua, -2, "TypeNames");
+    lua_pushcfunction(g_lua, l_class_name);
+    lua_setfield(g_lua, -2, "ClassName");
+    lua_pushcfunction(g_lua, l_type_name_at);
+    lua_setfield(g_lua, -2, "TypeNameAt");
     lua_pushcfunction(g_lua, l_type_component);
     lua_setfield(g_lua, -2, "TypeIsComponent");
     lua_pushcfunction(g_lua, l_stats_functor_groups);
@@ -4469,17 +4515,65 @@ function Ext.Types.GetFunctionLocation(fn)
   return info.short_src, info.linedefined
 end
 
--- Custom properties and methods are grafted onto bg3se's property map for
--- a type. bg3le's objects are plain tables built per read, so a graft has
--- nowhere to live that would survive the next read.
-function Ext.Types.AddCustomFunction()
-  error("bg3le: Ext.Types.AddCustomFunction needs the property map to be "
-        .. "extensible at runtime, which it is not here", 2)
+-- Custom methods and properties, by the type they were registered on.
+--
+-- Upstream grafts these onto the type's property map. bg3le's objects are
+-- built per read, so there is nothing per-object to graft to -- but the type
+-- is what the registration names, and a table keyed by type name outlives
+-- every view of it. Each view consults this when a key is not one of the
+-- engine's fields, which is exactly where upstream's property map would have
+-- answered.
+local custom_members = {}
+
+-- Published so the views can reach it; the prelude is compiled in more than
+-- one chunk, so a local here is not in scope there.
+function Ext._Internal.CustomMember(typeName, key)
+  local members = typeName ~= nil and custom_members[typeName] or nil
+  if members == nil then return nil end
+  return members[key]
 end
 
-function Ext.Types.AddCustomProperty()
-  error("bg3le: Ext.Types.AddCustomProperty needs the property map to be "
-        .. "extensible at runtime, which it is not here", 2)
+local function register_custom(what, typeName, property, entry)
+  if type(typeName) ~= "string" or type(property) ~= "string" then
+    error("Ext.Types." .. what .. " takes a type name and a member name", 2)
+  end
+
+  -- Upstream's two refusals, in its own words: an unknown type, and a type
+  -- that is not an object and so has no property map to extend.
+  local class = Ext._Internal.ClassName(typeName)
+  if class == nil then
+    error("Type not found: " .. typeName, 2)
+  end
+  if Ext._Internal.ObjectFields(class, "") == nil then
+    error("Cannot extend non-object type: " .. typeName, 2)
+  end
+
+  local members = custom_members[class]
+  if members == nil then
+    members = {}
+    custom_members[class] = members
+  end
+  members[property] = entry
+  return true
+end
+
+function Ext.Types.AddCustomFunction(typeName, property, func)
+  if type(func) ~= "function" then
+    error("Ext.Types.AddCustomFunction takes a function", 2)
+  end
+  return register_custom("AddCustomFunction", typeName, property,
+                         {Fn = func})
+end
+
+function Ext.Types.AddCustomProperty(typeName, property, getter, setter)
+  if type(getter) ~= "function" then
+    error("Ext.Types.AddCustomProperty takes a getter", 2)
+  end
+  if setter ~= nil and type(setter) ~= "function" then
+    error("Ext.Types.AddCustomProperty's setter must be a function", 2)
+  end
+  return register_custom("AddCustomProperty", typeName, property,
+                         {Get = getter, Set = setter})
 end
 
 function Ext.Types.GenerateIdeHelpers()
@@ -5518,6 +5612,33 @@ end
 -- A view over a set of fields, used for a component, for a struct nested
 -- inside one, and for a struct that is an array element; the only difference
 -- is the path prefix.
+-- The reflected type of a view, memoised.
+--
+-- A component answers to three names and only the class name keys the type
+-- registry; a nested struct's type comes from the field that declares it.
+-- Both are one call, and the set of (component, path) pairs is small, so the
+-- answer is kept rather than asked for per view -- a component is read often
+-- enough for that to matter.
+local view_types = {}
+
+local function type_of_view(comp, prefix)
+  local key = comp .. "\0" .. prefix
+  local found = view_types[key]
+  if found ~= nil then
+    if found == false then return nil end
+    return found
+  end
+
+  local name
+  if prefix == "" then
+    name = Ext._Internal.ClassName(comp)
+  else
+    name = Ext._Internal.TypeNameAt(comp, prefix)
+  end
+  view_types[key] = name or false
+  return name
+end
+
 make_fields = function(handle, comp, prefix, fields)
   local function path_to(key)
     if prefix == "" then return key end
@@ -5525,9 +5646,22 @@ make_fields = function(handle, comp, prefix, fields)
   end
 
   return setmetatable({}, {
-    __index = function(_, key)
+    -- What Ext.Types.GetObjectType reports, and what a custom member is
+    -- registered against.
+    __name = type_of_view(comp, prefix),
+    __index = function(self, key)
       local kind = fields[key]
       if kind == nil then
+        -- A member a mod grafted on with Ext.Types.AddCustomFunction or
+        -- AddCustomProperty, which is where upstream's property map would
+        -- have answered.
+        local extra = Ext._Internal.CustomMember(type_of_view(comp, prefix),
+                                                 key)
+        if extra ~= nil then
+          if extra.Fn ~= nil then return extra.Fn end
+          return extra.Get(self)
+        end
+
         local where = prefix == "" and comp or (comp .. "." .. prefix)
         error("bg3le: " .. where .. " has no field " .. tostring(key), 0)
       end
@@ -5536,7 +5670,19 @@ make_fields = function(handle, comp, prefix, fields)
       -- dispatch is what keeps the three call sites from drifting.
       return read_path(handle, comp, path_to(key))
     end,
-    __newindex = function(_, key, value)
+    __newindex = function(self, key, value)
+      if fields[key] == nil then
+        local extra = Ext._Internal.CustomMember(type_of_view(comp, prefix),
+                                                 key)
+        if extra ~= nil then
+          if extra.Set == nil then
+            error("bg3le: " .. tostring(key) .. " is read-only", 0)
+          end
+          extra.Set(self, value)
+          return
+        end
+      end
+
       local path = path_to(key)
       local ok, err = Ext._Internal.SetField(handle, comp, path, value)
       -- A hash set is the one field a plain write refuses on purpose: its
@@ -6418,11 +6564,35 @@ function read_object(addr, class, prefix, out)
     return class .. "." .. prefix
   end
 
+  -- The type this view is of, for Ext.Types.GetObjectType and for the members
+  -- a mod may have grafted on with Ext.Types.AddCustomFunction.
+  local viewType = (prefix == "") and Ext._Internal.ClassName(class)
+                   or Ext._Internal.TypeNameAt(class, prefix)
+
   return setmetatable(out, {
-    __index = values,
-    __newindex = function(_, key, value)
+    __name = viewType,
+    __index = function(self, key)
+      local held = values[key]
+      if held ~= nil then return held end
+
+      local extra = Ext._Internal.CustomMember(viewType, key)
+      if extra ~= nil then
+        if extra.Fn ~= nil then return extra.Fn end
+        return extra.Get(self)
+      end
+      return nil
+    end,
+    __newindex = function(self, key, value)
       local kind = fields[key]
       if kind == nil then
+        local extra = Ext._Internal.CustomMember(viewType, key)
+        if extra ~= nil then
+          if extra.Set == nil then
+            error("bg3le: " .. tostring(key) .. " is read-only", 0)
+          end
+          extra.Set(self, value)
+          return
+        end
         error("bg3le: " .. where() .. " has no field " .. tostring(key), 0)
       end
 

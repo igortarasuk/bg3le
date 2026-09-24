@@ -83,6 +83,32 @@ its table afterwards, `require` resolving against its own `Lua/`
 directory, and `Ext.IO.LoadFile(path, "data")` falling through to the
 archives when the file is not on disk.
 
-`BootstrapClient.lua` is not run at all: bg3le has one Lua context, the
-server's. For a UI mod that is most of the mod, so the mods that ship one
-are named at load time.
+`BootstrapClient.lua` runs too, in the client Lua context, after the
+server's bootstraps. Both contexts are real Lua states on the threads the
+engine gives them, which is why every cache bg3le derives is behind a lock
+-- see `src/vendor/cache_lock.h`.
+
+## The engine's load order holds 43 of the 70
+
+Measured 2026-09-23 with the same 57-mod set. The engine reports 73
+available modules and `modsettings.lsx` enables 70 of them, and the
+engine's own load order holds 43. Twenty-seven are missing from it,
+including Mod Configuration Menu.
+
+They are not unloaded. Stats carry the UUID of the mod that defined them,
+and counting 23,998 stats by `OriginalModId` puts 37 of them under
+"Clerics", which is one of the twenty-seven. Most of the rest are
+cosmetic -- hairstyles, face presets, hotbar and tooltip replacements --
+and define no stats at all, so there is nothing to count either way.
+
+So the engine's load order is narrower than "every mod whose content is
+mounted", the same way MCM mounts on content above. What it is exactly is
+not settled. Until it is:
+
+- `Ext.Mod.GetLoadOrder` returns the engine's order and then anything else
+  enabled in `modsettings.lsx`, which comes to 70.
+- `Ext.Mod.IsModLoaded` answers over that merged order. Asking the
+  engine's list alone reported MCM as absent, and 5eSpells reads every one
+  of its settings behind that call, so it silently disabled the whole mod.
+- `Ext.Mod.GetMod` tries the engine's order, then every Module the engine
+  holds, then the archives.

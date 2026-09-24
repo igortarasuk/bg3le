@@ -148,6 +148,13 @@ component's declared size with the size the engine recorded, and
   it — the stats array, the modifier lists, the value lists, the string,
   int64, guid and float pools, and `Object`'s own field offsets — is located
   by content and validated before use
+- `Ext.Types` over the same metadata. `GetAllTypes` lists all 3,071 reflected
+  classes, and a component or resource view reports its own type, so
+  `GetObjectType`, `TypeOf` and `IsA` answer for `entity.Health` and for a
+  nested struct rather than only for a stat. `AddCustomFunction` and
+  `AddCustomProperty` work: upstream grafts them onto the type's property map,
+  and bg3le keeps them keyed by type name, which every view of that type
+  consults where the property map would have answered
 - `Ext.Mod`, all five functions. The mod manager has no symbol either, so
   the list is found from the one thing every install shares: the base
   module's UUID is the constant `ed539163-…`, which locates a `Module`

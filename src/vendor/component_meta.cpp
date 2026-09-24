@@ -1240,6 +1240,43 @@ Resolved resolve_path(ClassFields const* cls, char const* path, void* base) {
 // Looks a component up by its engine name, as it appears in the ECS registry
 // ("eoc::HealthComponent"). Returns an opaque handle, or null if bg3se has no
 // metadata for it.
+// The declared type of the field at a path, for the same reason: a nested
+// struct is an object with a type of its own, and a view over it should say
+// which. Not NUL-terminated -- it is a slice of a compiler-generated name --
+// so the length comes back too.
+extern "C" bool bg3le_meta_type_name_at(void const* handle, char const* path,
+                                        char const** name,
+                                        std::uint16_t* length) {
+    if (handle == nullptr || name == nullptr || length == nullptr) return false;
+    *name = nullptr;
+    *length = 0;
+
+    auto const* cls = static_cast<ClassFields const*>(handle);
+    if (path == nullptr || path[0] == '\0') {
+        if (cls->Name == nullptr) return false;
+        *name = cls->Name;
+        *length = (std::uint16_t)std::strlen(cls->Name);
+        return true;
+    }
+
+    const auto r = resolve_path(cls, path, nullptr);
+    if (!r.Ok) return false;
+
+    // A struct field carries its type; an array of structs carries its
+    // element's, which is what an element view wants.
+    char const* found = r.Field.TypeName;
+    std::uint16_t len = r.Field.TypeNameLength;
+    if (found == nullptr) {
+        found = r.Field.ElemTypeName;
+        len = r.Field.ElemTypeNameLength;
+    }
+    if (found == nullptr || len == 0) return false;
+
+    *name = found;
+    *length = len;
+    return true;
+}
+
 extern "C" void const* bg3le_meta_component(char const* engineName) {
     if (engineName == nullptr) return nullptr;
     auto it = by_component_name().find(engineName);
@@ -2025,7 +2062,13 @@ extern "C" void const* bg3le_meta_class_at(std::size_t index) {
     return kAllClasses[index];
 }
 
-// The bg3se name of a reflected class, for Ext.Types.GetAllTypes.
+// The bg3se name of a reflected class.
+//
+// A component is reachable by three names -- its engine class, bg3se's short
+// name, and the class name from the generated metadata -- and only the last is
+// what the type registry is keyed by. Ext.Types.GetAllTypes lists these, and
+// Ext.Types.GetObjectType has to return one of them or GetTypeInfo on its
+// answer finds nothing.
 extern "C" char const* bg3le_meta_class_name(void const* handle) {
     if (handle == nullptr) return nullptr;
     return static_cast<ClassFields const*>(handle)->Name;
