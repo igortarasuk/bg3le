@@ -5682,9 +5682,33 @@ function Ext.Mod.GetLoadOrder()
   return out
 end
 
+-- Whether a mod is loaded, over the same order Ext.Mod.GetLoadOrder reports.
+--
+-- Asking the engine's own load order is not enough: it holds 43 of the 70
+-- enabled modules on this build, and Mod Configuration Menu is one of the
+-- ones missing from it even though it is loaded, configured and answering
+-- calls -- it mounts on content rather than through the load order, which
+-- reference/MOD-LOADING.md establishes. 5eSpells reads every one of its own
+-- settings behind `IsModLoaded(MCM)`, so a false there silently turned off
+-- every feature the mod has: no spell lists edited, no stats changed, and not
+-- one line of output to say so.
+--
+-- Recomputed when the order changes rather than cached outright, since a mod
+-- may ask before the order is complete.
+local mod_loaded = {}
+local mod_loaded_for = -1
+
 function Ext.Mod.IsModLoaded(uuid)
   if type(uuid) ~= "string" then return false end
-  return Ext._Internal.ModFind(uuid) ~= nil
+
+  local order = Ext.Mod.GetLoadOrder()
+  if #order ~= mod_loaded_for then
+    mod_loaded = {}
+    mod_loaded_for = #order
+    for _, id in ipairs(order) do mod_loaded[id] = true end
+  end
+
+  return mod_loaded[uuid] == true
 end
 
 -- What the archives say about a mod the engine has not loaded, keyed by
