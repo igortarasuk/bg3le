@@ -55,8 +55,11 @@ make_map = slice_between(
     "-- A map field is a view too, keyed the way the engine keys it.",
     "-- A view over a set of fields, used for a component")
 
+# From the JSON string helper rather than from encode itself: the encoder
+# calls it, and slicing below it left an undefined global that only showed up
+# as a pcall returning false.
 encoder = slice_between(
-    "local function encode(v, indent, depth, opts, seen, out)",
+    "-- A JSON string literal.",
     "function Ext.DumpExport(v)")
 
 PRELUDE = """
@@ -307,6 +310,25 @@ check("the serializer did not re-index the view", direct, 0)
 -- Direct access is still an error, which is the whole point of the split.
 check("naming the field directly still raises",
       pcall(function() return proxy.DiceValues end), false)
+
+-- A string with a control character in it has to come out as JSON and not as
+-- Lua. string.format("%q") writes \1, which no JSON parser takes -- including
+-- bg3le's own, which is how this was found: a net channel wrapped its payload
+-- in a table whose key held a byte 1, and every message was dropped on the
+-- parse.
+local control = Ext.Json.Stringify({k = string.char(1) .. "x" .. string.char(31)})
+check("a control character is escaped as JSON",
+      control:find("\\u0001", 1, true) ~= nil, true)
+check("a control character is not escaped as Lua",
+      control:find("\\1x", 1, true) == nil, true)
+check("the high control character too",
+      control:find("\\u001f", 1, true) ~= nil, true)
+
+local quoted = Ext.Json.Stringify({k = "a\"b\\c\nd\te"})
+check("a quote is escaped", quoted:find('\\"', 1, true) ~= nil, true)
+check("a backslash is escaped", quoted:find("\\\\", 1, true) ~= nil, true)
+check("a newline is escaped", quoted:find("\\n", 1, true) ~= nil, true)
+check("a tab is escaped", quoted:find("\\t", 1, true) ~= nil, true)
 
 """
 
