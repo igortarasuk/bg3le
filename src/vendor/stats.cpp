@@ -1114,18 +1114,113 @@ extern "C" char const* bg3le_stats_name(void const* object) {
 // Linear, like the resource bank lookup: the engine's hash for a FixedString
 // key is its own, and a wrong hash misses silently where a scan either finds
 // the name or does not.
+// Every stat by name, built once.
+//
+// This used to be a linear scan, and the comment above Ext.Stats.GetStats
+// said what that costs: a mod that walks the stats and fetches each one by
+// name turns 27,821 lookups into 27,821 scans of 27,821 objects, two
+// system calls an element. That is five hundred million reads, and it is
+// what 5eSpells was doing for six minutes at a stretch with nothing to
+// show for it.
+//
+// Built from one read of the pointer array and one name read per object --
+// forty milliseconds, once -- and rebuilt if the array's size changes,
+// which is the only way its contents can, since a stat object does not
+// move once the manager holds it.
+std::unordered_map<std::string, void const*> const& stats_by_name() {
+    static std::unordered_map<std::string, void const*> byName;
+    static std::uint32_t builtFor = 0;
+
+    const std::uint32_t size = state().Objects.Size;
+    if (!byName.empty() && builtFor == size) return byName;
+
+    byName.clear();
+    builtFor = size;
+
+    std::vector<void const*> all(size);
+    const std::size_t got =
+        safe_read_some(state().Objects.Buffer, all.data(),
+                       (std::size_t)size * sizeof(void*)) / sizeof(void*);
+
+    byName.reserve(got);
+    for (std::size_t i = 0; i < got; ++i) {
+        if (all[i] == nullptr) continue;
+        char const* name = bg3le_stats_name(all[i]);
+        if (name == nullptr || name[0] == '\0') continue;
+        byName.emplace(name, all[i]);
+    }
+
+    logf("stats: %zu stats indexed by name", byName.size());
+    return byName;
+}
+
+extern "C" char const* bg3le_stats_type(void const* object);
+
+// Stat names, by the modifier list they belong to, built once.
+//
+// Ext.Stats.GetStats walked all 27,821 objects and asked each one for its
+// name and its list -- six system calls an element, a quarter of a second
+// a call. A mod calls it once per spell school, or once per loop, and
+// 5eSpells never got past the section that does: it spent minutes there
+// without reaching a single stat write.
+//
+// The empty key holds every name, in array order, which is the order
+// upstream returns them in.
+std::unordered_map<std::string, std::vector<char const*>> const&
+stats_names_by_list() {
+    static std::unordered_map<std::string, std::vector<char const*>> byList;
+    static std::uint32_t builtFor = 0;
+
+    const std::uint32_t size = state().Objects.Size;
+    if (!byList.empty() && builtFor == size) return byList;
+
+    byList.clear();
+    builtFor = size;
+
+    std::vector<void const*> all(size);
+    const std::size_t got =
+        safe_read_some(state().Objects.Buffer, all.data(),
+                       (std::size_t)size * sizeof(void*)) / sizeof(void*);
+
+    std::vector<char const*>& every = byList[""];
+    every.reserve(got);
+    for (std::size_t i = 0; i < got; ++i) {
+        if (all[i] == nullptr) continue;
+        char const* name = bg3le_stats_name(all[i]);
+        if (name == nullptr || name[0] == '\0') continue;
+        every.push_back(name);
+
+        char const* list = bg3le_stats_type(all[i]);
+        if (list != nullptr && list[0] != '\0') byList[list].push_back(name);
+    }
+
+    logf("stats: %zu names indexed across %zu modifier lists", every.size(),
+         byList.size() - 1);
+    return byList;
+}
+
+extern "C" std::size_t bg3le_stats_names_count(char const* list) {
+    if (!ready()) return 0;
+    auto const& byList = stats_names_by_list();
+    auto found = byList.find(list == nullptr ? "" : list);
+    return found == byList.end() ? 0 : found->second.size();
+}
+
+extern "C" char const* bg3le_stats_names_at(char const* list,
+                                            std::size_t index) {
+    if (!ready()) return nullptr;
+    auto const& byList = stats_names_by_list();
+    auto found = byList.find(list == nullptr ? "" : list);
+    if (found == byList.end() || index >= found->second.size()) return nullptr;
+    return found->second[index];
+}
+
 extern "C" void* bg3le_stats_find(char const* wanted) {
     if (wanted == nullptr || !ready()) return nullptr;
-    const std::size_t n = state().Objects.Size;
-    for (std::size_t i = 0; i < n; ++i) {
-        void const* obj = object_at(i);
-        if (obj == nullptr) continue;
-        char const* name = bg3le_stats_name(obj);
-        if (name != nullptr && std::strcmp(name, wanted) == 0) {
-            return (void*)obj;
-        }
-    }
-    return nullptr;
+
+    auto const& byName = stats_by_name();
+    auto found = byName.find(wanted);
+    return found == byName.end() ? nullptr : (void*)found->second;
 }
 
 // ---- attributes ----

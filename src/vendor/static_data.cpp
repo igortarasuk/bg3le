@@ -25,6 +25,9 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
+#include <unordered_map>
+#include <string>
 
 #include "../ecs_types.h"
 #include "../log.h"
@@ -189,10 +192,28 @@ constexpr std::size_t kResourcesOffset =
 
 // Looks a GUID up in a bank, given the size of one resource.
 //
-// Linear over the key array rather than hashed: the engine's hash for a Guid
-// key is its own, and a wrong hash would miss silently, where a linear scan
-// either finds the key or does not. Banks hold hundreds of entries and this
-// runs once per lookup.
+// Not hashed: the engine's hash for a Guid key is its own, and a wrong
+// hash would miss silently where a scan either finds the key or does not.
+// But not a read per key either, which is what this was -- the comment
+// said "banks hold hundreds of entries and this runs once per lookup",
+// and both halves turned out to be wrong. A mod that edits spell lists
+// calls Ext.StaticData.Get in a loop, and 5eSpells' stats pass spent two
+// hundred and twenty million fault-tolerant reads here, at about a
+// million a second, without finishing.
+//
+// So the key array is read once per bank and indexed. The keys do not
+// change while the game runs -- a bank is built from the game's data and
+// then read -- and the index is rebuilt if the count moves, which is the
+// only way they could.
+struct Bank {
+    std::unordered_map<std::string, std::uint32_t> ByGuid;
+    std::uint32_t Count{0};
+};
+
+std::string guid_key(void const* guid) {
+    return std::string((char const*)guid, sizeof(bg3se::Guid));
+}
+
 void* find_resource(void* bank, void const* guid, std::size_t resourceSize) {
     if (bank == nullptr || guid == nullptr || resourceSize == 0) return nullptr;
 
@@ -207,16 +228,26 @@ void* find_resource(void* bank, void const* guid, std::size_t resourceSize) {
     if (keyBuf == nullptr || valueBuf == nullptr) return nullptr;
     if (keyCount > (1u << 22)) return nullptr;  // implausible; refuse
 
-    for (std::uint32_t i = 0; i < keyCount; ++i) {
-        bg3se::Guid key{};
-        if (!read_as((char const*)keyBuf + i * sizeof(bg3se::Guid), &key)) {
-            return nullptr;
+    static std::unordered_map<void*, Bank> banks;
+    Bank& known = banks[bank];
+    if (known.Count != keyCount || known.ByGuid.empty()) {
+        std::vector<bg3se::Guid> keys(keyCount);
+        const std::size_t got =
+            safe_read_some(keyBuf, keys.data(),
+                           (std::size_t)keyCount * sizeof(bg3se::Guid))
+            / sizeof(bg3se::Guid);
+
+        known.ByGuid.clear();
+        known.ByGuid.reserve(got);
+        for (std::size_t i = 0; i < got; ++i) {
+            known.ByGuid.emplace(guid_key(&keys[i]), (std::uint32_t)i);
         }
-        if (std::memcmp(&key, guid, sizeof(key)) == 0) {
-            return (char*)valueBuf + (std::size_t)i * resourceSize;
-        }
+        known.Count = keyCount;
     }
-    return nullptr;
+
+    auto found = known.ByGuid.find(guid_key(guid));
+    if (found == known.ByGuid.end()) return nullptr;
+    return (char*)valueBuf + (std::size_t)found->second * resourceSize;
 }
 
 }  // namespace

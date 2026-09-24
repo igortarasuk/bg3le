@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <deque>
+#include <set>
 #include <cstring>
 #include <ctime>
 #include <dirent.h>
@@ -1406,6 +1407,9 @@ extern "C" bool bg3le_stats_attr_set(void const* object, std::size_t index,
 extern "C" int bg3le_stats_condition_intern(char const* text);
 extern "C" int bg3le_stats_attr_index(void const* object,
                                       char const* wanted);
+extern "C" std::size_t bg3le_stats_names_count(char const* list);
+extern "C" char const* bg3le_stats_names_at(char const* list,
+                                            std::size_t index);
 extern "C" void bg3le_fixed_string_dump();
 extern "C" int bg3le_stats_string_intern(char const* text);
 extern "C" bool bg3le_fixed_string_intern(char const* text,
@@ -1683,6 +1687,23 @@ int l_object_array_info(lua_State* L) {
         lua_pushnil(L);
         lua_pushfstring(L, "cannot size %s.%s (status %d)", className, path,
                         status);
+        return 2;
+    }
+
+    // An implausible count means the size was read from something that is
+    // not this array's size, and walking it would read millions of
+    // elements that are not there. Said once per class and path, because
+    // it is a metadata problem worth fixing rather than a passing error.
+    constexpr std::size_t kSane = 1u << 20;
+    if (count > kSane) {
+        static std::set<std::string> said;
+        const std::string what = std::string(className) + "." + path;
+        if (said.insert(what).second) {
+            logf("meta: %s reports %zu elements, which is not a size; "
+                 "treating it as empty", what.c_str(), count);
+        }
+        lua_pushinteger(L, 0);
+        lua_pushstring(L, field_kind_name((FieldKind)elemKind));
         return 2;
     }
 
@@ -2422,6 +2443,26 @@ int l_env(lua_State* L) {
 int l_string_table_dump(lua_State*) {
     bg3le_fixed_string_dump();
     return 0;
+}
+
+// Ext._Internal.StatsNames([modifierList]) -> { name, ... }
+//
+// From an index built once rather than by walking every stat and asking
+// each one what it is. Ext.Stats.GetStats is called in loops, and doing it
+// the other way cost a quarter of a second a call.
+int l_stats_names(lua_State* L) {
+    char const* list = lua_isnoneornil(L, 1) ? nullptr : luaL_checkstring(L, 1);
+    const std::size_t count = bg3le_stats_names_count(list);
+
+    lua_createtable(L, (int)count, 0);
+    int kept = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        char const* name = bg3le_stats_names_at(list, i);
+        if (name == nullptr) continue;
+        lua_pushstring(L, name);
+        lua_rawseti(L, -2, ++kept);
+    }
+    return 1;
 }
 
 // Ext._Internal.StatsAttrFind(addr, name) -> index, kind, typeName
@@ -3385,6 +3426,8 @@ void build_state(bool client) {
     lua_setfield(g_lua, -2, "Env");
     lua_pushcfunction(g_lua, l_string_table_dump);
     lua_setfield(g_lua, -2, "StringTableDump");
+    lua_pushcfunction(g_lua, l_stats_names);
+    lua_setfield(g_lua, -2, "StatsNames");
     lua_pushcfunction(g_lua, l_stats_attr_find);
     lua_setfield(g_lua, -2, "StatsAttrFind");
     lua_pushcfunction(g_lua, l_stats_attr_set);
@@ -5617,29 +5660,14 @@ end
 -- how the FixedString path below was shown to be the thing that hangs the
 -- engine.
 local STAT_WRITABLE_KINDS = {
-  [0] = "int", [1] = "int", [4] = "enum", [8] = "condition",
+  [0] = "int", [1] = "int", [3] = "string", [4] = "enum", [8] = "condition",
 }
-
--- BG3LE_STAT_STRING_WRITES=1 adds FixedString attributes. Everything they
--- need is correct -- the entry comes off the engine's own free list, the id
--- resolves, the pool slot lands, and the attribute reads back -- and doing
--- one during a level load is harmless. What is not usable is a mod that
--- does hundreds: 5eSpells gets past the write that used to stop it and
--- then spends six minutes of the level load between one string write and
--- the next, in its own code. See reference/STAT-WRITES.md.
-if Ext._Internal.Env("BG3LE_STAT_STRING_WRITES") == "1" then
-  STAT_WRITABLE_KINDS[3] = "string"
-end
 if Ext._Internal.Env("BG3LE_STAT_WRITES") == "0" then
   STAT_WRITABLE_KINDS = {}
 end
 
 local STAT_KIND_UNWRITABLE = {
   [2] = "a float, which indexes a pool with no room to add to",
-  [3] = "a FixedString. The write itself works, but a mod that makes "
-        .. "hundreds of them spends minutes of the level load between one "
-        .. "and the next; see reference/STAT-WRITES.md, and "
-        .. "BG3LE_STAT_STRING_WRITES=1 enables it",
   [5] = "a flag set, which indexes the int64 pool",
   [6] = "a GUID, which indexes the GUID pool",
   [7] = "a functor list, which the engine holds compiled",
@@ -5924,31 +5952,12 @@ end
 -- has to match or a mod written against bg3se will not run here. Internal
 -- entry points stay ours to shape -- it is Ext.* that is the contract.
 --
--- No filter argument. Filtering by modifier list needs the modifier lists,
--- which are not located yet, and the obvious implementation -- StatsFind per
--- stat -- is quadratic: 15754 stats each costing a linear scan of 15754.
--- That would hang the story thread, which has already happened once on this
--- feature and is not worth repeating for a convenience.
+-- The filter works now. It used to be refused because the obvious
+-- implementation is quadratic -- a lookup by name per stat, each a linear
+-- scan -- and both halves of that are indexed today: names by modifier
+-- list here, and stats by name behind Ext.Stats.Get.
 function Ext.Stats.GetStats(modifierList)
-  local out = {}
-  local n = Ext._Internal.StatsCount()
-  for i = 0, n - 1 do
-    local name = Ext._Internal.StatsNameAt(i)
-    if name == nil then goto continue end
-    if modifierList == nil then
-      out[#out + 1] = name
-    else
-      -- By index, never by name: StatsFind is a linear scan, so filtering
-      -- through it would be 15754 scans of 15754 entries and would hang the
-      -- story thread.
-      local addr = Ext._Internal.StatsAt(i)
-      if addr ~= nil and Ext._Internal.StatsType(addr) == modifierList then
-        out[#out + 1] = name
-      end
-    end
-    ::continue::
-  end
-  return out
+  return Ext._Internal.StatsNames(modifierList)
 end
 
 -- Not part of upstream's surface, so it lives under _Internal where our own

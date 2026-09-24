@@ -404,9 +404,15 @@ extern "C" char const* bg3le_fixed_string(std::uint32_t index,
 
     std::uint32_t got = 0;
     char const* text = resolve(table, index, &got);
+
+    // Failures are kept too. An id that does not resolve is not going to
+    // start resolving -- ids are stable -- and not keeping them meant an
+    // unset FixedString field cost three reads every single time it was
+    // looked at. That, not the successful lookups, was three quarters of
+    // the extender's CPU during a mod's stats pass.
+    known.emplace(index, Known{text, got});
     if (text == nullptr) return nullptr;
 
-    known.emplace(index, Known{text, got});
     if (length != nullptr) *length = got;
     return text;
 }

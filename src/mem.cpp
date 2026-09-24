@@ -1,7 +1,11 @@
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include "mem.h"
+
+#include "log.h"
 
 #include <sys/uio.h>
 #include <unistd.h>
@@ -13,8 +17,40 @@ namespace bg3le {
 namespace {
 // Reading our own memory through process_vm_readv turns a bad pointer into
 // EFAULT rather than SIGSEGV, which matters when probing engine structs.
+// How many of these have been made, reported as they mount up.
+//
+// Every read here is a system call, which is the price of turning a bad
+// pointer into EFAULT rather than a crash. That is cheap until something
+// does it in a loop over a whole engine structure, and then it is the
+// only thing that matters -- so the number can be looked at rather than
+// inferred. BG3LE_COUNT_READS=1 turns it on.
+//
+// It is how the last of the stats work was found: a mod's pass was making
+// two hundred and twenty million of these, a million a second, and never
+// finishing.
+std::atomic<unsigned long long> g_reads{0};
+
+void count_read() {
+    static const bool counting = [] {
+        char const* opt = std::getenv("BG3LE_COUNT_READS");
+        return opt != nullptr && opt[0] == '1';
+    }();
+    if (!counting) return;
+
+    const unsigned long long n = g_reads.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n % 20000000ull != 0) return;
+
+    static auto started = std::chrono::steady_clock::now();
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now()
+                                      - started).count();
+    logf("mem: %llu million fault-tolerant reads so far, %.0f per second",
+         n / 1000000ull, seconds > 0 ? (double)n / seconds : 0.0);
+}
+
 bool read_raw(const void* addr, void* out, std::size_t n) {
     if (addr == nullptr || reinterpret_cast<std::uintptr_t>(addr) < 0x1000) return false;
+    count_read();
     iovec local{out, n};
     iovec remote{const_cast<void*>(addr), n};
     return ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) ==

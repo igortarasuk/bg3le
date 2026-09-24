@@ -45,7 +45,7 @@ Verified: after 5eSpells' pass, `Interrupt_AttackOfOpportunity.Conditions`
 reads `"not S5E_IsInvisibleSeen() and IsAbleToReact(context.Observer)
 and ..."` — the mod's prefix in front of the engine's own text.
 
-## FixedString attributes: correct, and still not usable
+## FixedString attributes
 
 A string attribute needs a string-table id, and text a mod builds at
 runtime has none. `ls::FixedString` is a 32-bit index: sub-table in the
@@ -78,40 +78,72 @@ Two wrong versions came first, and both are worth recording:
 - **Popping with a plain load and store.** Correct with the game idle,
   and it lost the race every time during a load.
 
-What works now, verified: an entry is placed off the free list, the id
-resolves through the same path every other read uses, the pool slot lands,
-and `PotentSpellcasting.Boosts` reads back as the mod's appended text
-through a fresh `Ext.Stats.Get`. A staged probe during the level load
-(`BG3LE_PROBE_INTERN=1/2/3`) shows each step is harmless on its own:
-placing an entry, taking a pool slot, and pointing the attribute at it all
-leave the load finishing in about a second.
+Nothing is added to the hash map the engine interns through, which is a
+deliberate limitation: the map's layout is not established here, and the
+only consequence is that the engine interning the same text later makes
+its own second entry -- which is what the table looks like anyway when a
+string arrives twice before either copy is released. The refcount is set
+high enough never to reach zero, so an entry never returns to the list
+and the id a mod holds stays its own.
 
-What is not usable is a mod that does hundreds. With string writes on,
-5eSpells gets past the write that used to stop it and then spends **369
-seconds between one string write and the next**, in its own code -- the
-console times out, so the story thread is inside the handler. It is
-progressing, not deadlocked, and it never finishes in any reasonable time.
+## Reading, which is what actually made this hard
 
-That is a performance problem in what the mod does after the point it
-previously died at, and it is not the string writes themselves. Three
-rounds of optimisation went in on the way and none of them was enough:
+With the writes correct, 5eSpells' `StatsLoaded` handler still never
+finished. It was not the writes: the story thread was inside the mod's own
+code, and `BG3LE_COUNT_READS=1` said why -- **two hundred and twenty
+million fault-tolerant reads, a million a second, still climbing**. Every
+read here is a `process_vm_readv`, which is the price of turning a bad
+pointer into `EFAULT` instead of a crash, and something was doing it in a
+loop over whole engine structures.
 
-- modifier metadata, a list's modifiers and an object's indexed properties
-  are each read once rather than once per attribute per stat;
-- the decoded text behind a pool index is kept, since whole families of
-  stats share the same expressions;
-- `Ext.Stats.Get` no longer snapshots every attribute. It returns a proxy
-  that reads on access, which is what upstream's does -- the snapshot cost
-  two hundred decodes and two hundred table entries whether or not the
-  caller wanted one of them, and because a mod keeps what it fetches, the
-  collector's share of each fetch grew with the heap: 8ms per stat at two
-  thousand, 40ms at six, 120ms at ten. Quadratic, and it read as a hang.
-  Attribute names are indexed per modifier list so reading a field by name
-  is a lookup rather than a walk.
+`perf` named it: **73% of the extender's CPU in `bg3le_fixed_string`**,
+which resolves an id to text and had a cache. The cache only kept
+successes. An *unset* FixedString field does not resolve, so it missed
+every time, and each miss walked the sub-table, the bucket array and the
+header -- three system calls, on every read of every empty field of every
+object. Keeping failures too is a four-line change and it is the whole
+difference between a handler that never finishes and one that takes five
+seconds. An id that does not resolve is not going to start resolving.
 
-Measuring the next step means instrumenting what the mod does in those six
-minutes, not guessing again. `BG3LE_STAT_STRING_WRITES=1` turns it on for
-whoever picks that up.
+Four more lookups were linear where they had to be indexed, each found by
+the same method -- look at what the numbers say, not at what the code
+looks like:
+
+- `Ext.Stats.Get` scanned all 27,821 objects comparing names, two system
+  calls an element, on every call. The comment above `Ext.Stats.GetStats`
+  had already worked out that this makes a mod's pass quadratic; the
+  lookup is a hash map now.
+- `Ext.Stats.GetStats(list)` walked every object asking for its name and
+  its modifier list, about six calls an element and a quarter of a second
+  a call, in a loop. Names are indexed by modifier list, which also means
+  the filter argument works rather than being refused.
+- `Ext.StaticData.Get` looked a GUID up by scanning a bank's key array
+  with a read per key. The comment said "banks hold hundreds of entries
+  and this runs once per lookup"; both halves were wrong. Keys are read
+  once per bank and indexed.
+- Reading a stat read its modifier metadata, its list's modifiers and its
+  indexed properties per attribute rather than once, and the text behind
+  a pool index every time rather than keeping it.
+
+And `Ext.Stats.Get` no longer snapshots every attribute: it returns a
+proxy that reads on access, which is what upstream's object does. The
+snapshot decoded two hundred values and built two hundred table entries
+whether or not the caller wanted one, and because a mod keeps what it
+fetches the collector's share of each fetch grew with the heap -- 8ms per
+stat at two thousand, 40ms at six, 120ms at ten. Quadratic, and it read as
+a hang.
+
+An array whose reported element count is implausible is now treated as
+empty, with the class and path named once, rather than walked.
+
+## Where it ends up
+
+5eSpells' whole `StatsLoaded` handler runs, in about five seconds. It
+rewrites forty interrupt conditions, appends to `PotentSpellcasting.Boosts`
+and interns three new strings on the way, and every one of them reads back
+through a fresh `Ext.Stats.Get`. The level load spends 5.5s in bg3le, most
+of it that handler. Sixty million reads for the whole load, against two
+hundred and twenty million for a load that never finished.
 
 ## What is not attempted
 
