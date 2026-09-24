@@ -219,7 +219,9 @@ component's declared size with the size the engine recorded, and
   hides `HOST_VISIBLE` from the device-local types so the engine's own
   selection picks host memory: p99 frametime 184ms to 15.8ms, GPU busy to
   99%, and less total CPU. It measures the hardware at startup and does
-  nothing on a machine where those writes are fast
+  nothing on a machine where those writes are fast. The same file also builds
+  on its own as `memsteer.so`, so the steering can be pointed at any native
+  Vulkan game rather than only at this one — see [MEMSTEER.md](MEMSTEER.md)
 - **The engine's thread pinning undone.** It pins each thread to one logical
   CPU, which makes that core the frame gate; the same game under Proton runs
   every thread on `0-15` because Wine ignores the requests, and that build
